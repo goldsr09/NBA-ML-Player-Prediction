@@ -1,0 +1,6 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Regenerable API fetch cache (large)
+analysis/output/nba_2025_26_advanced_cache/

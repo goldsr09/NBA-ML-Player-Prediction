@@ -1,0 +1,238 @@
+{
+  "summary": {
+    "coverage": {
+      "season": "2025-26",
+      "games_completed_regular_season": 874,
+      "team_games": 1748,
+      "date_start_utc": "2025-10-21 23:30:00+00:00",
+      "date_end_utc": "2026-02-26 01:00:00+00:00"
+    },
+    "league_baseline": {
+      "home_win_rate": 0.540045766590389,
+      "avg_total_points": 230.87757437070937,
+      "median_total_points": 230.0,
+      "avg_home_points": 116.06064073226544,
+      "avg_away_points": 114.81693363844394,
+      "avg_home_margin": 1.2437070938215102,
+      "avg_team_possessions": 102.77377574370709,
+      "avg_team_off_rating": 112.37340604920132,
+      "avg_team_efg": 0.5442676412176224,
+      "avg_team_3pa_rate": 0.415108784860824
+    },
+    "monthly_trends": [
+      {
+        "month": "2025-10",
+        "games": 75,
+        "avg_points": 117.47333333333333,
+        "avg_possessions": 104.8744,
+        "avg_off_rating": 112.04242585644567,
+        "avg_efg": 0.543359511919748,
+        "avg_3pa_rate": 0.41646604718779817,
+        "avg_ft_rate": 0.29967034027979994
+      },
+      {
+        "month": "2025-11",
+        "games": 221,
+        "avg_points": 116.50452488687783,
+        "avg_possessions": 103.36606334841629,
+        "avg_off_rating": 112.78084708358313,
+        "avg_efg": 0.5448355458064515,
+        "avg_3pa_rate": 0.41942278116161374,
+        "avg_ft_rate": 0.2807023340386543
+      },
+      {
+        "month": "2025-12",
+        "games": 195,
+        "avg_points": 116.83076923076923,
+        "avg_possessions": 103.08625641025641,
+        "avg_off_rating": 113.35617657697789,
+        "avg_efg": 0.5479890922972758,
+        "avg_3pa_rate": 0.40596520608811343,
+        "avg_ft_rate": 0.2662214342714959
+      },
+      {
+        "month": "2026-01",
+        "games": 233,
+        "avg_points": 113.20171673819742,
+        "avg_possessions": 101.54454935622319,
+        "avg_off_rating": 111.5713043807789,
+        "avg_efg": 0.5409665625128731,
+        "avg_3pa_rate": 0.41685619794190987,
+        "avg_ft_rate": 0.251903909464112
+      },
+      {
+        "month": "2026-02",
+        "games": 150,
+        "avg_points": 114.51666666666667,
+        "avg_possessions": 102.354,
+        "avg_off_rating": 111.90692926042995,
+        "avg_efg": 0.5441747822901791,
+        "avg_3pa_rate": 0.41724653656607713,
+        "avg_ft_rate": 0.2568070066894557
+      }
+    ],
+    "stat_battle_win_rates": {
+      "home_won_efg": {
+        "games": 463,
+        "home_win_rate_when_true": 0.8250539956803455,
+        "home_win_rate_when_false": 0.21897810218978103
+      },
+      "home_won_tov": {
+        "games": 412,
+        "home_win_rate_when_true": 0.6407766990291263,
+        "home_win_rate_when_false": 0.45021645021645024
+      },
+      "home_won_orb": {
+        "games": 438,
+        "home_win_rate_when_true": 0.6210045662100456,
+        "home_win_rate_when_false": 0.45871559633027525
+      },
+      "home_won_ft": {
+        "games": 438,
+        "home_win_rate_when_true": 0.589041095890411,
+        "home_win_rate_when_false": 0.4908256880733945
+      }
+    },
+    "margin_correlations_home_perspective": {
+      "efg_diff": 0.8065740265478082,
+      "tov_rate_diff": -0.29238159155717336,
+      "orb_rate_diff": 0.26331393559929717,
+      "ft_rate_diff": 0.07364586777442753,
+      "pace_avg": 0.013883971387395668
+    },
+    "descriptive_threshold_win_rates": {
+      "efg_edge_3pp": 0.9132947976878613,
+      "efg_edge_5pp": 0.9384057971014492,
+      "lose_tov_rate_by_3pp": 0.5661157024793388,
+      "orb_edge_8pp": 0.6682926829268293
+    },
+    "team_rest_effects": [
+      {
+        "rest_bucket": "b2b",
+        "games": 306,
+        "win_rate": 0.4934640522875817,
+        "avg_points": 114.51960784313725,
+        "avg_off_rating": 112.15824286687048,
+        "avg_possessions": 102.16084967320262
+      },
+      {
+        "rest_bucket": "1_day_rest",
+        "games": 1050,
+        "win_rate": 0.5,
+        "avg_points": 115.4752380952381,
+        "avg_off_rating": 112.53410495634029,
+        "avg_possessions": 102.65544761904762
+      },
+      {
+        "rest_bucket": "2_days_rest",
+        "games": 253,
+        "win_rate": 0.5138339920948617,
+        "avg_points": 115.41106719367589,
+        "avg_off_rating": 112.16173013978829,
+        "avg_possessions": 102.9408695652174
+      },
+      {
+        "rest_bucket": "3+_days_rest",
+        "games": 109,
+        "win_rate": 0.4954128440366973,
+        "avg_points": 116.36697247706422,
+        "avg_off_rating": 112.07716540035652,
+        "avg_possessions": 103.86293577981651
+      }
+    ],
+    "b2b_home_away_split": [
+      {
+        "is_home": 0,
+        "b2b": 0,
+        "games": 718,
+        "win_rate": 0.44986072423398327,
+        "avg_points": 114.87186629526462,
+        "avg_off_rating": 111.71519856322764
+      },
+      {
+        "is_home": 0,
+        "b2b": 1,
+        "games": 156,
+        "win_rate": 0.5064102564102564,
+        "avg_points": 114.56410256410257,
+        "avg_off_rating": 112.04390503193434
+      },
+      {
+        "is_home": 1,
+        "b2b": 0,
+        "games": 724,
+        "win_rate": 0.5524861878453039,
+        "avg_points": 116.38950276243094,
+        "avg_off_rating": 113.1170979120775
+      },
+      {
+        "is_home": 1,
+        "b2b": 1,
+        "games": 150,
+        "win_rate": 0.48,
+        "avg_points": 114.47333333333333,
+        "avg_off_rating": 112.27715421520409
+      }
+    ]
+  },
+  "models": {
+    "win_model": {
+      "n_games_train": 699,
+      "n_games_test": 175,
+      "accuracy": 0.6685714285714286,
+      "auc": 0.739272632129775,
+      "log_loss": 0.6248198781257672,
+      "baseline_home_win_rate_test": 0.48,
+      "top_coefficients": [
+        {
+          "feature": "diff_pre_net_rating_season",
+          "coef": 0.6596680222562714
+        },
+        {
+          "feature": "diff_pre_off_rating_avg5",
+          "coef": 0.1559661199219651
+        },
+        {
+          "feature": "diff_pre_possessions_avg5",
+          "coef": -0.1493861219452352
+        },
+        {
+          "feature": "diff_pre_efg_avg5",
+          "coef": -0.13707398591833977
+        },
+        {
+          "feature": "diff_pre_net_rating_avg5",
+          "coef": 0.12245503153047274
+        },
+        {
+          "feature": "home_b2b",
+          "coef": -0.09455570579521226
+        },
+        {
+          "feature": "diff_pre_ft_rate_avg5",
+          "coef": 0.084267078019802
+        },
+        {
+          "feature": "diff_pre_margin_avg10",
+          "coef": -0.07288083496921044
+        }
+      ]
+    },
+    "score_model": {
+      "n_team_games_train": 1398,
+      "n_team_games_test": 350,
+      "mae": 9.927643083085968,
+      "rmse": 12.635767452124686,
+      "r2": 0.05346954617985056,
+      "test_avg_points": 114.29428571428572
+    },
+    "total_model": {
+      "n_games_train": 699,
+      "n_games_test": 175,
+      "mae": 15.278514536831784,
+      "rmse": 19.05636279575736,
+      "r2": 0.04283508242152656,
+      "test_avg_total": 228.58857142857144
+    }
+  }
+}
