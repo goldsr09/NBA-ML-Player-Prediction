@@ -251,6 +251,40 @@ def train_model(df: pd.DataFrame, tune: bool = False) -> dict:
     print(f"  Linear MAE:   {baseline_mae:.2f}")
     print(f"  Improvement:  {baseline_mae - mae:+.2f} pts MAE")
 
+    # ── Bootstrap CI of MAE delta ─────────────────────────────────────
+    ml_errors = np.abs(y_test - y_pred)
+    lin_errors = np.abs(y_test - baseline_pred)
+    rng = np.random.default_rng(42)
+    n_boot = 2000
+    deltas = np.empty(n_boot)
+    n_test = len(y_test)
+    for b in range(n_boot):
+        idx = rng.integers(0, n_test, size=n_test)
+        deltas[b] = lin_errors[idx].mean() - ml_errors[idx].mean()
+    ci_lo, ci_hi = np.percentile(deltas, [2.5, 97.5])
+    ml_wins_bootstrap = (deltas > 0).mean()
+
+    print(f"\n  ── Bootstrap CI (MAE delta: linear - XGBoost) ──")
+    print(f"  Mean delta:   {deltas.mean():+.3f} pts (positive = ML better)")
+    print(f"  95% CI:       [{ci_lo:+.3f}, {ci_hi:+.3f}]")
+    print(f"  P(ML better): {ml_wins_bootstrap:.1%}")
+
+    ml_robust = ci_lo > 0  # CI entirely above zero = ML robustly better
+
+    # ── Month-by-month stability ──────────────────────────────────────
+    test_months = test_df["game_date"].dt.to_period("M")
+    print(f"\n  ── Month-by-Month Stability ──")
+    print(f"  {'Month':<10} {'N':>5} {'ML MAE':>8} {'Lin MAE':>8} {'Delta':>8}")
+    print(f"  {'-'*42}")
+    for month, idx in test_df.groupby(test_months).groups.items():
+        m_ml = ml_errors[idx.values - test_df.index[0]].mean()
+        m_lin = lin_errors[idx.values - test_df.index[0]].mean()
+        print(f"  {str(month):<10} {len(idx):>5} {m_ml:>8.2f} {m_lin:>8.2f} {m_lin - m_ml:>+8.2f}")
+
+    if not ml_robust:
+        print(f"\n  WARNING: ML does not robustly beat linear (CI includes 0).")
+        print(f"  Model will be saved but artifact flags use_ml=False.")
+
     # ── Conditional residual std by margin bucket ─────────────────────
     residuals = y_test - y_pred
     test_margins = test_df["abs_margin_3q"].values
@@ -325,6 +359,13 @@ def train_model(df: pd.DataFrame, tune: bool = False) -> dict:
     qdf_full = load_quarter_data()
     team_snapshot = build_team_q4_snapshot(qdf_full)
 
+    # ── Q4 elapsed-time uncertainty curve ─────────────────────────────
+    # Empirically measure how much uncertainty remains at each fraction of Q4.
+    # At fraction f, we know thru_3q + f*q4_actual; remaining is (1-f)*q4_actual.
+    # Std of remaining scoring decreases as Q4 progresses.
+    print(f"\n  ── Q4 Elapsed-Time Std Curve ──")
+    q4_elapsed_std = _compute_q4_elapsed_std(df)
+
     # ── Probability calibration check ─────────────────────────────────
     print(f"\n  ── Probability Calibration (strikes 200-260) ──")
     _calibration_check(oof_residuals, oof_margins, df, cond_std_final, overall_std_final)
@@ -335,13 +376,18 @@ def train_model(df: pd.DataFrame, tune: bool = False) -> dict:
         "features": available_features,
         "conditional_std": cond_std_final,
         "overall_std": overall_std_final,
+        "q4_elapsed_std": q4_elapsed_std,
         "team_q4_snapshot": team_snapshot,
         "linear_fallback": {"coef": LINEAR_COEF, "intercept": LINEAR_INTERCEPT},
+        "use_ml": ml_robust,
         "eval_metrics": {
             "mae": float(mae),
             "rmse": float(rmse),
             "r2": float(r2),
             "mae_vs_baseline": float(baseline_mae - mae),
+            "bootstrap_ci_lo": float(ci_lo),
+            "bootstrap_ci_hi": float(ci_hi),
+            "p_ml_better": float(ml_wins_bootstrap),
         },
         "trained_at": datetime.now().isoformat(),
         "n_games": len(df),
@@ -378,6 +424,38 @@ def _calibration_check(oof_residuals, oof_margins, df, cond_std, overall_std):
         marker = " !" if abs(gap) > 5 else ""
         print(f"  {strike:>8} {model_p_over:>7.1f}% {empirical_over:>9.1f}% "
               f"{gap:>+7.1f}% {n_over:>8}{marker}")
+
+
+def _compute_q4_elapsed_std(df: pd.DataFrame) -> dict:
+    """Compute empirical std of remaining scoring at each Q4 elapsed fraction.
+
+    At fraction f of Q4, we know: thru_3q + f * q4_actual.
+    The unknown remaining is: (1-f) * q4_actual.
+    We measure the std of (game_total - known) across all games for each bucket.
+
+    Returns dict mapping fraction labels to std values, e.g.:
+        {"0.00": 9.7, "0.17": 8.1, "0.33": 6.5, ...}
+    """
+    q4_totals = df["q4_total"].values if "q4_total" in df.columns else (df["game_total"] - df["thru_3q_total"]).values
+    game_totals = df[TARGET_COL].values
+    thru_3q = df["thru_3q_total"].values
+
+    fractions = [0.0, 1/6, 2/6, 3/6, 4/6, 5/6, 1.0]
+    labels = ["0.00", "0.17", "0.33", "0.50", "0.67", "0.83", "1.00"]
+
+    result = {}
+    for frac, label in zip(fractions, labels):
+        # Known at this point: thru_3q + frac * q4_actual
+        known = thru_3q + frac * q4_totals
+        remaining = game_totals - known  # what's still unknown
+        result[label] = float(np.std(remaining))
+
+    print(f"  {'Fraction':>10} {'Remaining Std':>14}")
+    print(f"  {'-'*26}")
+    for label in labels:
+        print(f"  {label:>10} {result[label]:>13.2f}")
+
+    return result
 
 
 def _tune_hyperparams(X_train, y_train, df, features, imputer) -> dict:

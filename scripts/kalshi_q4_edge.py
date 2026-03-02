@@ -41,6 +41,14 @@ OVERALL_Q4_MEAN = 54.7
 KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
 NBA_SCOREBOARD = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
 
+# ── Signal gating thresholds ──────────────────────────────────────────────
+# Only fire signals when market conditions meet all of these.
+MIN_PERIOD = 3           # Must be end-of-Q3 or later (period >= 3 with clock <= 30s, or period >= 4)
+MIN_VOLUME = 10          # Minimum contract volume on the strike
+MAX_SPREAD = 12          # Max bid-ask spread (cents) to consider a market liquid
+MIN_EV_AFTER_FEES = 2.0  # Minimum EV (cents) after Kalshi fee (currently 0)
+MIN_EDGE_PCT = 3.0       # Minimum edge % to show a signal at all
+
 # Team tricode mappings (NBA CDN → Kalshi event ticker abbreviations)
 TRICODE_MAP = {
     "PHX": "PHX", "PHO": "PHX",
@@ -161,6 +169,32 @@ def project_final_total_ml(thru_3q, q1, q2, q3, margin_3q, home, away, artifact)
 def project_final_total(thru_3q):
     """Project final total using linear regression (fallback)."""
     return REG_COEF * thru_3q + REG_INTERCEPT
+
+
+def _lookup_q4_elapsed_std(fraction_done, base_std):
+    """Look up empirical std for remaining scoring given Q4 elapsed fraction.
+
+    Uses the q4_elapsed_std curve from the trained model artifact.
+    Falls back to square-root decay if artifact not available.
+    """
+    if ML_ARTIFACT is None or "q4_elapsed_std" not in ML_ARTIFACT:
+        # Fallback: square-root decay (less aggressive than linear)
+        return base_std * max(0.1, (1 - fraction_done) ** 0.5)
+
+    curve = ML_ARTIFACT["q4_elapsed_std"]
+    # Curve keys: "0.00", "0.17", "0.33", "0.50", "0.67", "0.83", "1.00"
+    knots = sorted((float(k), v) for k, v in curve.items())
+
+    # Linear interpolation between nearest knots
+    for i in range(len(knots) - 1):
+        f0, s0 = knots[i]
+        f1, s1 = knots[i + 1]
+        if f0 <= fraction_done <= f1:
+            t = (fraction_done - f0) / (f1 - f0) if f1 > f0 else 0
+            return s0 + t * (s1 - s0)
+
+    # Beyond last knot
+    return max(knots[-1][1], 1.0)
 
 
 # ── Network helpers ───────────────────────────────────────────────────────
@@ -429,9 +463,24 @@ def display_game(game, kalshi_event, markets):
     away_3q = sum(away_qs.get(q, 0) for q in [1, 2, 3])
     margin_3q = home_3q - away_3q
 
-    if ML_ARTIFACT is not None:
+    # Use ML only if artifact says it's robust; otherwise use linear
+    # but still use artifact for conditional_std and team snapshot
+    use_ml = (ML_ARTIFACT is not None and ML_ARTIFACT.get("use_ml", True))
+    if use_ml:
         projected, projection_std = project_final_total_ml(
             thru_3q, q1, q2, q3, margin_3q, home, away, ML_ARTIFACT)
+    elif ML_ARTIFACT is not None:
+        # Linear projection but with conditional std from artifact
+        projected = project_final_total(thru_3q)
+        abs_margin = abs(margin_3q)
+        cond_std = ML_ARTIFACT.get("conditional_std", {})
+        overall_std = ML_ARTIFACT.get("overall_std", 9.2)
+        if abs_margin <= 10:
+            projection_std = cond_std.get("close_0_10", overall_std)
+        elif abs_margin <= 20:
+            projection_std = cond_std.get("moderate_11_20", overall_std)
+        else:
+            projection_std = cond_std.get("blowout_21_plus", overall_std)
     else:
         projected = project_final_total(thru_3q)
         projection_std = 9.2
@@ -440,7 +489,8 @@ def display_game(game, kalshi_event, markets):
     q4_projected = projected - thru_3q
     pace_q4 = thru_3q / 3
 
-    # If in Q4, adjust projection based on actual Q4 scoring + remaining time
+    # If in Q4, adjust projection based on actual Q4 scoring + remaining time.
+    # Use empirical elapsed-time std curve from training (if available).
     time_adjusted_projection = projected
 
     if period == 4 and clock_secs is not None:
@@ -451,7 +501,7 @@ def display_game(game, kalshi_event, markets):
         if q4_fraction_done > 0.1:
             q4_remaining_model = q4_projected * (1 - q4_fraction_done)
             time_adjusted_projection = compute_thru_3q(game) + q4_so_far + q4_remaining_model
-            projection_std = projection_std * (1 - q4_fraction_done)
+            projection_std = _lookup_q4_elapsed_std(q4_fraction_done, projection_std)
 
     print(f"\n  Through 3Q total:       {thru_3q:.0f}")
     print(f"  Per-quarter pace:       {thru_3q/3:.1f}")
@@ -505,12 +555,17 @@ def display_game(game, kalshi_event, markets):
         ev_buy_yes = (model_over_prob / 100) * (100 - over_cost) - (model_under_prob / 100) * over_cost
         ev_buy_no = (model_under_prob / 100) * (100 - under_cost) - (model_over_prob / 100) * under_cost
 
+        # Gating: check if this market meets liquidity/quality thresholds
+        spread = m["yes_ask"] - m["yes_bid"] if m["yes_bid"] > 0 else 99
+        liquid = (m["volume"] >= MIN_VOLUME and spread <= MAX_SPREAD)
+
         edges.append({
             "strike": strike,
             "yes_ask": m["yes_ask"],
             "no_ask": m["no_ask"],
             "yes_bid": m["yes_bid"],
             "no_bid": m["no_bid"],
+            "spread": spread,
             "volume": m["volume"],
             "over_cost": over_cost,
             "under_cost": under_cost,
@@ -519,8 +574,16 @@ def display_game(game, kalshi_event, markets):
             "edge_under": round(edge_under, 1),
             "ev_buy_yes": round(ev_buy_yes, 2),
             "ev_buy_no": round(ev_buy_no, 2),
+            "liquid": liquid,
             "ticker": m["ticker"],
         })
+
+    # Game-level gate: only signal if period meets threshold
+    # (period=3 clock<=30s or period>=4 is fine; mid-Q3 extrapolation is not)
+    game_eligible = (
+        (period >= 4) or
+        (period == 3 and (clock_secs is None or clock_secs <= 30))
+    )
 
     print(f"\n  {'Strike':>8} {'Ask O':>6} {'Ask U':>6} {'Mdl O%':>7} {'Edge O':>7} {'Edge U':>7} "
           f"{'Signal':>8} {'EV':>7} {'Vol':>8}")
@@ -530,19 +593,18 @@ def display_game(game, kalshi_event, markets):
         # Signal based on which side has better edge
         best_edge = max(e["edge_over"], e["edge_under"])
         signal = ""
-        if e["edge_over"] >= 5:
-            signal = "OVER"
-        elif e["edge_under"] >= 5:
-            signal = "UNDER"
-        elif e["edge_over"] >= 3:
-            signal = "over?"
-        elif e["edge_under"] >= 3:
-            signal = "under?"
+
+        # Only emit signals if game + market pass gates
+        if game_eligible and e["liquid"]:
+            if e["edge_over"] >= MIN_EDGE_PCT and e["ev_buy_yes"] >= MIN_EV_AFTER_FEES:
+                signal = "OVER" if e["edge_over"] >= 5 else "over?"
+            elif e["edge_under"] >= MIN_EDGE_PCT and e["ev_buy_no"] >= MIN_EV_AFTER_FEES:
+                signal = "UNDER" if e["edge_under"] >= 5 else "under?"
 
         marker = ""
-        if best_edge >= 10:
+        if signal in ("OVER", "UNDER") and best_edge >= 10:
             marker = " **"
-        elif best_edge >= 5:
+        elif signal in ("OVER", "UNDER"):
             marker = " *"
 
         best_ev = e["ev_buy_yes"] if e["edge_over"] >= e["edge_under"] else e["ev_buy_no"]
@@ -551,22 +613,32 @@ def display_game(game, kalshi_event, markets):
               f"{e['edge_over']:>+6.1f} {e['edge_under']:>+6.1f} "
               f"{signal:>8} {best_ev:>+6.1f} {e['volume']:>8,}{marker}")
 
-    # Best opportunity by EV
-    best_over = max(edges, key=lambda x: x["ev_buy_yes"])
-    best_under = max(edges, key=lambda x: x["ev_buy_no"])
+    if not game_eligible:
+        print(f"\n  SIGNALS GATED: game in Q{period} — waiting for end of Q3")
+        return
 
-    print(f"\n  BEST BETS:")
-    if best_over["ev_buy_yes"] > 0:
+    # Filter to gated edges for best-bet selection
+    gated = [e for e in edges if e["liquid"]]
+    if not gated:
+        print(f"\n  SIGNALS GATED: no markets meet liquidity thresholds "
+              f"(vol>={MIN_VOLUME}, spread<={MAX_SPREAD}c)")
+        return
+
+    best_over = max(gated, key=lambda x: x["ev_buy_yes"])
+    best_under = max(gated, key=lambda x: x["ev_buy_no"])
+
+    print(f"\n  BEST BETS (vol>={MIN_VOLUME}, spread<={MAX_SPREAD}c, EV>={MIN_EV_AFTER_FEES}c):")
+    if best_over["ev_buy_yes"] >= MIN_EV_AFTER_FEES and best_over["edge_over"] >= MIN_EDGE_PCT:
         print(f"    OVER  {best_over['strike']}: buy YES at {best_over['yes_ask']}c "
               f"(EV={best_over['ev_buy_yes']:+.1f}c, edge={best_over['edge_over']:+.1f}%)")
     else:
-        print(f"    OVER  — no +EV over bets")
+        print(f"    OVER  — no qualifying over bets")
 
-    if best_under["ev_buy_no"] > 0:
+    if best_under["ev_buy_no"] >= MIN_EV_AFTER_FEES and best_under["edge_under"] >= MIN_EDGE_PCT:
         print(f"    UNDER {best_under['strike']}: buy NO at {best_under['no_ask']}c "
               f"(EV={best_under['ev_buy_no']:+.1f}c, edge={best_under['edge_under']:+.1f}%)")
     else:
-        print(f"    UNDER — no +EV under bets")
+        print(f"    UNDER — no qualifying under bets")
 
 
 # ── Scan loop ─────────────────────────────────────────────────────────────
@@ -582,7 +654,9 @@ def run_scan(log_enabled=False):
         metrics = ML_ARTIFACT.get("eval_metrics", {})
         n_games = ML_ARTIFACT.get("n_games", "?")
         mae = metrics.get("mae", 0)
-        print(f"  Model: XGBoost ML ({n_games:,} games, MAE={mae:.1f})")
+        use_ml = ML_ARTIFACT.get("use_ml", True)
+        mode = "XGBoost ML" if use_ml else "Linear + ML std/snapshot"
+        print(f"  Model: {mode} ({n_games:,} games, MAE={mae:.1f})")
     else:
         print(f"  Model: Linear fallback (Final = {REG_COEF:.4f} x 3Q_total + {REG_INTERCEPT:.1f})")
     print(f"{'#'*70}")
