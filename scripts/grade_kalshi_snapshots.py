@@ -20,7 +20,11 @@ from pathlib import Path
 
 import numpy as np
 
-ANALYSIS_OUTPUT = Path("/Users/ryangoldstein/NBA/analysis/output")
+import os as _os
+ANALYSIS_OUTPUT = Path(
+    _os.environ.get("NBA_OUTPUT_DIR",
+                     str(Path(__file__).resolve().parent.parent / "analysis" / "output"))
+)
 LOG_DIR = ANALYSIS_OUTPUT / "kalshi_logs"
 RESULTS_CSV = ANALYSIS_OUTPUT / "kalshi_graded_results.csv"
 

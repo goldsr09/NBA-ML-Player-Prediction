@@ -27,8 +27,12 @@ import numpy as np
 
 # ── Paths ─────────────────────────────────────────────────────────────────
 
+import os as _os
 SCRIPT_DIR = Path(__file__).parent
-ANALYSIS_OUTPUT = Path("/Users/ryangoldstein/NBA/analysis/output")
+ANALYSIS_OUTPUT = Path(
+    _os.environ.get("NBA_OUTPUT_DIR",
+                     str(Path(__file__).resolve().parent.parent / "analysis" / "output"))
+)
 MODEL_PATH = ANALYSIS_OUTPUT / "models" / "q4_total_model.joblib"
 LOG_DIR = ANALYSIS_OUTPUT / "kalshi_logs"
 

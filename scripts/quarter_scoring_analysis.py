@@ -19,9 +19,14 @@ from pathlib import Path
 from scipy import stats
 
 # ── Shared cache base path ────────────────────────────────────────────────
-# Cache dirs are gitignored so not in worktrees — use the main repo.
+# Resolve from script location -> project root -> analysis/output.
+# Respects NBA_OUTPUT_DIR env var override for non-standard layouts.
 # Other scripts (train_q4_model.py) import this constant.
-ANALYSIS_OUTPUT_BASE = Path("/Users/ryangoldstein/NBA/analysis/output")
+import os as _os
+ANALYSIS_OUTPUT_BASE = Path(
+    _os.environ.get("NBA_OUTPUT_DIR",
+                     str(Path(__file__).resolve().parent.parent / "analysis" / "output"))
+)
 
 # ── Load all boxscores across seasons ─────────────────────────────────────
 
