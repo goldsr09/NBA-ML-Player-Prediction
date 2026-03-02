@@ -554,10 +554,26 @@ def train_and_save(tune: bool = False) -> dict:
     qdf = load_quarter_data()
     print(f"  Loaded {len(qdf):,} total games")
 
+    if len(qdf) == 0:
+        cache_dir = ANALYSIS_OUTPUT_BASE / "historical_cache"
+        print("\n  ERROR: No quarter data found. Training requires historical boxscores.")
+        print(f"  Expected cache directory: {cache_dir}")
+        print("\n  Setup instructions:")
+        print("    1. Run from the main repo (not a worktree):")
+        print("       python scripts/fetch_historical_seasons.py")
+        print("    2. Or set NBA_OUTPUT_DIR to point to an existing analysis/output dir:")
+        print("       NBA_OUTPUT_DIR=/path/to/NBA/analysis/output python scripts/train_q4_model.py")
+        sys.exit(1)
+
     # Build features
     print("\n  Building features...")
     df = build_features(qdf)
     print(f"  Feature matrix: {len(df):,} games × {len(FEATURE_COLS)} features")
+
+    if len(df) == 0:
+        print("\n  ERROR: 0 regulation games after filtering. Cannot train.")
+        print("  This likely means all loaded games had overtime — check data integrity.")
+        sys.exit(1)
 
     # Drop games with no target
     df = df.dropna(subset=[TARGET_COL])

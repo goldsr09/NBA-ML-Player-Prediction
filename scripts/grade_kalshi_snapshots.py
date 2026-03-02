@@ -4,7 +4,10 @@ Grade Kalshi Q4 Snapshot Logs
 
 Reads logged snapshots from kalshi_q4_edge.py --log, identifies decision
 points (end of Q3 / early Q4), grades against final outcomes, and computes
-realized P/L and CLV.
+realized P/L and closing-line value (CLV).
+
+Mirrors the scanner's exact projection mode and gating policy so that
+reported P/L matches what live signals would have produced.
 
 Usage:
     python3 scripts/grade_kalshi_snapshots.py                    # Grade all logged days
@@ -28,6 +31,18 @@ ANALYSIS_OUTPUT = Path(
 LOG_DIR = ANALYSIS_OUTPUT / "kalshi_logs"
 RESULTS_CSV = ANALYSIS_OUTPUT / "kalshi_graded_results.csv"
 
+# Import gating constants from the scanner so grader policy is identical.
+sys.path.insert(0, str(Path(__file__).parent))
+from kalshi_q4_edge import (
+    MIN_VOLUME, MAX_SPREAD, MIN_EV_AFTER_FEES, MIN_EDGE_PCT,
+    project_final_total, project_final_total_ml,
+)
+
+# Linear fallback constants (duplicated here to avoid circular state issues)
+_LINEAR_COEF = 1.0604
+_LINEAR_INTERCEPT = 44.34
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────
 
 def load_ml_artifact():
@@ -42,47 +57,63 @@ def load_ml_artifact():
         return None
 
 
-def find_decision_snapshot(snapshots):
-    """From a list of snapshots for one game, find the best decision point.
+def find_decision_snapshot(game_snapshots):
+    """From a list of per-game snapshot dicts, find the best decision point.
 
     Preference: end of Q3 (period=3, clock near 0) or earliest Q4 snapshot.
-    Returns the snapshot dict and the game entry within it, or (None, None).
+    Returns the game snapshot dict, or None.
     """
     candidates = []
-    for snap in snapshots:
-        for g in snap.get("games", []):
-            period = g.get("period", 0)
-            clock = g.get("clock_seconds")
+    for gs in game_snapshots:
+        period = gs.get("period", 0)
+        clock = gs.get("clock_seconds")
 
-            # End of Q3: period=3, clock <= 30s (or None = between quarters)
-            if period == 3 and (clock is None or clock <= 30):
-                candidates.append((0, snap, g))  # priority 0 = best
-            # Early Q4: period=4, clock > 600 (less than 2 min played)
-            elif period == 4 and clock is not None and clock > 600:
-                candidates.append((1, snap, g))
-            # Mid Q4 fallback
-            elif period == 4:
-                candidates.append((2, snap, g))
+        # End of Q3: period=3, clock <= 30s (or None = between quarters)
+        if period == 3 and (clock is None or clock <= 30):
+            candidates.append((0, gs))  # priority 0 = best
+        # Early Q4: period=4, clock > 600 (less than 2 min played)
+        elif period == 4 and clock is not None and clock > 600:
+            candidates.append((1, gs))
 
     if not candidates:
-        return None, None
+        return None
 
     candidates.sort(key=lambda x: x[0])
-    _, snap, game = candidates[0]
-    return snap, game
+    return candidates[0][1]
 
 
-def find_final_snapshot(snapshots, game_id):
+def find_final_snapshot(game_snapshots):
     """Find the snapshot where this game is Final."""
-    for snap in reversed(snapshots):
-        for g in snap.get("games", []):
-            if g.get("game_id") == game_id and "Final" in g.get("status", ""):
-                return snap, g
-    return None, None
+    for gs in reversed(game_snapshots):
+        if "Final" in gs.get("status", ""):
+            return gs
+    return None
+
+
+def find_closing_snapshot(game_snapshots, decision_ts):
+    """Find the last snapshot before Final for closing-line prices.
+
+    CLV = closing_price - entry_price. The closing snapshot is the last
+    one captured before the game ended.
+    """
+    pre_final = []
+    for gs in game_snapshots:
+        if "Final" not in gs.get("status", ""):
+            ts = gs.get("timestamp", "")
+            if ts > decision_ts:
+                pre_final.append(gs)
+
+    if not pre_final:
+        return None
+    return pre_final[-1]
 
 
 def compute_projection(game, artifact):
-    """Compute model projection for a game at decision time."""
+    """Compute projection mirroring the scanner's exact logic.
+
+    Respects use_ml flag: uses ML only when artifact says it's robust,
+    otherwise uses linear projection with conditional std from artifact.
+    """
     home_qs = {int(k): v for k, v in game.get("home_qs", {}).items()}
     away_qs = {int(k): v for k, v in game.get("away_qs", {}).items()}
 
@@ -91,19 +122,57 @@ def compute_projection(game, artifact):
     q3 = home_qs.get(3, 0) + away_qs.get(3, 0)
     thru_3q = q1 + q2 + q3
     margin_3q = sum(home_qs.get(q, 0) for q in [1, 2, 3]) - sum(away_qs.get(q, 0) for q in [1, 2, 3])
+    abs_margin = abs(margin_3q)
 
-    if artifact is not None:
-        sys.path.insert(0, str(Path(__file__).parent))
-        from kalshi_q4_edge import project_final_total_ml
+    use_ml = (artifact is not None and artifact.get("use_ml", True))
+
+    if use_ml:
         proj, std = project_final_total_ml(
             thru_3q, q1, q2, q3, margin_3q,
             game.get("home", ""), game.get("away", ""), artifact)
+    elif artifact is not None:
+        # Linear projection but with conditional std from artifact
+        proj = _LINEAR_COEF * thru_3q + _LINEAR_INTERCEPT
+        cond_std = artifact.get("conditional_std", {})
+        overall_std = artifact.get("overall_std", 9.2)
+        if abs_margin <= 10:
+            std = cond_std.get("close_0_10", overall_std)
+        elif abs_margin <= 20:
+            std = cond_std.get("moderate_11_20", overall_std)
+        else:
+            std = cond_std.get("blowout_21_plus", overall_std)
     else:
-        proj = 1.0604 * thru_3q + 44.34
+        proj = _LINEAR_COEF * thru_3q + _LINEAR_INTERCEPT
         std = 9.2
 
     return proj, std, thru_3q
 
+
+def game_period_eligible(game):
+    """Check if game period meets decision threshold (mirrors scanner gate)."""
+    period = game.get("period", 0)
+    clock = game.get("clock_seconds")
+    return (
+        (period >= 4) or
+        (period == 3 and (clock is None or clock <= 30))
+    )
+
+
+def market_eligible(m):
+    """Check if a single market passes liquidity/quality gates."""
+    yes_ask = m.get("yes_ask", 0)
+    no_ask = m.get("no_ask", 0)
+    yes_bid = m.get("yes_bid", 0)
+    volume = m.get("volume", 0)
+
+    if yes_ask <= 0 or no_ask <= 0:
+        return False
+
+    spread = yes_ask - yes_bid if yes_bid > 0 else 99
+    return volume >= MIN_VOLUME and spread <= MAX_SPREAD
+
+
+# ── Core grading ──────────────────────────────────────────────────────────
 
 def grade_day(day_dir, artifact):
     """Grade all games for one day's snapshots.
@@ -120,36 +189,31 @@ def grade_day(day_dir, artifact):
         with open(f) as fh:
             snapshots.append(json.load(fh))
 
-    # Collect unique game_ids across all snapshots
-    game_ids = set()
+    # Collect per-game snapshot timelines
+    game_timelines = {}  # game_id -> [snapshot_dicts]
     for snap in snapshots:
         for g in snap.get("games", []):
-            game_ids.add(g.get("game_id"))
+            gid = g.get("game_id")
+            if gid:
+                entry = {"timestamp": snap["timestamp"], **g,
+                         "kalshi_markets": g.get("kalshi_markets", [])}
+                game_timelines.setdefault(gid, []).append(entry)
+
+    from scipy.stats import norm
 
     trades = []
-    for game_id in game_ids:
-        # Get all snapshots containing this game
-        game_snapshots = []
-        for snap in snapshots:
-            for g in snap.get("games", []):
-                if g.get("game_id") == game_id:
-                    game_snapshots.append({"timestamp": snap["timestamp"], **g,
-                                           "kalshi_markets": g.get("kalshi_markets", [])})
-
-        if not game_snapshots:
+    for game_id, timeline in game_timelines.items():
+        # Find decision point
+        dec_game = find_decision_snapshot(timeline)
+        if dec_game is None:
             continue
 
-        # Find decision point
-        dec_snap, dec_game = find_decision_snapshot(
-            [{"timestamp": gs["timestamp"], "games": [gs]} for gs in game_snapshots])
-        if dec_snap is None:
+        # Game-level period gate
+        if not game_period_eligible(dec_game):
             continue
 
         # Find final result
-        final_snap, final_game = find_final_snapshot(
-            [{"timestamp": gs["timestamp"], "games": [gs]} for gs in game_snapshots],
-            game_id)
-
+        final_game = find_final_snapshot(timeline)
         if final_game is None:
             continue
 
@@ -157,40 +221,58 @@ def grade_day(day_dir, artifact):
         if actual_total == 0:
             continue
 
-        # Compute projection at decision time
+        # Compute projection at decision time (mirrors scanner mode)
         proj, std, thru_3q = compute_projection(dec_game, artifact)
+
+        # Find closing snapshot for CLV
+        closing_game = find_closing_snapshot(timeline, dec_game.get("timestamp", ""))
+        closing_markets = {}
+        if closing_game:
+            for cm in closing_game.get("kalshi_markets", []):
+                closing_markets[cm.get("strike")] = cm
 
         # Grade each market strike at decision time
         dec_markets = dec_game.get("kalshi_markets", [])
         if not dec_markets:
             continue
 
-        from scipy.stats import norm
-
         for m in dec_markets:
             strike = m.get("strike", 0)
             yes_ask = m.get("yes_ask", 0)
             no_ask = m.get("no_ask", 0)
+            yes_bid = m.get("yes_bid", 0)
             volume = m.get("volume", 0)
 
-            if yes_ask <= 0 or no_ask <= 0:
+            # Market-level gate (identical to scanner)
+            if not market_eligible(m):
                 continue
 
             model_over_pct = norm.sf(strike, loc=proj, scale=max(std, 1.0)) * 100
             model_under_pct = 100 - model_over_pct
 
+            # Edge against executable prices (mirrors scanner)
             edge_over = model_over_pct - yes_ask
             edge_under = model_under_pct - no_ask
 
-            # Determine which side (if any) we'd trade
+            # EV per contract
+            ev_buy_yes = (model_over_pct / 100) * (100 - yes_ask) - (model_under_pct / 100) * yes_ask
+            ev_buy_no = (model_under_pct / 100) * (100 - no_ask) - (model_over_pct / 100) * no_ask
+
+            # Determine side using scanner's exact gating logic
             side = None
             cost = 0
-            if edge_over >= 5 and yes_ask > 0:
+            edge = 0
+            ev = 0
+            if edge_over >= MIN_EDGE_PCT and ev_buy_yes >= MIN_EV_AFTER_FEES:
                 side = "OVER"
                 cost = yes_ask
-            elif edge_under >= 5 and no_ask > 0:
+                edge = edge_over
+                ev = ev_buy_yes
+            elif edge_under >= MIN_EDGE_PCT and ev_buy_no >= MIN_EV_AFTER_FEES:
                 side = "UNDER"
                 cost = no_ask
+                edge = edge_under
+                ev = ev_buy_no
 
             if side is None:
                 continue
@@ -204,16 +286,29 @@ def grade_day(day_dir, artifact):
                 won = not went_over
                 payout = 100 - cost if won else -cost
 
-            # CLV: compare entry price to what fair value was at decision time
-            fair_price = model_over_pct if side == "OVER" else model_under_pct
-            clv = fair_price - cost
+            # Model edge (what the model thinks the edge is at entry)
+            model_edge = edge
+
+            # True CLV: compare entry price to closing (last pre-final) price.
+            # CLV > 0 means the market moved toward our position after entry.
+            clv = np.nan
+            closing_m = closing_markets.get(strike)
+            if closing_m is not None:
+                if side == "OVER":
+                    closing_price = closing_m.get("yes_ask", 0)
+                    if closing_price > 0:
+                        clv = float(closing_price - cost)
+                else:
+                    closing_price = closing_m.get("no_ask", 0)
+                    if closing_price > 0:
+                        clv = float(closing_price - cost)
 
             trades.append({
                 "date": day_dir.name,
                 "game_id": game_id,
                 "home": dec_game.get("home", ""),
                 "away": dec_game.get("away", ""),
-                "decision_time": dec_snap.get("timestamp", ""),
+                "decision_time": dec_game.get("timestamp", ""),
                 "period": dec_game.get("period", 0),
                 "thru_3q": thru_3q,
                 "projection": round(proj, 1),
@@ -221,12 +316,13 @@ def grade_day(day_dir, artifact):
                 "strike": strike,
                 "side": side,
                 "cost": cost,
-                "edge": round(edge_over if side == "OVER" else edge_under, 1),
+                "model_edge": round(model_edge, 1),
+                "ev": round(ev, 1),
                 "model_prob": round(model_over_pct if side == "OVER" else model_under_pct, 1),
                 "actual_total": actual_total,
                 "won": won,
                 "pnl": round(payout, 2),
-                "clv": round(clv, 1),
+                "clv": round(clv, 1) if not np.isnan(clv) else None,
                 "volume": volume,
                 "ticker": m.get("ticker", ""),
             })
@@ -243,15 +339,16 @@ def print_trades(trades):
         return
 
     print(f"\n  {'Date':<10} {'Game':<12} {'Strike':>7} {'Side':<6} {'Cost':>5} "
-          f"{'Edge':>6} {'Actual':>7} {'Won':>4} {'P/L':>7} {'CLV':>6}")
-    print(f"  {'-'*78}")
+          f"{'Edge':>6} {'EV':>6} {'Actual':>7} {'Won':>4} {'P/L':>7} {'CLV':>6}")
+    print(f"  {'-'*84}")
 
     for t in trades:
         label = f"{t['away']}@{t['home']}"
         won_str = "Y" if t["won"] else "N"
+        clv_str = f"{t['clv']:>+5.1f}" if t["clv"] is not None else "   N/A"
         print(f"  {t['date']:<10} {label:<12} {t['strike']:>7} {t['side']:<6} "
-              f"{t['cost']:>4}c {t['edge']:>+5.1f} {t['actual_total']:>7} "
-              f"{won_str:>4} {t['pnl']:>+6.1f}c {t['clv']:>+5.1f}")
+              f"{t['cost']:>4}c {t['model_edge']:>+5.1f} {t['ev']:>+5.1f} {t['actual_total']:>7} "
+              f"{won_str:>4} {t['pnl']:>+6.1f}c {clv_str}")
 
 
 def print_summary(trades):
@@ -264,11 +361,14 @@ def print_summary(trades):
     wins = sum(1 for t in trades if t["won"])
     total_pnl = sum(t["pnl"] for t in trades)
     avg_pnl = total_pnl / n
-    avg_edge = sum(t["edge"] for t in trades) / n
-    avg_clv = sum(t["clv"] for t in trades) / n
+    avg_edge = sum(t["model_edge"] for t in trades) / n
     avg_cost = sum(t["cost"] for t in trades) / n
 
     roi = total_pnl / sum(t["cost"] for t in trades) * 100 if n > 0 else 0
+
+    # CLV stats (only where available)
+    clv_trades = [t for t in trades if t["clv"] is not None]
+    avg_clv = sum(t["clv"] for t in clv_trades) / len(clv_trades) if clv_trades else 0
 
     print(f"\n  ── AGGREGATE SUMMARY ──")
     print(f"  Total trades:    {n}")
@@ -276,9 +376,14 @@ def print_summary(trades):
     print(f"  Total P/L:       {total_pnl:+.1f}c")
     print(f"  Avg P/L:         {avg_pnl:+.1f}c per trade")
     print(f"  ROI:             {roi:+.1f}%")
-    print(f"  Avg edge:        {avg_edge:+.1f}%")
-    print(f"  Avg CLV:         {avg_clv:+.1f}%")
+    print(f"  Avg model edge:  {avg_edge:+.1f}%")
     print(f"  Avg cost:        {avg_cost:.0f}c")
+    if clv_trades:
+        print(f"  Avg CLV:         {avg_clv:+.1f}c ({len(clv_trades)}/{n} with closing data)")
+    else:
+        print(f"  Avg CLV:         N/A (no closing snapshots)")
+    print(f"\n  Gates: vol>={MIN_VOLUME}, spread<={MAX_SPREAD}c, "
+          f"edge>={MIN_EDGE_PCT}%, EV>={MIN_EV_AFTER_FEES}c")
 
     # By side
     for side in ["OVER", "UNDER"]:
@@ -308,8 +413,8 @@ def save_results(trades):
     import csv
 
     fields = ["date", "game_id", "home", "away", "decision_time", "period",
-              "thru_3q", "projection", "std", "strike", "side", "cost", "edge",
-              "model_prob", "actual_total", "won", "pnl", "clv", "volume", "ticker"]
+              "thru_3q", "projection", "std", "strike", "side", "cost", "model_edge",
+              "ev", "model_prob", "actual_total", "won", "pnl", "clv", "volume", "ticker"]
 
     write_header = not RESULTS_CSV.exists()
     with open(RESULTS_CSV, "a", newline="") as f:
@@ -337,7 +442,9 @@ def main():
 
     artifact = load_ml_artifact()
     if artifact:
-        print(f"Using ML model (trained {artifact.get('trained_at', '?')[:10]})")
+        use_ml = artifact.get("use_ml", True)
+        mode = "ML projection" if use_ml else "linear + ML std/snapshot"
+        print(f"Model: {mode} (trained {artifact.get('trained_at', '?')[:10]})")
     else:
         print("No ML model found, using linear regression")
 
@@ -377,7 +484,8 @@ def main():
             save_results(all_trades)
     else:
         print("\n  No actionable trades across all logged days.")
-        print("  (Trades require edge >= 5% at end of Q3 / early Q4)")
+        print(f"  (Gates: period>=3 end, vol>={MIN_VOLUME}, spread<={MAX_SPREAD}c, "
+              f"edge>={MIN_EDGE_PCT}%, EV>={MIN_EV_AFTER_FEES}c)")
 
 
 if __name__ == "__main__":
