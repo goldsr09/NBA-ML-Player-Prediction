@@ -5887,14 +5887,19 @@ def grade_canonical_results(target_date: str) -> pd.DataFrame:
 
     # Fetch actual results from boxscores
     print("  Loading actual game results...", flush=True)
-    _schedule_df, _team_games, player_games = build_team_games_and_players(include_historical=False)
+    schedule_df, _team_games, player_games = build_team_games_and_players(include_historical=False)
 
     ext = load_extended_player_stats()
     if not ext.empty:
         player_games = player_games.merge(ext, on=["game_id", "team", "player_id"], how="left")
 
+    # player_games may lack game_date_est; derive it from the schedule.
+    if "game_date_est" not in player_games.columns and "game_date_est" in schedule_df.columns:
+        date_map = schedule_df[["game_id", "game_date_est"]].drop_duplicates("game_id")
+        player_games = player_games.merge(date_map, on="game_id", how="left")
+
     if "game_date_est" in player_games.columns:
-        actual_games = player_games[player_games["game_date_est"] == target_date].copy()
+        actual_games = player_games[player_games["game_date_est"].astype(str) == str(target_date)].copy()
     else:
         actual_games = pd.DataFrame()
 
@@ -5904,6 +5909,11 @@ def grade_canonical_results(target_date: str) -> pd.DataFrame:
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     graded_count = 0
+
+    # Ensure string-typed columns aren't stuck as float64 (all-NaN at creation).
+    for col in ("graded_at",):
+        if col in history.columns:
+            history[col] = history[col].astype(object)
 
     for idx, row in target_rows.iterrows():
         if pd.notna(row.get("actual_value")):
