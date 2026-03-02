@@ -231,9 +231,13 @@ def normalize_player_name(name: Any) -> str:
     return s
 
 
-def generate_prediction_id(date: str, name_norm: str, stat_type: str) -> str:
-    """Deterministic dedup key for canonical results: '{date}_{name_norm}_{stat_type}'."""
-    return f"{date}_{name_norm}_{stat_type}"
+def generate_prediction_id(date: str, name_norm: str, stat_type: str, team: str = "") -> str:
+    """Deterministic dedup key: '{date}_{team}_{name_norm}_{stat_type}'.
+
+    Team is included to avoid same-name collisions across teams.
+    """
+    team_norm = (team or "").upper().strip()
+    return f"{date}_{team_norm}_{name_norm}_{stat_type}"
 
 
 def _injury_key(team: str, player_name: str) -> str:
@@ -3283,8 +3287,14 @@ def load_cached_prop_lines(max_dates: int = 180) -> pd.DataFrame:
 def _build_market_training_frame(
     player_df: pd.DataFrame,
     max_dates: int = 180,
+    pretrained_models: tuple[dict[str, Any], dict[str, tuple[SimpleImputer, XGBRegressor, list[str]]]] | None = None,
 ) -> pd.DataFrame:
-    """Join cached market lines to historical rows with model predictions."""
+    """Join cached market lines to historical rows with model predictions.
+
+    If ``pretrained_models`` is provided as (two_stage_models, single_models),
+    those are reused instead of training from scratch — avoids expensive
+    duplicate training within a single run.
+    """
     lines = load_cached_prop_lines(max_dates=max_dates)
     if lines.empty:
         return pd.DataFrame()
@@ -3302,7 +3312,10 @@ def _build_market_training_frame(
         return pd.DataFrame()
 
     # Out-of-sample predictions for residual training (avoid leakage).
-    two_stage, single_models = train_prediction_models(fit_df)
+    if pretrained_models is not None:
+        two_stage, single_models = pretrained_models
+    else:
+        two_stage, single_models = train_prediction_models(fit_df)
     pred_hist = score_df.copy()
     if two_stage:
         pred_hist = predict_two_stage(two_stage, pred_hist)
@@ -3376,9 +3389,10 @@ def _build_market_training_frame(
 def train_market_residual_models(
     player_df: pd.DataFrame,
     max_dates: int = 180,
+    pretrained_models: tuple[dict[str, Any], dict[str, tuple[SimpleImputer, XGBRegressor, list[str]]]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
     """Train per-stat market residual and calibration models."""
-    market_df = _build_market_training_frame(player_df, max_dates=max_dates)
+    market_df = _build_market_training_frame(player_df, max_dates=max_dates, pretrained_models=pretrained_models)
     residual_models: dict[str, dict[str, Any]] = {}
     calibrators: dict[str, dict[str, Any]] = {}
     diagnostics: dict[str, Any] = {"rows": int(len(market_df)), "per_stat": {}}
@@ -5761,7 +5775,8 @@ def save_canonical_results(
     for _, r in prop_edges.iterrows():
         name_norm = normalize_player_name(r.get("player_name", ""))
         stat_type = str(r.get("stat_type", ""))
-        pid = generate_prediction_id(target_date, name_norm, stat_type)
+        team = str(r.get("team", ""))
+        pid = generate_prediction_id(target_date, name_norm, stat_type, team=team)
         rows.append({
             "prediction_id": pid,
             "game_date_est": target_date,
@@ -5819,19 +5834,29 @@ def save_canonical_results(
 
     new_df = pd.DataFrame(rows)
 
-    # Load existing history, remove rows for this date, append new
+    # Merge with existing history, keeping the FIRST-written row per prediction_id
+    # to preserve decision-time snapshots (no hindsight bias from reruns).
     if PROP_RESULTS_HISTORY_FILE.exists():
         try:
             existing = pd.read_csv(PROP_RESULTS_HISTORY_FILE)
-            existing = existing[existing["game_date_est"].astype(str) != str(target_date)]
-            combined = pd.concat([existing, new_df], ignore_index=True)
+            existing_ids = set(existing["prediction_id"].astype(str))
+            # Only insert rows whose prediction_id doesn't already exist
+            truly_new = new_df[~new_df["prediction_id"].isin(existing_ids)]
+            combined = pd.concat([existing, truly_new], ignore_index=True)
+            n_new = len(truly_new)
+            n_skipped = len(new_df) - n_new
         except Exception:
             combined = new_df
+            n_new = len(new_df)
+            n_skipped = 0
     else:
         combined = new_df
+        n_new = len(new_df)
+        n_skipped = 0
 
     combined.to_csv(PROP_RESULTS_HISTORY_FILE, index=False)
-    print(f"  Canonical results saved: {len(new_df)} rows for {target_date} -> {PROP_RESULTS_HISTORY_FILE}", flush=True)
+    skip_msg = f" ({n_skipped} already existed)" if n_skipped else ""
+    print(f"  Canonical results saved: {n_new} new rows for {target_date}{skip_msg} -> {PROP_RESULTS_HISTORY_FILE}", flush=True)
     return PROP_RESULTS_HISTORY_FILE
 
 
@@ -5888,18 +5913,25 @@ def grade_canonical_results(target_date: str) -> pd.DataFrame:
         stat_type = str(row.get("stat_type", ""))
         team = str(row.get("team", ""))
 
-        # Match by normalized name + team
+        # Match by exact normalized name + team (no substring fallback to avoid
+        # ambiguous matches like "Gary Harris" matching "Tobias Harris").
         actual_norm = actual_games["player_name"].map(normalize_player_name)
         pred_norm = normalize_player_name(player_name)
         mask = actual_norm.eq(pred_norm)
-        if not mask.any() and pred_norm:
-            mask = actual_norm.str.contains(re.escape(pred_norm), na=False)
         if team:
             mask = mask & (actual_games["team"] == team)
 
         matched = actual_games[mask]
         if matched.empty:
             continue
+
+        if len(matched) > 1:
+            # Multiple matches (shouldn't happen with exact norm + team). Take first
+            # but log a warning so it can be investigated.
+            print(
+                f"    Warning: multiple matches for {player_name} ({team}), using first",
+                flush=True,
+            )
 
         actual_row = matched.iloc[0]
         actual_val = actual_row.get(stat_type, np.nan)
@@ -5984,7 +6016,8 @@ def migrate_tracking_to_canonical() -> None:
         name = str(r.get("player_name", ""))
         name_norm = normalize_player_name(name)
         stat_type = str(r.get("stat_type", ""))
-        pid = generate_prediction_id(date, name_norm, stat_type)
+        team = str(r.get("team", ""))
+        pid = generate_prediction_id(date, name_norm, stat_type, team=team)
         rows.append({
             "prediction_id": pid,
             "game_date_est": date,
@@ -6438,6 +6471,7 @@ def main() -> None:
     residual_models, market_calibs, diag = train_market_residual_models(
         player_df,
         max_dates=args.market_model_max_dates,
+        pretrained_models=(two_stage_models, single_models),
     )
     coverage = summarize_market_coverage(diag)
     market_rows = int(coverage.get("total_rows", 0))
