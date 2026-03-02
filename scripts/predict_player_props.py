@@ -98,7 +98,7 @@ _EXTENDED_STATS_CACHE: pd.DataFrame | None = None  # Invalidated when new fields
 _BOX_ADV_CACHE: pd.DataFrame | None = None
 PLAYER_FEATURE_CACHE_FILE = MODEL_DIR / "player_features_cache.pkl"
 PLAYER_FEATURE_CACHE_META = MODEL_DIR / "player_features_cache_meta.json"
-PLAYER_FEATURE_CACHE_VERSION = "v4"  # v4: market line features + residual model
+PLAYER_FEATURE_CACHE_VERSION = "v5"  # v5: minutes model + recency + matchup deltas
 NO_LINES_RETRY_SECS_SAME_DAY = 45 * 60
 BOX_ADV_REQUEST_SLEEP_SECS = 1.0
 BOX_ADV_DEFAULT_RETRIES = 5
@@ -119,6 +119,9 @@ MIN_EDGE_PCT = 15.0        # minimum edge% to signal (e.g., pred 23 vs line 20 =
 MIN_EV = 0.20              # minimum EV to signal (20 cents per dollar)
 BEST_BET_EV = 0.40         # EV threshold for "best bet" flag
 MAX_SIGNALS_PER_DAY = 10   # cap total signals to avoid overexposure
+MAX_SIGNALS_PER_PLAYER = 2       # cap signals per player (already enforced in portfolio filter)
+MAX_SIGNALS_PER_GAME = 4         # cap signals from a single game
+MAX_SIGNALS_PER_TEAM = 3         # cap signals from one team's players
 USE_BOXSCORE_ADV_FEATURES = True
 
 # Signal policy controls
@@ -156,6 +159,16 @@ CALIB_MIN_SAMPLE = 50       # minimum graded rows per slice for calibration metr
 CALIB_DEFAULT_LOOKBACK_DAYS = 90
 CALIB_RELIABILITY_LOOKBACK_DAYS = 30
 CALIB_RELIABILITY_MIN_SAMPLE = 50
+
+# Phase 1: OOF validation fold minimum size
+OOF_MIN_VAL_FOLD_SIZE = 100
+
+# Phase 10: Deploy gate thresholds
+DEPLOY_GATE_MIN_GRADED_PER_STAT = 100
+DEPLOY_GATE_MIN_CLV = 0.0
+DEPLOY_GATE_MAX_BRIER = 0.28
+DEPLOY_GATE_MAX_MODEL_AGE_DAYS = 14
+DEPLOY_GATES_ENFORCE = False  # advisory mode initially
 
 # Canonical results history (Phase 1)
 PROP_RESULTS_HISTORY_FILE = PREDICTIONS_DIR / "prop_results_history.csv"
@@ -231,13 +244,9 @@ def normalize_player_name(name: Any) -> str:
     return s
 
 
-def generate_prediction_id(date: str, name_norm: str, stat_type: str, team: str = "") -> str:
-    """Deterministic dedup key: '{date}_{team}_{name_norm}_{stat_type}'.
-
-    Team is included to avoid same-name collisions across teams.
-    """
-    team_norm = (team or "").upper().strip()
-    return f"{date}_{team_norm}_{name_norm}_{stat_type}"
+def generate_prediction_id(date: str, name_norm: str, stat_type: str) -> str:
+    """Deterministic dedup key for canonical results: '{date}_{name_norm}_{stat_type}'."""
+    return f"{date}_{name_norm}_{stat_type}"
 
 
 def _injury_key(team: str, player_name: str) -> str:
@@ -1841,6 +1850,66 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
     # Starter rate
     grp_starter = pg.groupby(player_group)["starter"]
     pg["pre_starter_rate"] = grp_starter.transform(lambda s: s.shift(1).rolling(10, min_periods=1).mean())
+
+    # --- Phase 3: Enhanced minutes model features ---
+    # DNP rate: fraction of recent games with < 5 minutes (shift(1) to avoid leakage)
+    if "minutes" in pg.columns:
+        pg["_dnp_flag"] = (pg["minutes"] < 5).astype(float)
+        pg["dnp_rate_last10"] = pg.groupby(player_group)["_dnp_flag"].transform(
+            lambda s: s.shift(1).rolling(10, min_periods=3).mean()
+        )
+        pg.drop(columns=["_dnp_flag"], inplace=True, errors="ignore")
+
+    # Foul trouble tendency: fouls per minute
+    if "pre_fouls_personal_avg5" in pg.columns and "pre_minutes_avg5" in pg.columns:
+        safe_min = pg["pre_minutes_avg5"].clip(lower=1.0)
+        pg["pre_fouls_per_min_avg5"] = pg["pre_fouls_personal_avg5"].fillna(0) / safe_min
+
+    # Starter benched rate: started but got < 15 min in last 3 games
+    if "starter" in pg.columns and "minutes" in pg.columns:
+        pg["_starter_benched"] = ((pg["starter"] > 0) & (pg["minutes"] < 15)).astype(float)
+        pg["starter_benched_rate3"] = pg.groupby(player_group)["_starter_benched"].transform(
+            lambda s: s.shift(1).rolling(3, min_periods=1).mean()
+        )
+        pg.drop(columns=["_starter_benched"], inplace=True, errors="ignore")
+
+    # --- Phase 7: Recency-weighted features ---
+    recency_stat_cols = ["points", "rebounds", "assists", "fg3m", "minutes"]
+    for col in recency_stat_cols:
+        # Use the renamed rolling cols (no _reg suffix)
+        avg_col = f"pre_{col}_avg5" if f"pre_{col}_avg5" in pg.columns else None
+        season_col = f"pre_{col}_season" if f"pre_{col}_season" in pg.columns else None
+
+        # EWM variance (captures inconsistency weighted toward recent games)
+        raw_col = col if col in pg.columns else None
+        if raw_col:
+            pg[f"pre_{col}_ewm_var5"] = pg.groupby(player_group)[raw_col].transform(
+                lambda s: s.shift(1).ewm(span=5, min_periods=3).var()
+            )
+
+        # Momentum / trend: slope of last 5 games via linear regression
+        if raw_col:
+            def _rolling_slope(s: pd.Series) -> pd.Series:
+                shifted = s.shift(1)
+                out = pd.Series(np.nan, index=s.index, dtype=float)
+                for i in range(4, len(shifted)):
+                    window = shifted.iloc[max(0, i - 4):i + 1].dropna()
+                    if len(window) >= 3:
+                        x = np.arange(len(window), dtype=float)
+                        y = window.values.astype(float)
+                        if np.std(x) > 0:
+                            slope = float(np.polyfit(x, y, 1)[0])
+                            out.iloc[i] = slope
+                return out
+
+            pg[f"pre_{col}_trend5"] = pg.groupby(player_group)[raw_col].transform(_rolling_slope)
+
+        # Recency ratio: avg3 / season_avg (>1 = hot streak)
+        avg3_col = f"pre_{col}_avg3"
+        if avg3_col in pg.columns and season_col and season_col in pg.columns:
+            safe_season = pg[season_col].clip(lower=0.1)
+            pg[f"pre_{col}_recent_vs_season"] = pg[avg3_col].fillna(0) / safe_season
+
     # Defragment after heavy rolling-window feature construction.
     pg = pg.copy()
 
@@ -2169,6 +2238,27 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
         pg["opp_reb_allowed_to_pos_avg10"] = np.nan
         pg["opp_ast_allowed_to_pos_avg10"] = np.nan
 
+    # --- Phase 8: Matchup delta features ---
+    # Player's recent average minus what the opponent allows to that position
+    if "pre_points_avg10" in pg.columns and "opp_pts_allowed_to_pos_avg10" in pg.columns:
+        pg["player_vs_opp_pts_delta"] = (
+            pg["pre_points_avg10"].fillna(0) - pg["opp_pts_allowed_to_pos_avg10"].fillna(0)
+        )
+    else:
+        pg["player_vs_opp_pts_delta"] = 0.0
+    if "pre_rebounds_avg10" in pg.columns and "opp_reb_allowed_to_pos_avg10" in pg.columns:
+        pg["player_vs_opp_reb_delta"] = (
+            pg["pre_rebounds_avg10"].fillna(0) - pg["opp_reb_allowed_to_pos_avg10"].fillna(0)
+        )
+    else:
+        pg["player_vs_opp_reb_delta"] = 0.0
+    if "pre_assists_avg10" in pg.columns and "opp_ast_allowed_to_pos_avg10" in pg.columns:
+        pg["player_vs_opp_ast_delta"] = (
+            pg["pre_assists_avg10"].fillna(0) - pg["opp_ast_allowed_to_pos_avg10"].fillna(0)
+        )
+    else:
+        pg["player_vs_opp_ast_delta"] = 0.0
+
     # --- Live-only fields (filled at prediction time) ---
     # Keep these columns in training so feature schemas stay stable.
     pg["injury_availability_prob"] = np.nan
@@ -2437,6 +2527,165 @@ def _run_market_line_ablation(player_df: pd.DataFrame) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 6: Generalized Feature Ablation Framework
+# ---------------------------------------------------------------------------
+
+FEATURE_GROUPS_FOR_ABLATION: dict[str, list[str]] = {
+    "market_lines": [
+        "prop_open_line", "prop_line_vs_avg5", "prop_line_vs_avg10",
+        "implied_over_prob", "line_available",
+    ],
+    "boxscore_advanced": [
+        "pre_adv_usage_pct_avg5", "pre_adv_usage_pct_avg10", "pre_adv_usage_pct_ewm5",
+        "pre_adv_usage_pct_avg3",
+        "pre_adv_pace_avg5", "pre_adv_pace_avg10", "pre_adv_possessions_avg5",
+        "pre_adv_possessions_avg10",
+        "pre_adv_off_rating_avg5", "pre_adv_off_rating_avg10",
+        "pre_adv_ts_pct_avg5", "pre_adv_ts_pct_avg10",
+        "pre_adv_ast_pct_avg5", "pre_adv_ast_pct_avg10",
+        "pre_adv_reb_pct_avg5", "pre_adv_reb_pct_avg10",
+    ],
+    "injury_context": [
+        "team_injury_pressure", "team_injury_proxy_missing_minutes5",
+        "team_injury_proxy_missing_points5", "team_star_player_absent_flag",
+        "team_active_count",
+        "injury_availability_prob", "injury_unavailability_prob",
+        "injury_is_out", "injury_is_doubtful", "injury_is_questionable", "injury_is_probable",
+        "usage_boost_proxy", "minutes_x_injury_pressure", "pace_x_injury_pressure",
+        "role_pts_injury_beta20", "role_reb_injury_beta20",
+        "role_ast_injury_beta20", "role_min_injury_beta20",
+    ],
+    "matchup": [
+        "matchup_pace_avg", "matchup_off_vs_def", "pace_diff_vs_recent",
+        "opp_pts_allowed_to_pos_avg10", "opp_reb_allowed_to_pos_avg10",
+        "opp_ast_allowed_to_pos_avg10",
+        "player_vs_opp_pts_delta", "player_vs_opp_reb_delta", "player_vs_opp_ast_delta",
+    ],
+    "referee": [
+        "ref_crew_avg_total", "ref_crew_avg_fta", "ref_crew_avg_fouls",
+        "ref_crew_avg_pace", "ref_crew_total_over_league_avg", "ref_crew_pace_over_league_avg",
+    ],
+    "vegas_context": [
+        "implied_total", "implied_spread", "implied_team_total",
+        "abs_spread", "spread_x_starter", "is_big_favorite",
+    ],
+    "recency": [
+        "pre_points_ewm_var5", "pre_points_trend5", "pre_points_recent_vs_season",
+        "pre_rebounds_ewm_var5", "pre_rebounds_trend5", "pre_rebounds_recent_vs_season",
+        "pre_assists_ewm_var5", "pre_assists_trend5", "pre_assists_recent_vs_season",
+        "pre_fg3m_ewm_var5", "pre_fg3m_trend5", "pre_fg3m_recent_vs_season",
+        "pre_minutes_ewm_var5", "pre_minutes_trend5", "pre_minutes_recent_vs_season",
+    ],
+}
+
+
+def run_feature_ablation(
+    player_df: pd.DataFrame,
+    feature_groups: dict[str, list[str]] | None = None,
+    targets: list[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Generalized walk-forward feature group ablation.
+
+    For each feature group, runs walk-forward backtest twice:
+    once with all features, once with the group removed.
+    Reports per-group lift/drag with paired t-test significance.
+    """
+    if feature_groups is None:
+        feature_groups = FEATURE_GROUPS_FOR_ABLATION
+    if targets is None:
+        targets = ["points", "rebounds", "assists"]
+        if "fg3m" in player_df.columns and player_df["fg3m"].notna().sum() > 200:
+            targets.append("fg3m")
+
+    if "season" not in player_df.columns:
+        print("  Error: season column required for walk-forward ablation.", flush=True)
+        return {}
+
+    seasons = sorted(player_df["season"].unique())
+    if len(seasons) < 3:
+        print(f"  Need >= 3 seasons. Have: {seasons}", flush=True)
+        return {}
+
+    results: dict[str, dict[str, Any]] = {}
+
+    for group_name, drop_features in feature_groups.items():
+        print(f"\n  === Ablation: removing '{group_name}' ({len(drop_features)} features) ===", flush=True)
+        group_results: dict[str, dict[str, list[float]]] = {
+            t: {"full_mae": [], "ablated_mae": []} for t in targets
+        }
+
+        for i in range(2, len(seasons)):
+            test_season = seasons[i]
+            train_seasons = seasons[:i]
+            train = player_df[player_df["season"].isin(train_seasons)].copy()
+            test = player_df[player_df["season"] == test_season].copy()
+
+            if len(train) < 500 or len(test) < 100:
+                continue
+
+            for target in targets:
+                if target not in train.columns or train[target].notna().sum() < 200:
+                    continue
+
+                full_features = get_feature_list(target, two_stage=False)
+                ablated_features = [f for f in full_features if f not in drop_features]
+
+                try:
+                    # Full model
+                    imp_f, mod_f, used_f = train_prop_model(train, full_features, target)
+                    test_valid = test.dropna(subset=[target]).copy()
+                    if test_valid.empty:
+                        continue
+                    pred_f = predict_prop(imp_f, mod_f, used_f, test_valid)
+                    mae_f = float(mean_absolute_error(test_valid[target], pred_f))
+                    group_results[target]["full_mae"].append(mae_f)
+
+                    # Ablated model (without group)
+                    imp_a, mod_a, used_a = train_prop_model(train, ablated_features, target)
+                    pred_a = predict_prop(imp_a, mod_a, used_a, test_valid)
+                    mae_a = float(mean_absolute_error(test_valid[target], pred_a))
+                    group_results[target]["ablated_mae"].append(mae_a)
+                except ValueError:
+                    continue
+
+        # Report results for this group
+        results[group_name] = {}
+        for target in targets:
+            full_maes = group_results[target]["full_mae"]
+            ablated_maes = group_results[target]["ablated_mae"]
+            if len(full_maes) >= 2 and len(ablated_maes) >= 2:
+                f_mean = np.mean(full_maes)
+                a_mean = np.mean(ablated_maes)
+                diff = a_mean - f_mean  # positive = group helps (removing it hurts)
+                pct = (diff / f_mean * 100) if f_mean > 0 else 0
+                # Paired t-test on per-fold deltas
+                deltas = [a - f for a, f in zip(ablated_maes, full_maes)]
+                if len(deltas) >= 2 and np.std(deltas) > 0:
+                    t_stat, p_val = sp_stats.ttest_1samp(deltas, 0)
+                else:
+                    t_stat, p_val = np.nan, np.nan
+                sig = "*" if pd.notna(p_val) and p_val < 0.05 else ""
+                verdict = "HELPS" if diff > 0 else "HURTS" if diff < 0 else "NEUTRAL"
+                results[group_name][target] = {
+                    "full_mae": round(f_mean, 3),
+                    "ablated_mae": round(a_mean, 3),
+                    "diff": round(diff, 4),
+                    "diff_pct": round(pct, 2),
+                    "p_value": round(float(p_val), 4) if pd.notna(p_val) else None,
+                    "verdict": verdict,
+                }
+                print(
+                    f"    {target:>10s}: full={f_mean:.3f}  w/o {group_name}={a_mean:.3f}  "
+                    f"delta={diff:+.4f} ({pct:+.1f}%) [{verdict}]{sig}",
+                    flush=True,
+                )
+            else:
+                print(f"    {target:>10s}: insufficient folds for comparison", flush=True)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Feature lists for each prop target
 # ---------------------------------------------------------------------------
 
@@ -2530,6 +2779,10 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
         # Foul trouble / engagement
         "pre_fouls_personal_avg5",
         "pre_fouls_personal_avg10",
+        # Phase 8: Matchup deltas
+        "player_vs_opp_pts_delta",
+        "player_vs_opp_reb_delta",
+        "player_vs_opp_ast_delta",
     ]
     if USE_BOXSCORE_ADV_FEATURES:
         common += [
@@ -2545,6 +2798,14 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
         # Minutes model: no per-minute features to avoid circularity
         specific = [
             "pre_points_avg3", "pre_points_avg5",
+            # Phase 3: Enhanced minutes model features
+            "dnp_rate_last10",
+            "pre_fouls_per_min_avg5",
+            "starter_benched_rate3",
+            # Phase 7: Recency features for minutes
+            "pre_minutes_ewm_var5",
+            "pre_minutes_trend5",
+            "pre_minutes_recent_vs_season",
         ]
     elif target == "points":
         specific = [
@@ -2565,6 +2826,8 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             "pre_fga_per_min_avg5", "pre_fta_per_min_avg5",
             # Per-minute rate
             "pre_pts_per_min_avg3", "pre_pts_per_min_avg5", "pre_pts_per_min_ewm5",
+            # Phase 7: Recency features
+            "pre_points_ewm_var5", "pre_points_trend5", "pre_points_recent_vs_season",
         ]
         if USE_BOXSCORE_ADV_FEATURES:
             specific += [
@@ -2599,6 +2862,8 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             "pre_center_depth_risk",
             # Per-minute rate
             "pre_reb_per_min_avg3", "pre_reb_per_min_avg5", "pre_reb_per_min_ewm5",
+            # Phase 7: Recency features
+            "pre_rebounds_ewm_var5", "pre_rebounds_trend5", "pre_rebounds_recent_vs_season",
         ]
         if USE_BOXSCORE_ADV_FEATURES:
             specific += [
@@ -2615,6 +2880,8 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             "pre_tov_avg5", "pre_tov_avg10",
             # Per-minute rate
             "pre_ast_per_min_avg3", "pre_ast_per_min_avg5", "pre_ast_per_min_ewm5",
+            # Phase 7: Recency features
+            "pre_assists_ewm_var5", "pre_assists_trend5", "pre_assists_recent_vs_season",
         ]
         if USE_BOXSCORE_ADV_FEATURES:
             specific += [
@@ -2633,6 +2900,8 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             "pre_points_avg5",
             # Per-minute rate
             "pre_fg3m_per_min_avg3", "pre_fg3m_per_min_avg5", "pre_fg3m_per_min_ewm5",
+            # Phase 7: Recency features
+            "pre_fg3m_ewm_var5", "pre_fg3m_trend5", "pre_fg3m_recent_vs_season",
         ]
         if USE_BOXSCORE_ADV_FEATURES:
             specific += [
@@ -2812,6 +3081,9 @@ def _time_series_oof_predictions(
         fold_val = valid.iloc[val_idx].copy()
         if fold_train.empty or fold_val.empty:
             continue
+        # Phase 1: skip tiny validation folds to avoid noisy OOF predictions
+        if len(val_idx) < OOF_MIN_VAL_FOLD_SIZE:
+            continue
 
         fold_sw = None
         if sample_weight is not None:
@@ -2928,6 +3200,89 @@ def train_oof_residual_models(
     return residual_models
 
 
+def train_uncertainty_models(
+    train_df: pd.DataFrame,
+    two_stage_models: dict[str, Any],
+    min_oof_rows: int = 500,
+) -> dict[str, tuple[SimpleImputer, XGBRegressor, list[str]]]:
+    """Train Phase 4 uncertainty models: predict abs(actual - oof_pred) per stat.
+
+    Output is a predicted MAE; multiply by sqrt(pi/2) ≈ 1.253 to convert to
+    approximate std for the t-distribution.
+
+    Returns dict mapping target -> (imputer, model, features).
+    """
+    uncertainty_models: dict[str, tuple[SimpleImputer, XGBRegressor, list[str]]] = {}
+    stat_targets = ["points", "rebounds", "assists"]
+    if "fg3m" in train_df.columns and train_df["fg3m"].notna().sum() > 200:
+        stat_targets.append("fg3m")
+
+    # Need OOF minutes predictions
+    min_features = get_feature_list("minutes", two_stage=False)
+    oof_minutes = _time_series_oof_predictions(
+        train_df, min_features, "minutes", min_rows=min_oof_rows,
+    )
+    train_df = train_df.copy()
+    train_df["oof_pred_minutes"] = oof_minutes
+
+    for target in stat_targets:
+        if target not in train_df.columns:
+            continue
+
+        stat_features = get_feature_list(target, two_stage=True)
+        oof_preds = _time_series_oof_predictions(
+            train_df, stat_features, target, min_rows=min_oof_rows,
+        )
+
+        oof_col = f"oof_pred_{target}"
+        train_df[oof_col] = oof_preds
+        valid_mask = train_df[oof_col].notna() & train_df[target].notna()
+        valid_df = train_df[valid_mask].copy()
+
+        if len(valid_df) < min_oof_rows:
+            continue
+
+        # Target: absolute error
+        abs_error_col = f"_abs_error_{target}"
+        valid_df[abs_error_col] = np.abs(valid_df[target] - valid_df[oof_col])
+
+        # Features: same as stat model + oof prediction + market features
+        unc_features = stat_features + [
+            oof_col,
+            "oof_pred_minutes",
+            "prop_open_line",
+        ]
+
+        # Conservative hyperparameters for uncertainty model
+        unc_params = {
+            "n_estimators": 150,
+            "max_depth": 4,
+            "learning_rate": 0.03,
+            "subsample": 0.85,
+            "colsample_bytree": 0.8,
+            "reg_lambda": 3.0,
+            "reg_alpha": 0.3,
+            "min_child_weight": 5,
+        }
+
+        try:
+            imp, model, used_feats = train_prop_model(
+                valid_df, unc_features, abs_error_col, params=unc_params,
+            )
+            uncertainty_models[target] = (imp, model, used_feats)
+            pred_mae = valid_df[abs_error_col]
+            print(
+                f"    Uncertainty {target}: trained on {len(valid_df)} rows  "
+                f"mean_abs_error={pred_mae.mean():.2f}",
+                flush=True,
+            )
+        except ValueError as e:
+            print(f"    Uncertainty {target}: training failed ({e})", flush=True)
+            continue
+
+    return uncertainty_models
+
+
 def train_two_stage_models(
     train_df: pd.DataFrame,
 ) -> dict[str, Any]:
@@ -3019,6 +3374,15 @@ def train_two_stage_models(
         print(f"  Stage 3 residual models: {', '.join(sorted(residual_models.keys()))}", flush=True)
     else:
         print("  Stage 3: no residual models trained (insufficient OOF data)", flush=True)
+
+    # Phase 4: Uncertainty models (predict abs(actual - oof_pred))
+    print("  Training uncertainty models (Phase 4)...", flush=True)
+    uncertainty_models = train_uncertainty_models(stage2_train, models, min_oof_rows=500)
+    if uncertainty_models:
+        models["_uncertainty"] = uncertainty_models
+        print(f"  Uncertainty models: {', '.join(sorted(uncertainty_models.keys()))}", flush=True)
+    else:
+        print("  Uncertainty: no models trained (insufficient OOF data)", flush=True)
 
     return models
 
@@ -3292,8 +3656,7 @@ def _build_market_training_frame(
     """Join cached market lines to historical rows with model predictions.
 
     If ``pretrained_models`` is provided as (two_stage_models, single_models),
-    those are reused instead of training from scratch — avoids expensive
-    duplicate training within a single run.
+    those are reused instead of retraining in this function.
     """
     lines = load_cached_prop_lines(max_dates=max_dates)
     if lines.empty:
@@ -3392,7 +3755,11 @@ def train_market_residual_models(
     pretrained_models: tuple[dict[str, Any], dict[str, tuple[SimpleImputer, XGBRegressor, list[str]]]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
     """Train per-stat market residual and calibration models."""
-    market_df = _build_market_training_frame(player_df, max_dates=max_dates, pretrained_models=pretrained_models)
+    market_df = _build_market_training_frame(
+        player_df,
+        max_dates=max_dates,
+        pretrained_models=pretrained_models,
+    )
     residual_models: dict[str, dict[str, Any]] = {}
     calibrators: dict[str, dict[str, Any]] = {}
     diagnostics: dict[str, Any] = {"rows": int(len(market_df)), "per_stat": {}}
@@ -3482,7 +3849,11 @@ def train_market_residual_models(
 def train_synthetic_probability_calibrators(
     player_df: pd.DataFrame,
 ) -> dict[str, dict[str, Any]]:
-    """Fallback calibration from synthetic lines when market history is sparse."""
+    """Fallback calibration from synthetic lines when market history is sparse.
+
+    Phase 5: Fits separate OVER and UNDER calibrators per stat, stored as
+    ``{stat: {"over": calib_over, "under": calib_under}}``.
+    """
     calibrators: dict[str, dict[str, Any]] = {}
     player_df = player_df.sort_values("game_time_utc").reset_index(drop=True)
     cut = int(len(player_df) * 0.8)
@@ -3506,11 +3877,19 @@ def train_synthetic_probability_calibrators(
         line = tv[line_col].to_numpy(dtype=float)
         resid_std = max(float(np.std(actual - pred)), 0.01)
         p_over_raw = 1.0 - sp_stats.norm.cdf((line - pred) / resid_std)
+        p_under_raw = 1.0 - p_over_raw
         non_push = np.abs(actual - line) > 1e-9
-        labels = (actual > line).astype(int)
-        calib = _fit_probability_calibrator(p_over_raw[non_push], labels[non_push])
-        if calib is not None:
-            calibrators[stat] = calib
+        labels_over = (actual > line).astype(int)
+        labels_under = (actual < line).astype(int)
+        calib_over = _fit_probability_calibrator(p_over_raw[non_push], labels_over[non_push])
+        calib_under = _fit_probability_calibrator(p_under_raw[non_push], labels_under[non_push])
+        stat_calibs: dict[str, Any] = {}
+        if calib_over is not None:
+            stat_calibs["over"] = calib_over
+        if calib_under is not None:
+            stat_calibs["under"] = calib_under
+        if stat_calibs:
+            calibrators[stat] = stat_calibs
     return calibrators
 
 
@@ -3571,6 +3950,7 @@ def compute_prop_edges(
     market_residual_models: dict[str, dict[str, Any]] | None = None,
     prob_calibrators: dict[str, dict[str, Any]] | None = None,
     calibration_degraded_stats: set[str] | None = None,
+    uncertainty_models: dict[str, tuple[SimpleImputer, XGBRegressor, list[str]]] | None = None,
 ) -> pd.DataFrame:
     """Compute edges between model predictions and prop lines."""
     if predictions.empty or prop_lines.empty:
@@ -3624,8 +4004,28 @@ def compute_prop_edges(
 
         # Compute p_over and p_under using blended (player-specific + global) std
         resid_std = residual_stds.get(stat_type, np.nan)
+
+        # Phase 4: Use uncertainty model if available
+        unc_std = np.nan
+        if uncertainty_models and stat_type in uncertainty_models:
+            u_imp, u_model, u_feats = uncertainty_models[stat_type]
+            unc_row = pred_row.copy()
+            unc_row[f"oof_pred_{stat_type}"] = pred_base
+            unc_row["oof_pred_minutes"] = pred_row.get("pred_minutes", np.nan)
+            try:
+                unc_pred = predict_prop(u_imp, u_model, u_feats, pd.DataFrame([unc_row]))
+                predicted_mae = float(unc_pred[0])
+                if np.isfinite(predicted_mae) and predicted_mae > 0:
+                    # Convert predicted MAE to std: std ≈ MAE * sqrt(pi/2)
+                    unc_std = predicted_mae * 1.253
+            except Exception:
+                pass
+
         player_std = pred_row.get(f"pre_{stat_type}_std10", np.nan)
-        if pd.notna(player_std) and player_std > 0 and pd.notna(resid_std):
+        if pd.notna(unc_std) and unc_std > 0:
+            # Use uncertainty model output as the blended std
+            blended_std = unc_std
+        elif pd.notna(player_std) and player_std > 0 and pd.notna(resid_std):
             n_games = pred_row.get("player_game_num", 10)
             player_weight = min(n_games / 30, 0.7)  # max 70% player-specific
             blended_std = player_weight * player_std + (1 - player_weight) * resid_std
@@ -5249,11 +5649,100 @@ def format_predictions(pred_df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def apply_portfolio_caps(prop_edges: pd.DataFrame) -> pd.DataFrame:
+    """Apply portfolio de-correlation caps directly to signal rows.
+
+    Non-selected signals are converted to NO BET and annotated via
+    `signal_blocked_reason` so persisted outputs match what is actionable.
+    """
+    if prop_edges.empty or "signal" not in prop_edges.columns:
+        return prop_edges
+
+    out = prop_edges.copy()
+    signal_mask = out["signal"] != "NO BET"
+    signals = out[signal_mask].copy()
+    if signals.empty:
+        return out
+
+    signals["_best_ev"] = signals.apply(
+        lambda r: r["ev_over"] if r["signal"] == "OVER" else r["ev_under"],
+        axis=1,
+    )
+    signals = signals.sort_values("_best_ev", ascending=False)
+
+    blocked_reasons: dict[int, str] = {}
+
+    # Cap 1: per-player with same-direction suppression first.
+    player_counts: dict[str, int] = {}
+    player_directions: dict[str, set[str]] = defaultdict(set)
+    keep_player: list[int] = []
+    for idx, row in signals.iterrows():
+        player = str(row.get("player_name", ""))
+        direction = str(row.get("signal", ""))
+        count = player_counts.get(player, 0)
+        seen_dirs = player_directions[player]
+        if direction in seen_dirs:
+            blocked_reasons[idx] = "portfolio_player_same_direction"
+            continue
+        if count >= MAX_SIGNALS_PER_PLAYER:
+            blocked_reasons[idx] = "portfolio_player_cap"
+            continue
+        keep_player.append(idx)
+        player_counts[player] = count + 1
+        player_directions[player].add(direction)
+    signals = signals.loc[keep_player]
+
+    # Cap 2: per-game
+    game_counts: dict[tuple[str, str], int] = {}
+    keep_game: list[int] = []
+    for idx, row in signals.iterrows():
+        home = str(row.get("home_team", ""))
+        away = str(row.get("away_team", ""))
+        game_key = (home, away) if home else (away, "")
+        count = game_counts.get(game_key, 0)
+        if count >= MAX_SIGNALS_PER_GAME:
+            blocked_reasons[idx] = "portfolio_game_cap"
+            continue
+        keep_game.append(idx)
+        game_counts[game_key] = count + 1
+    signals = signals.loc[keep_game]
+
+    # Cap 3: per-team
+    team_counts: dict[str, int] = {}
+    keep_team: list[int] = []
+    for idx, row in signals.iterrows():
+        team = str(row.get("team", ""))
+        count = team_counts.get(team, 0)
+        if count >= MAX_SIGNALS_PER_TEAM:
+            blocked_reasons[idx] = "portfolio_team_cap"
+            continue
+        keep_team.append(idx)
+        team_counts[team] = count + 1
+    signals = signals.loc[keep_team]
+
+    keep_idx = set(signals.index.tolist())
+    original_signal_idx = set(out[signal_mask].index.tolist())
+    blocked_idx = sorted(original_signal_idx - keep_idx)
+    if blocked_idx:
+        out.loc[blocked_idx, "signal"] = "NO BET"
+        if "confidence" in out.columns:
+            out.loc[blocked_idx, "confidence"] = ""
+        if "signal_blocked_reason" in out.columns:
+            for idx in blocked_idx:
+                reason = blocked_reasons.get(idx, "portfolio_cap")
+                out.at[idx, "signal_blocked_reason"] = reason
+
+    return out
+
+
 def print_prop_edge_summary(prop_edges: pd.DataFrame) -> None:
     """Print a formatted summary of prop edge signals."""
     if prop_edges.empty:
         print("\n  No prop edge data available.", flush=True)
         return
+
+    # Keep display output aligned with persisted actionable signals.
+    prop_edges = apply_portfolio_caps(prop_edges)
 
     n_signals = int((prop_edges["signal"] != "NO BET").sum())
     n_best_bets = int((prop_edges["confidence"] == "BEST BET").sum())
@@ -5290,18 +5779,6 @@ def print_prop_edge_summary(prop_edges: pd.DataFrame) -> None:
     )
     all_signals = all_signals.sort_values("_best_ev", ascending=False)
 
-    # Cap at 2 signals per player to reduce correlation exposure
-    signal_counts: dict[str, int] = {}
-    keep_mask: list[bool] = []
-    for idx, sig_row in all_signals.iterrows():
-        player = sig_row["player_name"]
-        count = signal_counts.get(player, 0)
-        if count < 2:
-            keep_mask.append(True)
-            signal_counts[player] = count + 1
-        else:
-            keep_mask.append(False)
-    all_signals = all_signals[keep_mask]
     n_correlated = int(all_signals.get("correlated", pd.Series(False)).sum()) if "correlated" in all_signals.columns else 0
     if n_correlated > 0:
         print(f"  Correlated signals (same player, same direction): {n_correlated}", flush=True)
@@ -5346,6 +5823,310 @@ def _print_prop_table(df: pd.DataFrame) -> None:
         p_s = f"{p_hit:.3f}" if pd.notna(p_hit) else "  N/A"
         print(f"  {name:25s} {team:5s} {stat:10s} {line:6.1f} {pred:6.1f} "
               f"{edge:+6.1f} {signal:8s} {ev_s:>7s} {p_s:>7s}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Phase 9: Production Monitoring — Daily Report
+# ---------------------------------------------------------------------------
+
+DAILY_METRICS_LOG = PROP_LOG_DIR / "daily_metrics.csv"
+
+
+def generate_daily_report(
+    prop_edges: pd.DataFrame,
+    predictions: pd.DataFrame,
+    target_date: str,
+) -> dict[str, Any]:
+    """Generate a daily health report for production monitoring.
+
+    Checks:
+    1. Feature missingness in today's predictions
+    2. Prediction distribution vs historical norms
+    3. Signal summary by stat/confidence/direction
+    4. Model freshness (days since last retrain)
+
+    Returns report dict and persists metrics to daily_metrics.csv.
+    """
+    report: dict[str, Any] = {"date": target_date, "per_stat": {}}
+
+    # 1. Feature missingness
+    feature_missing: dict[str, float] = {}
+    if not predictions.empty:
+        for col in predictions.columns:
+            pct = float(predictions[col].isna().mean() * 100)
+            if pct > 0:
+                feature_missing[col] = round(pct, 1)
+    max_missing_pct = max(feature_missing.values()) if feature_missing else 0.0
+    high_missing = {k: v for k, v in feature_missing.items() if v > 50}
+    report["feature_missing_pct_max"] = round(max_missing_pct, 1)
+    report["high_missing_features"] = high_missing
+
+    # 2. Prediction distribution per stat
+    pred_cols = [c for c in predictions.columns if c.startswith("pred_") and c != "pred_starter_prob"]
+    pred_stats: dict[str, dict[str, float]] = {}
+    for col in pred_cols:
+        vals = predictions[col].dropna()
+        if vals.empty:
+            continue
+        pred_stats[col] = {
+            "mean": round(float(vals.mean()), 2),
+            "std": round(float(vals.std()), 2),
+            "min": round(float(vals.min()), 2),
+            "max": round(float(vals.max()), 2),
+            "count": int(len(vals)),
+        }
+    report["prediction_distributions"] = pred_stats
+
+    # 3. Signal summary
+    signal_summary: dict[str, dict[str, int]] = {}
+    if not prop_edges.empty:
+        signals = prop_edges[prop_edges["signal"] != "NO BET"]
+        for stat_type, grp in signals.groupby("stat_type"):
+            signal_summary[str(stat_type)] = {
+                "n_signals": int(len(grp)),
+                "n_best_bets": int((grp["confidence"] == "BEST BET").sum()),
+                "n_leans": int((grp["confidence"] == "LEAN").sum()),
+                "n_over": int((grp["signal"] == "OVER").sum()),
+                "n_under": int((grp["signal"] == "UNDER").sum()),
+            }
+    report["signal_summary"] = signal_summary
+
+    # 4. Model freshness
+    model_age_days = np.nan
+    model_files = list(MODEL_DIR.glob("*.joblib"))
+    if model_files:
+        newest = max(model_files, key=lambda p: p.stat().st_mtime)
+        age_secs = time.time() - newest.stat().st_mtime
+        model_age_days = round(age_secs / 86400.0, 1)
+    report["model_age_days"] = model_age_days
+
+    # Print report
+    print(f"\n{'=' * 60}", flush=True)
+    print(f"  DAILY HEALTH REPORT — {target_date}", flush=True)
+    print(f"{'=' * 60}", flush=True)
+
+    if high_missing:
+        print(f"  [ALERT] Features with >50% NaN:", flush=True)
+        for feat, pct in sorted(high_missing.items(), key=lambda x: -x[1])[:10]:
+            print(f"    {feat}: {pct:.1f}% missing", flush=True)
+    else:
+        print(f"  Feature missingness: OK (max {max_missing_pct:.1f}%)", flush=True)
+
+    print(f"\n  Prediction distributions:", flush=True)
+    for col, stats in pred_stats.items():
+        print(f"    {col}: mean={stats['mean']:.1f} std={stats['std']:.1f} "
+              f"[{stats['min']:.1f}, {stats['max']:.1f}] n={stats['count']}", flush=True)
+
+    n_total_signals = sum(s["n_signals"] for s in signal_summary.values())
+    n_total_best = sum(s["n_best_bets"] for s in signal_summary.values())
+    print(f"\n  Signals: {n_total_signals} total ({n_total_best} best bets)", flush=True)
+    for stat, counts in signal_summary.items():
+        print(f"    {stat}: {counts['n_signals']} signals "
+              f"({counts['n_over']}O/{counts['n_under']}U, "
+              f"{counts['n_best_bets']} best)", flush=True)
+
+    if pd.notna(model_age_days):
+        freshness = "OK" if model_age_days < 14 else "STALE"
+        print(f"\n  Model freshness: {model_age_days:.1f} days [{freshness}]", flush=True)
+    else:
+        print(f"\n  Model freshness: no model files found", flush=True)
+
+    print(f"{'=' * 60}\n", flush=True)
+
+    # Persist metrics to daily log
+    PROP_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_rows: list[dict[str, Any]] = []
+    stat_types = set(signal_summary.keys())
+    if not prop_edges.empty and "stat_type" in prop_edges.columns:
+        stat_types |= set(prop_edges["stat_type"].unique())
+    for stat in sorted(stat_types):
+        ss = signal_summary.get(stat, {})
+        stat_signals = (
+            prop_edges[
+                (prop_edges["stat_type"] == stat) & (prop_edges["signal"] != "NO BET")
+            ].copy()
+            if not prop_edges.empty
+            else pd.DataFrame()
+        )
+        mean_ev = np.nan
+        if not stat_signals.empty:
+            selected_ev = np.where(
+                stat_signals["signal"] == "OVER",
+                pd.to_numeric(stat_signals.get("ev_over"), errors="coerce"),
+                pd.to_numeric(stat_signals.get("ev_under"), errors="coerce"),
+            )
+            if np.isfinite(selected_ev).any():
+                mean_ev = float(np.nanmean(selected_ev))
+        log_rows.append({
+            "date": target_date,
+            "stat_type": stat,
+            "n_predictions": int(len(prop_edges[prop_edges["stat_type"] == stat])) if not prop_edges.empty else 0,
+            "n_signals": ss.get("n_signals", 0),
+            "n_best_bets": ss.get("n_best_bets", 0),
+            "n_leans": ss.get("n_leans", 0),
+            "mean_pred": pred_stats.get(f"pred_{stat}", {}).get("mean", np.nan),
+            "mean_edge": float(prop_edges.loc[prop_edges["stat_type"] == stat, "edge"].mean())
+                if not prop_edges.empty and "edge" in prop_edges.columns
+                and len(prop_edges[prop_edges["stat_type"] == stat]) > 0
+                else np.nan,
+            "mean_ev": mean_ev,
+            "feature_missing_pct_max": max_missing_pct,
+            "model_age_days": model_age_days,
+        })
+    if log_rows:
+        new_log = pd.DataFrame(log_rows)
+        if DAILY_METRICS_LOG.exists():
+            try:
+                existing = pd.read_csv(DAILY_METRICS_LOG)
+                existing = existing[existing["date"].astype(str) != str(target_date)]
+                combined = pd.concat([existing, new_log], ignore_index=True)
+            except Exception:
+                combined = new_log
+        else:
+            combined = new_log
+        combined.to_csv(DAILY_METRICS_LOG, index=False)
+
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Phase 10: Deploy Gates
+# ---------------------------------------------------------------------------
+
+
+def check_deploy_gates(target_date: str) -> dict[str, Any]:
+    """Automated go/no-go checks before signals are published.
+
+    Returns a dict with gate names mapped to pass/fail + details.
+    """
+    results: dict[str, Any] = {"date": target_date, "gates": {}}
+
+    # Load graded history
+    history = pd.DataFrame()
+    if PROP_RESULTS_HISTORY_FILE.exists():
+        try:
+            history = pd.read_csv(PROP_RESULTS_HISTORY_FILE)
+        except Exception:
+            pass
+
+    graded = history[history["actual_value"].notna()].copy() if not history.empty else pd.DataFrame()
+
+    # Gate 1: Min graded per stat
+    gate1: dict[str, Any] = {"passed": True, "details": {}, "affected_stats": set()}
+    for stat in ["points", "rebounds", "assists", "fg3m"]:
+        n = int(len(graded[graded["stat_type"] == stat])) if not graded.empty else 0
+        gate1["details"][stat] = n
+        if n < DEPLOY_GATE_MIN_GRADED_PER_STAT:
+            gate1["passed"] = False
+            gate1["affected_stats"].add(stat)
+    results["gates"]["min_graded_per_stat"] = gate1
+
+    # Gate 2: Positive trailing CLV (last 30 days)
+    gate2: dict[str, Any] = {"passed": True, "details": {}}
+    if not graded.empty and "game_date_est" in graded.columns:
+        cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+        recent = graded[
+            (graded["game_date_est"].astype(str) >= cutoff)
+            & (graded["signal"] != "NO BET")
+        ]
+        if not recent.empty and "line_move" in recent.columns:
+            with_move = recent[recent["line_move"].notna()].copy()
+            if not with_move.empty:
+                line_move = pd.to_numeric(with_move["line_move"], errors="coerce")
+                clv_dir = np.where(
+                    with_move["signal"] == "OVER",
+                    line_move,
+                    -line_move,
+                )
+                mean_clv = float(np.nanmean(clv_dir))
+                gate2["details"]["avg_clv_line_pts_30d"] = round(mean_clv, 3)
+                gate2["details"]["n_signals_30d"] = int(len(recent))
+                gate2["details"]["n_with_line_move_30d"] = int(len(with_move))
+                if mean_clv < DEPLOY_GATE_MIN_CLV:
+                    gate2["passed"] = False
+            else:
+                gate2["details"]["n_signals_30d"] = int(len(recent))
+                gate2["details"]["n_with_line_move_30d"] = 0
+                gate2["passed"] = False
+        else:
+            gate2["details"]["n_signals_30d"] = 0
+            gate2["passed"] = False
+    else:
+        gate2["passed"] = False
+        gate2["details"]["reason"] = "no graded history"
+    results["gates"]["positive_trailing_clv"] = gate2
+
+    # Gate 3: Calibration tolerance
+    gate3: dict[str, Any] = {"passed": True, "details": {}, "affected_stats": set()}
+    if not graded.empty and "game_date_est" in graded.columns:
+        cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+        recent_signal = graded[
+            (graded["game_date_est"].astype(str) >= cutoff)
+            & (graded["signal"] != "NO BET")
+        ]
+        if not recent_signal.empty:
+            recent_signal = recent_signal.copy()
+            recent_signal["p_hit"] = np.where(
+                recent_signal["signal"] == "UNDER",
+                recent_signal["p_under"].astype(float),
+                recent_signal["p_over"].astype(float),
+            )
+            for stat, grp in recent_signal.groupby("stat_type"):
+                valid = grp[grp["p_hit"].notna() & grp["hit"].notna()]
+                if len(valid) < 30:
+                    continue
+                brier = float(np.mean(
+                    (valid["p_hit"].astype(float) - valid["hit"].astype(float)) ** 2
+                ))
+                gate3["details"][str(stat)] = {"brier_30d": round(brier, 4), "n": int(len(valid))}
+                if brier > DEPLOY_GATE_MAX_BRIER:
+                    gate3["passed"] = False
+                    gate3["affected_stats"].add(str(stat))
+    results["gates"]["calibration_tolerance"] = gate3
+
+    # Gate 4: Model freshness
+    gate4: dict[str, Any] = {"passed": True, "details": {}}
+    model_files = list(MODEL_DIR.glob("*.joblib"))
+    if model_files:
+        newest = max(model_files, key=lambda p: p.stat().st_mtime)
+        age_days = (time.time() - newest.stat().st_mtime) / 86400.0
+        gate4["details"]["model_age_days"] = round(age_days, 1)
+        gate4["details"]["newest_model"] = newest.name
+        if age_days > DEPLOY_GATE_MAX_MODEL_AGE_DAYS:
+            gate4["passed"] = False
+    else:
+        gate4["passed"] = True  # No persisted models = training fresh each run
+        gate4["details"]["reason"] = "no persisted model files (training fresh)"
+    results["gates"]["model_freshness"] = gate4
+
+    # Summary
+    all_passed = all(g["passed"] for g in results["gates"].values())
+    results["all_passed"] = all_passed
+    return results
+
+
+def _print_deploy_gate_status(gate_results: dict[str, Any]) -> None:
+    """Pretty-print deploy gate status."""
+    print(f"\n{'=' * 60}", flush=True)
+    print(f"  DEPLOY GATE STATUS — {gate_results.get('date', '')}", flush=True)
+    print(f"{'=' * 60}", flush=True)
+
+    for gate_name, gate_info in gate_results.get("gates", {}).items():
+        status = "PASS" if gate_info.get("passed", False) else "FAIL"
+        marker = "  " if gate_info.get("passed", False) else "  [!]"
+        print(f"{marker} {gate_name}: {status}", flush=True)
+        details = gate_info.get("details", {})
+        if isinstance(details, dict):
+            for k, v in details.items():
+                print(f"      {k}: {v}", flush=True)
+        affected = gate_info.get("affected_stats", set())
+        if affected:
+            print(f"      affected_stats: {', '.join(sorted(affected))}", flush=True)
+
+    overall = "ALL GATES PASSED" if gate_results.get("all_passed", False) else "SOME GATES FAILED"
+    enforce = "(ENFORCING)" if DEPLOY_GATES_ENFORCE else "(ADVISORY)"
+    print(f"\n  {overall} {enforce}", flush=True)
+    print(f"{'=' * 60}\n", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -5775,8 +6556,7 @@ def save_canonical_results(
     for _, r in prop_edges.iterrows():
         name_norm = normalize_player_name(r.get("player_name", ""))
         stat_type = str(r.get("stat_type", ""))
-        team = str(r.get("team", ""))
-        pid = generate_prediction_id(target_date, name_norm, stat_type, team=team)
+        pid = generate_prediction_id(target_date, name_norm, stat_type)
         rows.append({
             "prediction_id": pid,
             "game_date_est": target_date,
@@ -5834,29 +6614,19 @@ def save_canonical_results(
 
     new_df = pd.DataFrame(rows)
 
-    # Merge with existing history, keeping the FIRST-written row per prediction_id
-    # to preserve decision-time snapshots (no hindsight bias from reruns).
+    # Load existing history, remove rows for this date, append new
     if PROP_RESULTS_HISTORY_FILE.exists():
         try:
             existing = pd.read_csv(PROP_RESULTS_HISTORY_FILE)
-            existing_ids = set(existing["prediction_id"].astype(str))
-            # Only insert rows whose prediction_id doesn't already exist
-            truly_new = new_df[~new_df["prediction_id"].isin(existing_ids)]
-            combined = pd.concat([existing, truly_new], ignore_index=True)
-            n_new = len(truly_new)
-            n_skipped = len(new_df) - n_new
+            existing = existing[existing["game_date_est"].astype(str) != str(target_date)]
+            combined = pd.concat([existing, new_df], ignore_index=True)
         except Exception:
             combined = new_df
-            n_new = len(new_df)
-            n_skipped = 0
     else:
         combined = new_df
-        n_new = len(new_df)
-        n_skipped = 0
 
     combined.to_csv(PROP_RESULTS_HISTORY_FILE, index=False)
-    skip_msg = f" ({n_skipped} already existed)" if n_skipped else ""
-    print(f"  Canonical results saved: {n_new} new rows for {target_date}{skip_msg} -> {PROP_RESULTS_HISTORY_FILE}", flush=True)
+    print(f"  Canonical results saved: {len(new_df)} rows for {target_date} -> {PROP_RESULTS_HISTORY_FILE}", flush=True)
     return PROP_RESULTS_HISTORY_FILE
 
 
@@ -5887,19 +6657,14 @@ def grade_canonical_results(target_date: str) -> pd.DataFrame:
 
     # Fetch actual results from boxscores
     print("  Loading actual game results...", flush=True)
-    schedule_df, _team_games, player_games = build_team_games_and_players(include_historical=False)
+    _schedule_df, _team_games, player_games = build_team_games_and_players(include_historical=False)
 
     ext = load_extended_player_stats()
     if not ext.empty:
         player_games = player_games.merge(ext, on=["game_id", "team", "player_id"], how="left")
 
-    # player_games may lack game_date_est; derive it from the schedule.
-    if "game_date_est" not in player_games.columns and "game_date_est" in schedule_df.columns:
-        date_map = schedule_df[["game_id", "game_date_est"]].drop_duplicates("game_id")
-        player_games = player_games.merge(date_map, on="game_id", how="left")
-
     if "game_date_est" in player_games.columns:
-        actual_games = player_games[player_games["game_date_est"].astype(str) == str(target_date)].copy()
+        actual_games = player_games[player_games["game_date_est"] == target_date].copy()
     else:
         actual_games = pd.DataFrame()
 
@@ -5910,11 +6675,6 @@ def grade_canonical_results(target_date: str) -> pd.DataFrame:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     graded_count = 0
 
-    # Ensure string-typed columns aren't stuck as float64 (all-NaN at creation).
-    for col in ("graded_at",):
-        if col in history.columns:
-            history[col] = history[col].astype(object)
-
     for idx, row in target_rows.iterrows():
         if pd.notna(row.get("actual_value")):
             continue  # already graded
@@ -5923,25 +6683,18 @@ def grade_canonical_results(target_date: str) -> pd.DataFrame:
         stat_type = str(row.get("stat_type", ""))
         team = str(row.get("team", ""))
 
-        # Match by exact normalized name + team (no substring fallback to avoid
-        # ambiguous matches like "Gary Harris" matching "Tobias Harris").
+        # Match by normalized name + team
         actual_norm = actual_games["player_name"].map(normalize_player_name)
         pred_norm = normalize_player_name(player_name)
         mask = actual_norm.eq(pred_norm)
+        if not mask.any() and pred_norm:
+            mask = actual_norm.str.contains(re.escape(pred_norm), na=False)
         if team:
             mask = mask & (actual_games["team"] == team)
 
         matched = actual_games[mask]
         if matched.empty:
             continue
-
-        if len(matched) > 1:
-            # Multiple matches (shouldn't happen with exact norm + team). Take first
-            # but log a warning so it can be investigated.
-            print(
-                f"    Warning: multiple matches for {player_name} ({team}), using first",
-                flush=True,
-            )
 
         actual_row = matched.iloc[0]
         actual_val = actual_row.get(stat_type, np.nan)
@@ -6026,8 +6779,7 @@ def migrate_tracking_to_canonical() -> None:
         name = str(r.get("player_name", ""))
         name_norm = normalize_player_name(name)
         stat_type = str(r.get("stat_type", ""))
-        team = str(r.get("team", ""))
-        pid = generate_prediction_id(date, name_norm, stat_type, team=team)
+        pid = generate_prediction_id(date, name_norm, stat_type)
         rows.append({
             "prediction_id": pid,
             "game_date_est": date,
@@ -6241,6 +6993,15 @@ def parse_args() -> argparse.Namespace:
     # Phase 4 + Weekly retrain
     p.add_argument("--weekly-retrain", action="store_true",
                    help="Run weekly retrain: fresh models, calibration report, market backtest")
+    # Phase 6: Feature ablation framework
+    p.add_argument("--ablation-features", action="store_true",
+                   help="Run generalized feature group ablation (walk-forward)")
+    # Phase 9: Production monitoring
+    p.add_argument("--daily-report", action="store_true",
+                   help="Generate daily health report from latest predictions")
+    # Phase 10: Deploy gates
+    p.add_argument("--deploy-status", action="store_true",
+                   help="Print current deploy gate status without running predictions")
     return p.parse_args()
 
 
@@ -6275,6 +7036,36 @@ def main() -> None:
         else:
             print(f"Tracking CLV for {target_date}...", flush=True)
             track_prop_clv(target_date)
+        return
+
+    # --- Calibration report mode (history-only) ---
+    if args.calibration_report:
+        print("\nGenerating calibration report from canonical results...", flush=True)
+        report = compute_calibration_report()
+        print_calibration_report(report)
+        report_path = PROP_LOG_DIR / f"calibration_report_{datetime.now().strftime('%Y%m%d')}.json"
+        with open(report_path, "w") as f:
+            json.dump(report, f, indent=2, default=str)
+        print(f"\n  Report saved to {report_path}", flush=True)
+        return
+
+    # --- Daily report mode (history/prediction-file only) ---
+    if args.daily_report:
+        target_date = args.date or datetime.now().strftime("%Y%m%d")
+        print(f"\nGenerating daily health report for {target_date}...", flush=True)
+        pred_file = PREDICTIONS_DIR / f"player_props_{target_date}.csv"
+        edge_file = PREDICTIONS_DIR / f"player_prop_edges_{target_date}.csv"
+        preds = pd.read_csv(pred_file) if pred_file.exists() else pd.DataFrame()
+        edges = pd.read_csv(edge_file) if edge_file.exists() else pd.DataFrame()
+        generate_daily_report(edges, preds, target_date)
+        return
+
+    # --- Deploy status mode (history-only) ---
+    if args.deploy_status:
+        target_date = args.date or datetime.now().strftime("%Y%m%d")
+        print(f"\nDeploy gate status for {target_date}...", flush=True)
+        gate_results = check_deploy_gates(target_date)
+        _print_deploy_gate_status(gate_results)
         return
 
     print("Loading game history and building team/player features...", flush=True)
@@ -6391,22 +7182,14 @@ def main() -> None:
         run_walk_forward_backtest(player_df)
         return
 
-    # --- Calibration report mode (Phase 2) ---
-    if args.calibration_report:
-        print("\nGenerating calibration report from canonical results...", flush=True)
-        report = compute_calibration_report()
-        print_calibration_report(report)
-        # Save JSON
-        report_path = PROP_LOG_DIR / f"calibration_report_{datetime.now().strftime('%Y%m%d')}.json"
-        with open(report_path, "w") as f:
-            json.dump(report, f, indent=2, default=str)
-        print(f"\n  Report saved to {report_path}", flush=True)
-        return
-
     # --- Market lines ablation mode (Phase 3) ---
-    if args.ablation_market_lines:
-        print("\nRunning market-line feature ablation (walk-forward with/without market features)...", flush=True)
-        _run_market_line_ablation(player_df)
+    if args.ablation_market_lines or args.ablation_features:
+        if args.ablation_features:
+            print("\nRunning generalized feature group ablation...", flush=True)
+            run_feature_ablation(player_df)
+        else:
+            print("\nRunning market-line feature ablation (walk-forward with/without market features)...", flush=True)
+            _run_market_line_ablation(player_df)
         return
 
     # --- Weekly retrain mode ---
@@ -6551,6 +7334,9 @@ def main() -> None:
         if degraded_stats:
             print(f"  Calibration drift gate active for: {', '.join(sorted(degraded_stats))}", flush=True)
 
+        # Phase 4: Extract uncertainty models from two_stage_models
+        unc_models = two_stage_models.get("_uncertainty", None) if two_stage_models else None
+
         print("Computing prop edges...", flush=True)
         prop_edges = compute_prop_edges(
             pred_df,
@@ -6559,6 +7345,7 @@ def main() -> None:
             market_residual_models=market_residual_models,
             prob_calibrators=prob_calibrators,
             calibration_degraded_stats=degraded_stats,
+            uncertainty_models=unc_models,
         )
         if not prop_edges.empty:
             pre_signals = int((prop_edges["signal"] != "NO BET").sum())
@@ -6575,6 +7362,43 @@ def main() -> None:
                     f"(window <= {args.lineup_lock_minutes} min)",
                     flush=True,
                 )
+
+            # Phase 2: enforce portfolio caps in persisted outputs.
+            cap_pre = int((prop_edges["signal"] != "NO BET").sum())
+            prop_edges = apply_portfolio_caps(prop_edges)
+            cap_post = int((prop_edges["signal"] != "NO BET").sum())
+            if cap_post != cap_pre:
+                print(f"  Portfolio caps: {cap_pre} -> {cap_post} signals", flush=True)
+
+            # Phase 10: apply deploy gates before writing outputs.
+            gate_results = check_deploy_gates(target_date)
+            any_fail = any(not g.get("passed", True) for g in gate_results.get("gates", {}).values())
+            if any_fail:
+                failed_gates = [k for k, v in gate_results.get("gates", {}).items() if not v.get("passed", True)]
+                print(f"\n  [DEPLOY GATE WARNING] Failed gates: {', '.join(failed_gates)}", flush=True)
+                if DEPLOY_GATES_ENFORCE:
+                    gate_blocked = 0
+                    for gate_name in failed_gates:
+                        gate_info = gate_results["gates"][gate_name]
+                        affected = gate_info.get("affected_stats", set())
+                        if affected:
+                            for stat in affected:
+                                mask = (prop_edges["stat_type"] == stat) & (prop_edges["signal"] != "NO BET")
+                                gate_blocked += int(mask.sum())
+                                prop_edges.loc[mask, "signal"] = "NO BET"
+                                prop_edges.loc[mask, "confidence"] = ""
+                                if "signal_blocked_reason" in prop_edges.columns:
+                                    prop_edges.loc[mask, "signal_blocked_reason"] = f"deploy_gate:{gate_name}"
+                        else:
+                            mask = prop_edges["signal"] != "NO BET"
+                            gate_blocked += int(mask.sum())
+                            prop_edges.loc[mask, "signal"] = "NO BET"
+                            prop_edges.loc[mask, "confidence"] = ""
+                            if "signal_blocked_reason" in prop_edges.columns:
+                                prop_edges.loc[mask, "signal_blocked_reason"] = f"deploy_gate:{gate_name}"
+                    if gate_blocked:
+                        print(f"  Deploy gate enforcement blocked {gate_blocked} signals", flush=True)
+
             edge_out_path = PREDICTIONS_DIR / f"player_prop_edges_{target_date}.csv"
             prop_edges.to_csv(edge_out_path, index=False)
             print(f"  Prop edges saved to {edge_out_path}", flush=True)
@@ -6625,6 +7449,12 @@ def main() -> None:
     # Print prop edge signals
     if not prop_edges.empty:
         print_prop_edge_summary(prop_edges)
+
+    # Phase 9: Auto-generate daily health report
+    try:
+        generate_daily_report(prop_edges, pred_df, target_date)
+    except Exception:
+        pass  # Don't let report crash the main pipeline
 
     # Phase 2: Brief calibration summary if enough graded data exists
     if PROP_RESULTS_HISTORY_FILE.exists():
