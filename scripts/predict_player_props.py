@@ -106,7 +106,7 @@ _BOX_ADV_CACHE: pd.DataFrame | None = None
 _ESPN_ATHLETE_DISK_CACHE_LOADED = False
 PLAYER_FEATURE_CACHE_FILE = MODEL_DIR / "player_features_cache.pkl"
 PLAYER_FEATURE_CACHE_META = MODEL_DIR / "player_features_cache_meta.json"
-PLAYER_FEATURE_CACHE_VERSION = "v11"  # v11: expanded BDL matchup/scoring tracking fields + tracking coverage gate
+PLAYER_FEATURE_CACHE_VERSION = "v11"  # v11: defensive matchup + scoring context from stats.nba.com, tracking dedup fix
 NO_LINES_RETRY_SECS_SAME_DAY = 45 * 60
 BOX_ADV_REQUEST_SLEEP_SECS = 1.0
 BOX_ADV_DEFAULT_RETRIES = 5
@@ -139,7 +139,6 @@ USE_QUANTILE_UNCERTAINTY = True  # Quantile regression for uncertainty (Step 2)
 USE_PLAYER_TARGET_ENCODING = False  # Per-player target encoding (Step 4, experimental)
 USE_MARKET_LINE_BLENDING = False  # Market line blending (Step 6, gated)
 MARKET_LINE_BLEND_ALPHA = 0.5  # Weight on model prediction (vs 1-alpha on market line)
-MIN_TRACKING_FEATURE_NONNULL_RATE = 0.05  # Drop sparse pre_trk_* features below this training coverage.
 
 # OVER signal hardening: drop LEAN OVER, require lineup confirmation + low injury risk
 SUPPRESS_LEAN_OVER = True  # Only allow BEST BET OVER; LEAN OVER → NO BET
@@ -1092,10 +1091,7 @@ def _parse_tracking_payload(payload: dict[str, Any], game_id: str) -> list[dict[
             dist_i = idx("DIST_MILES", "DIST")
             speed_i = idx("AVG_SPEED", "SPEED")
             cont_shots_i = idx("CONTESTED_SHOTS", "CONT_SHOTS")
-            cont_shots_2pt_i = idx("CONTESTED_SHOTS_2PT")
-            cont_shots_3pt_i = idx("CONTESTED_SHOTS_3PT")
             uncontested_fga_i = idx("UNCONTESTED_FGA")
-            uncontested_fgm_i = idx("UNCONTESTED_FGM")
             # Hustle stats (from BDL advanced)
             deflections_i = idx("DEFLECTIONS")
             box_outs_i = idx("BOX_OUTS")
@@ -1112,18 +1108,6 @@ def _parse_tracking_payload(payload: dict[str, Any], game_id: str) -> list[dict[
             pts_paint_i = idx("PTS_PAINT")
             pts_fb_i = idx("PTS_FAST_BREAK")
             pts_off_to_i = idx("PTS_OFF_TO")
-            pts_second_chance_i = idx("PTS_SECOND_CHANCE")
-            screen_ast_pts_i = idx("SCREEN_ASSIST_PTS")
-            charges_drawn_i = idx("CHARGES_DRAWN")
-            switches_on_i = idx("SWITCHES_ON")
-            # Matchup-defense stats
-            matchup_fg_pct_i = idx("MATCHUP_FG_PCT")
-            matchup_fga_i = idx("MATCHUP_FGA")
-            matchup_fgm_i = idx("MATCHUP_FGM")
-            matchup_3pt_pct_i = idx("MATCHUP_3PT_PCT")
-            matchup_3pa_i = idx("MATCHUP_3PA")
-            matchup_3pm_i = idx("MATCHUP_3PM")
-            matchup_player_pts_i = idx("MATCHUP_PLAYER_PTS")
             if pid_i < 0 or team_i < 0:
                 continue
 
@@ -1154,10 +1138,7 @@ def _parse_tracking_payload(payload: dict[str, Any], game_id: str) -> list[dict[
                     "trk_dist_miles": _safe(r, dist_i),
                     "trk_avg_speed": _safe(r, speed_i),
                     "trk_contested_shots": _safe(r, cont_shots_i),
-                    "trk_contested_shots_2pt": _safe(r, cont_shots_2pt_i),
-                    "trk_contested_shots_3pt": _safe(r, cont_shots_3pt_i),
                     "trk_uncontested_fga": _safe(r, uncontested_fga_i),
-                    "trk_uncontested_fgm": _safe(r, uncontested_fgm_i),
                     # Hustle stats
                     "trk_deflections": _safe(r, deflections_i),
                     "trk_box_outs": _safe(r, box_outs_i),
@@ -1174,18 +1155,6 @@ def _parse_tracking_payload(payload: dict[str, Any], game_id: str) -> list[dict[
                     "trk_pts_paint": _safe(r, pts_paint_i),
                     "trk_pts_fast_break": _safe(r, pts_fb_i),
                     "trk_pts_off_to": _safe(r, pts_off_to_i),
-                    "trk_pts_second_chance": _safe(r, pts_second_chance_i),
-                    "trk_screen_assist_pts": _safe(r, screen_ast_pts_i),
-                    "trk_charges_drawn": _safe(r, charges_drawn_i),
-                    "trk_switches_on": _safe(r, switches_on_i),
-                    # Matchup-defense stats
-                    "trk_matchup_fg_pct": _safe(r, matchup_fg_pct_i),
-                    "trk_matchup_fga": _safe(r, matchup_fga_i),
-                    "trk_matchup_fgm": _safe(r, matchup_fgm_i),
-                    "trk_matchup_3pt_pct": _safe(r, matchup_3pt_pct_i),
-                    "trk_matchup_3pa": _safe(r, matchup_3pa_i),
-                    "trk_matchup_3pm": _safe(r, matchup_3pm_i),
-                    "trk_matchup_player_pts": _safe(r, matchup_player_pts_i),
                 }
                 rows.append(row_dict)
         if rows:
@@ -1226,10 +1195,7 @@ def _parse_tracking_payload(payload: dict[str, Any], game_id: str) -> list[dict[
                 "trk_dist_miles": _to_float(stats.get("distanceMiles") or stats.get("DIST_MILES") or stats.get("dist")),
                 "trk_avg_speed": _to_float(stats.get("averageSpeed") or stats.get("AVG_SPEED") or stats.get("speed")),
                 "trk_contested_shots": _to_float(stats.get("contestedShots") or stats.get("CONTESTED_SHOTS")),
-                "trk_contested_shots_2pt": _to_float(stats.get("contestedShots2Pt") or stats.get("CONTESTED_SHOTS_2PT")),
-                "trk_contested_shots_3pt": _to_float(stats.get("contestedShots3Pt") or stats.get("CONTESTED_SHOTS_3PT")),
                 "trk_uncontested_fga": _to_float(stats.get("uncontestedFga") or stats.get("UNCONTESTED_FGA")),
-                "trk_uncontested_fgm": _to_float(stats.get("uncontestedFgm") or stats.get("UNCONTESTED_FGM")),
                 # Hustle stats (populated by BDL via Shape A; CDN keys here as fallback)
                 "trk_deflections": _to_float(stats.get("deflections") or stats.get("DEFLECTIONS")),
                 "trk_box_outs": _to_float(stats.get("boxOuts") or stats.get("BOX_OUTS")),
@@ -1244,18 +1210,6 @@ def _parse_tracking_payload(payload: dict[str, Any], game_id: str) -> list[dict[
                 "trk_pts_paint": _to_float(stats.get("pointsPaint") or stats.get("PTS_PAINT")),
                 "trk_pts_fast_break": _to_float(stats.get("pointsFastBreak") or stats.get("PTS_FAST_BREAK")),
                 "trk_pts_off_to": _to_float(stats.get("pointsOffTurnovers") or stats.get("PTS_OFF_TO")),
-                "trk_pts_second_chance": _to_float(stats.get("pointsSecondChance") or stats.get("PTS_SECOND_CHANCE")),
-                "trk_screen_assist_pts": _to_float(stats.get("screenAssistPoints") or stats.get("SCREEN_ASSIST_PTS")),
-                "trk_charges_drawn": _to_float(stats.get("chargesDrawn") or stats.get("CHARGES_DRAWN")),
-                "trk_switches_on": _to_float(stats.get("switchesOn") or stats.get("SWITCHES_ON")),
-                # Matchup-defense stats
-                "trk_matchup_fg_pct": _to_float(stats.get("matchupFgPct") or stats.get("MATCHUP_FG_PCT")),
-                "trk_matchup_fga": _to_float(stats.get("matchupFga") or stats.get("MATCHUP_FGA")),
-                "trk_matchup_fgm": _to_float(stats.get("matchupFgm") or stats.get("MATCHUP_FGM")),
-                "trk_matchup_3pt_pct": _to_float(stats.get("matchup3ptPct") or stats.get("MATCHUP_3PT_PCT")),
-                "trk_matchup_3pa": _to_float(stats.get("matchup3pa") or stats.get("MATCHUP_3PA")),
-                "trk_matchup_3pm": _to_float(stats.get("matchup3pm") or stats.get("MATCHUP_3PM")),
-                "trk_matchup_player_pts": _to_float(stats.get("matchupPlayerPoints") or stats.get("MATCHUP_PLAYER_PTS")),
             })
     return rows
 
@@ -1319,6 +1273,173 @@ def load_player_tracking_stats(
     out = _TRACKING_CACHE
     if wanted_ids is not None:
         out = out[out["game_id"].astype(str).isin(wanted_ids)]
+    return out.copy()
+
+
+# ---------------------------------------------------------------------------
+# Defensive + Scoring boxscore stats (from stats.nba.com)
+# ---------------------------------------------------------------------------
+DEFENSIVE_CACHE_DIR = PROP_CACHE_DIR / "boxscore_defensive_raw"
+SCORING_CACHE_DIR = PROP_CACHE_DIR / "boxscore_scoring_raw"
+_DEFENSIVE_CACHE: pd.DataFrame | None = None
+_SCORING_CACHE: pd.DataFrame | None = None
+
+
+def _parse_minutes_str(v: Any) -> float:
+    """Parse 'MM:SS' or 'PTXXMYY.ZZS' to float minutes."""
+    if v is None:
+        return np.nan
+    s = str(v).strip()
+    if ":" in s:
+        parts = s.split(":")
+        try:
+            return float(parts[0]) + float(parts[1]) / 60.0
+        except (ValueError, IndexError):
+            return np.nan
+    if s.startswith("PT") and s.endswith("S"):
+        s = s[2:-1]
+        mins = 0.0
+        if "M" in s:
+            m_part, s = s.split("M")
+            mins = float(m_part)
+        if s:
+            mins += float(s) / 60.0
+        return mins
+    try:
+        return float(s)
+    except ValueError:
+        return np.nan
+
+
+def load_defensive_stats(
+    game_ids: list[str] | pd.Series | np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Load boxscoredefensivev2 data from local cache."""
+    global _DEFENSIVE_CACHE
+    if _DEFENSIVE_CACHE is None:
+        rows: list[dict[str, Any]] = []
+        if DEFENSIVE_CACHE_DIR.is_dir():
+            for f in sorted(DEFENSIVE_CACHE_DIR.glob("*.json")):
+                gid = f.stem
+                try:
+                    data = json.loads(f.read_text())
+                except Exception:
+                    continue
+                if "empty" in data:
+                    continue
+                root = data.get("boxScoreDefensive") or data
+                for side_key in ("homeTeam", "awayTeam"):
+                    side = root.get(side_key)
+                    if not isinstance(side, dict):
+                        continue
+                    team = str(
+                        side.get("teamTricode") or side.get("teamCode") or ""
+                    ).upper().strip()
+                    for p in side.get("players") or []:
+                        if not isinstance(p, dict):
+                            continue
+                        pid = p.get("personId") or p.get("playerId")
+                        if pid is None:
+                            continue
+                        st = p.get("statistics") or {}
+                        rows.append({
+                            "game_id": str(gid),
+                            "team": team,
+                            "player_id": int(pid),
+                            "def_matchup_fga": _to_float(st.get("matchupFieldGoalsAttempted")),
+                            "def_matchup_fgm": _to_float(st.get("matchupFieldGoalsMade")),
+                            "def_matchup_fg_pct": _to_float(st.get("matchupFieldGoalPercentage")),
+                            "def_matchup_3pa": _to_float(st.get("matchupThreePointersAttempted")),
+                            "def_matchup_3pm": _to_float(st.get("matchupThreePointersMade")),
+                            "def_matchup_3pt_pct": _to_float(st.get("matchupThreePointerPercentage")),
+                            "def_matchup_minutes": _parse_minutes_str(st.get("matchupMinutes")),
+                            "def_matchup_assists": _to_float(st.get("matchupAssists")),
+                            "def_matchup_tov": _to_float(st.get("matchupTurnovers")),
+                            "def_matchup_player_pts": _to_float(st.get("playerPoints")),
+                            "def_switches_on": _to_float(st.get("switchesOn")),
+                            "def_partial_poss": _to_float(st.get("partialPossessions")),
+                        })
+        if not rows:
+            _DEFENSIVE_CACHE = pd.DataFrame()
+        else:
+            df = pd.DataFrame(rows).drop_duplicates(
+                subset=["game_id", "team", "player_id"], keep="first"
+            )
+            _DEFENSIVE_CACHE = df.reset_index(drop=True)
+
+    if _DEFENSIVE_CACHE is None or _DEFENSIVE_CACHE.empty:
+        return pd.DataFrame()
+    out = _DEFENSIVE_CACHE
+    if game_ids is not None:
+        wanted = sorted({str(g) for g in list(game_ids) if str(g).strip()})
+        out = out[out["game_id"].astype(str).isin(wanted)]
+    return out.copy()
+
+
+def load_scoring_stats(
+    game_ids: list[str] | pd.Series | np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Load boxscorescoringv3 data from local cache."""
+    global _SCORING_CACHE
+    if _SCORING_CACHE is None:
+        rows: list[dict[str, Any]] = []
+        if SCORING_CACHE_DIR.is_dir():
+            for f in sorted(SCORING_CACHE_DIR.glob("*.json")):
+                gid = f.stem
+                try:
+                    data = json.loads(f.read_text())
+                except Exception:
+                    continue
+                if "empty" in data:
+                    continue
+                root = data.get("boxScoreScoring") or data
+                for side_key in ("homeTeam", "awayTeam"):
+                    side = root.get(side_key)
+                    if not isinstance(side, dict):
+                        continue
+                    team = str(
+                        side.get("teamTricode") or side.get("teamCode") or ""
+                    ).upper().strip()
+                    for p in side.get("players") or []:
+                        if not isinstance(p, dict):
+                            continue
+                        pid = p.get("personId") or p.get("playerId")
+                        if pid is None:
+                            continue
+                        st = p.get("statistics") or {}
+                        rows.append({
+                            "game_id": str(gid),
+                            "team": team,
+                            "player_id": int(pid),
+                            "scr_pct_assisted_2pt": _to_float(st.get("percentageAssisted2pt")),
+                            "scr_pct_assisted_3pt": _to_float(st.get("percentageAssisted3pt")),
+                            "scr_pct_assisted_fgm": _to_float(st.get("percentageAssistedFGM")),
+                            "scr_pct_unassisted_2pt": _to_float(st.get("percentageUnassisted2pt")),
+                            "scr_pct_unassisted_3pt": _to_float(st.get("percentageUnassisted3pt")),
+                            "scr_pct_fga_2pt": _to_float(st.get("percentageFieldGoalsAttempted2pt")),
+                            "scr_pct_fga_3pt": _to_float(st.get("percentageFieldGoalsAttempted3pt")),
+                            "scr_pct_pts_2pt": _to_float(st.get("percentagePoints2pt")),
+                            "scr_pct_pts_3pt": _to_float(st.get("percentagePoints3pt")),
+                            "scr_pct_pts_ft": _to_float(st.get("percentagePointsFreeThrow")),
+                            "scr_pct_pts_paint": _to_float(st.get("percentagePointsPaint")),
+                            "scr_pct_pts_midrange": _to_float(st.get("percentagePointsMidrange2pt")),
+                            "scr_pct_pts_fastbreak": _to_float(st.get("percentagePointsFastBreak")),
+                            "scr_pct_pts_off_to": _to_float(st.get("percentagePointsOffTurnovers")),
+                        })
+        if not rows:
+            _SCORING_CACHE = pd.DataFrame()
+        else:
+            df = pd.DataFrame(rows).drop_duplicates(
+                subset=["game_id", "team", "player_id"], keep="first"
+            )
+            _SCORING_CACHE = df.reset_index(drop=True)
+
+    if _SCORING_CACHE is None or _SCORING_CACHE.empty:
+        return pd.DataFrame()
+    out = _SCORING_CACHE
+    if game_ids is not None:
+        wanted = sorted({str(g) for g in list(game_ids) if str(g).strip()})
+        out = out[out["game_id"].astype(str).isin(wanted)]
     return out.copy()
 
 
@@ -2502,19 +2623,14 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
         "trk_catch_shoot_fg3a", "trk_catch_shoot_fg3m",
         "trk_pull_up_fga", "trk_pull_up_fgm", "trk_pull_up_fg3a",
         "trk_dist_miles", "trk_avg_speed",
-        "trk_contested_shots", "trk_contested_shots_2pt", "trk_contested_shots_3pt",
-        "trk_uncontested_fga", "trk_uncontested_fgm",
+        "trk_contested_shots", "trk_uncontested_fga",
         # Hustle stats (from BDL advanced)
         "trk_deflections", "trk_box_outs", "trk_off_box_outs", "trk_def_box_outs",
         "trk_loose_balls", "trk_screen_assists", "trk_secondary_assists",
         # Rebound chances
         "trk_reb_chances", "trk_reb_chances_off", "trk_reb_chances_def",
         # Scoring breakdown
-        "trk_pts_paint", "trk_pts_fast_break", "trk_pts_off_to", "trk_pts_second_chance",
-        "trk_screen_assist_pts", "trk_charges_drawn", "trk_switches_on",
-        # Matchup-defense stats
-        "trk_matchup_fg_pct", "trk_matchup_fga", "trk_matchup_fgm",
-        "trk_matchup_3pt_pct", "trk_matchup_3pa", "trk_matchup_3pm", "trk_matchup_player_pts",
+        "trk_pts_paint", "trk_pts_fast_break", "trk_pts_off_to",
     ]
     if USE_TRACKING_FEATURES:
         trk = load_player_tracking_stats(
@@ -2535,6 +2651,54 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
         if c not in pg.columns:
             pg[c] = np.nan
 
+    # --- Load and merge Defensive boxscore stats (matchup defense) ---
+    def_cols = [
+        "def_matchup_fga", "def_matchup_fgm", "def_matchup_fg_pct",
+        "def_matchup_3pa", "def_matchup_3pm", "def_matchup_3pt_pct",
+        "def_matchup_minutes", "def_matchup_assists", "def_matchup_tov",
+        "def_matchup_player_pts", "def_switches_on", "def_partial_poss",
+    ]
+    if USE_TRACKING_FEATURES:
+        def_df = load_defensive_stats(
+            game_ids=pg["game_id"].astype(str).unique().tolist(),
+        )
+        if not def_df.empty:
+            pg = pg.merge(
+                def_df[["game_id", "team", "player_id"] + [c for c in def_cols if c in def_df.columns]],
+                on=["game_id", "team", "player_id"],
+                how="left",
+            )
+            _def_pct = def_df[[c for c in def_cols if c in def_df.columns]].notna().any(axis=1).mean() * 100
+            print(f"  Merged defensive stats: {len(def_df)} rows, {_def_pct:.0f}% coverage", flush=True)
+    for c in def_cols:
+        if c not in pg.columns:
+            pg[c] = np.nan
+
+    # --- Load and merge Scoring boxscore stats (shot creation context) ---
+    scr_cols = [
+        "scr_pct_assisted_2pt", "scr_pct_assisted_3pt", "scr_pct_assisted_fgm",
+        "scr_pct_unassisted_2pt", "scr_pct_unassisted_3pt",
+        "scr_pct_fga_2pt", "scr_pct_fga_3pt",
+        "scr_pct_pts_2pt", "scr_pct_pts_3pt", "scr_pct_pts_ft",
+        "scr_pct_pts_paint", "scr_pct_pts_midrange",
+        "scr_pct_pts_fastbreak", "scr_pct_pts_off_to",
+    ]
+    if USE_TRACKING_FEATURES:
+        scr_df = load_scoring_stats(
+            game_ids=pg["game_id"].astype(str).unique().tolist(),
+        )
+        if not scr_df.empty:
+            pg = pg.merge(
+                scr_df[["game_id", "team", "player_id"] + [c for c in scr_cols if c in scr_df.columns]],
+                on=["game_id", "team", "player_id"],
+                how="left",
+            )
+            _scr_pct = scr_df[[c for c in scr_cols if c in scr_df.columns]].notna().any(axis=1).mean() * 100
+            print(f"  Merged scoring stats: {len(scr_df)} rows, {_scr_pct:.0f}% coverage", flush=True)
+    for c in scr_cols:
+        if c not in pg.columns:
+            pg[c] = np.nan
+
     # --- OT regulation adjustment ---
     # Scale counting stats to regulation-equivalent for rolling averages.
     # OT inflates counting stats by ~10% per OT period; per-minute rates are unaffected.
@@ -2549,18 +2713,18 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
                        "trk_catch_shoot_fga", "trk_catch_shoot_fgm",
                        "trk_catch_shoot_fg3a", "trk_catch_shoot_fg3m",
                        "trk_pull_up_fga", "trk_pull_up_fgm", "trk_pull_up_fg3a",
-                       "trk_contested_shots", "trk_contested_shots_2pt", "trk_contested_shots_3pt",
-                       "trk_uncontested_fga", "trk_uncontested_fgm",
+                       "trk_contested_shots", "trk_uncontested_fga",
                        # Hustle counting stats (OT-adjusted)
                        "trk_deflections", "trk_box_outs", "trk_off_box_outs",
                        "trk_def_box_outs", "trk_loose_balls", "trk_screen_assists",
                        "trk_secondary_assists", "trk_reb_chances", "trk_reb_chances_off",
                        "trk_reb_chances_def", "trk_pts_paint", "trk_pts_fast_break",
-                       "trk_pts_off_to", "trk_pts_second_chance",
-                       "trk_screen_assist_pts", "trk_charges_drawn", "trk_switches_on",
-                       # Matchup-defense counts
-                       "trk_matchup_fga", "trk_matchup_fgm",
-                       "trk_matchup_3pa", "trk_matchup_3pm", "trk_matchup_player_pts"]
+                       "trk_pts_off_to",
+                       # Defensive matchup counting stats (OT-adjusted)
+                       "def_matchup_fga", "def_matchup_fgm",
+                       "def_matchup_3pa", "def_matchup_3pm",
+                       "def_matchup_assists", "def_matchup_tov",
+                       "def_matchup_player_pts", "def_switches_on"]
     for col in _counting_stats:
         if col in pg.columns:
             pg[f"{col}_reg"] = pg[col] * reg_factor
@@ -2593,6 +2757,11 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
         pg["trk_reb_chances_per_min"] = pg["trk_reb_chances"].fillna(0) / safe_mins
     if "trk_screen_assists" in pg.columns:
         pg["trk_screen_assists_per_min"] = pg["trk_screen_assists"].fillna(0) / safe_mins
+    # Defensive per-minute rates
+    if "def_matchup_fga" in pg.columns:
+        pg["def_matchup_fga_per_min"] = pg["def_matchup_fga"].fillna(0) / safe_mins
+    if "def_matchup_fgm" in pg.columns:
+        pg["def_matchup_fgm_per_min"] = pg["def_matchup_fgm"].fillna(0) / safe_mins
 
     # --- Player rolling features ---
     player_group = ["team", "player_id", "season"] if "season" in pg.columns else ["team", "player_id"]
@@ -2620,8 +2789,7 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
                     "trk_touches_reg", "trk_drives_reg", "trk_passes_reg",
                     "trk_catch_shoot_fga_reg", "trk_catch_shoot_fg3a_reg",
                     "trk_pull_up_fga_reg", "trk_pull_up_fg3a_reg",
-                    "trk_contested_shots_reg", "trk_contested_shots_2pt_reg", "trk_contested_shots_3pt_reg",
-                    "trk_uncontested_fga_reg", "trk_uncontested_fgm_reg",
+                    "trk_contested_shots_reg", "trk_uncontested_fga_reg",
                     # Tracking per-minute rates
                     "trk_touches_per_min", "trk_drives_per_min",
                     "trk_catch_shoot_fg3a_per_min",
@@ -2632,16 +2800,22 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
                     "trk_secondary_assists_reg",
                     "trk_reb_chances_reg", "trk_reb_chances_off_reg", "trk_reb_chances_def_reg",
                     "trk_pts_paint_reg", "trk_pts_fast_break_reg", "trk_pts_off_to_reg",
-                    "trk_pts_second_chance_reg", "trk_screen_assist_pts_reg",
-                    "trk_charges_drawn_reg", "trk_switches_on_reg",
-                    # Matchup-defense rolling context
-                    "trk_matchup_fg_pct", "trk_matchup_fga_reg", "trk_matchup_fgm_reg",
-                    "trk_matchup_3pt_pct", "trk_matchup_3pa_reg", "trk_matchup_3pm_reg",
-                    "trk_matchup_player_pts_reg",
                     # Hustle per-minute rates
                     "trk_deflections_per_min", "trk_box_outs_per_min",
                     "trk_loose_balls_per_min", "trk_reb_chances_per_min",
-                    "trk_screen_assists_per_min"]
+                    "trk_screen_assists_per_min",
+                    # Defensive matchup stats (from stats.nba.com)
+                    "def_matchup_fga_reg", "def_matchup_fgm_reg",
+                    "def_matchup_3pa_reg", "def_matchup_3pm_reg",
+                    "def_matchup_fg_pct", "def_matchup_3pt_pct",
+                    "def_matchup_player_pts_reg", "def_switches_on_reg",
+                    "def_matchup_fga_per_min", "def_matchup_fgm_per_min",
+                    # Scoring context stats (from stats.nba.com)
+                    "scr_pct_assisted_2pt", "scr_pct_assisted_3pt",
+                    "scr_pct_unassisted_2pt", "scr_pct_unassisted_3pt",
+                    "scr_pct_fga_2pt", "scr_pct_fga_3pt",
+                    "scr_pct_pts_paint", "scr_pct_pts_midrange",
+                    "scr_pct_pts_fastbreak"]
     # Last-3-game hot streak features (faster than avg5 for capturing streaks)
     avg3_cols = ["points_reg", "rebounds_reg", "assists_reg", "minutes", "fg3m_reg",
                  "fg3a_reg", "fouls_drawn_reg", "adv_usage_pct",
@@ -2649,7 +2823,9 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
                  # Tracking: touches and drives are strong usage signals
                  "trk_touches_reg", "trk_drives_reg",
                  # Hustle: box_outs for rebounds, reb_chances
-                 "trk_box_outs_reg", "trk_reb_chances_reg"]
+                 "trk_box_outs_reg", "trk_reb_chances_reg",
+                 # Defensive matchup: recent matchup load
+                 "def_matchup_fga_reg", "def_matchup_fg_pct"]
     for col in rolling_cols:
         if col not in pg.columns:
             continue
@@ -2675,9 +2851,12 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
                 # Hustle EWM
                 "trk_deflections_reg", "trk_box_outs_reg",
                 "trk_reb_chances_reg", "trk_screen_assists_reg",
-                # Additional BDL scoring/matchup context
-                "trk_pts_second_chance_reg", "trk_screen_assist_pts_reg",
-                "trk_matchup_3pa_reg", "trk_matchup_player_pts_reg"]
+                # Defensive matchup EWM
+                "def_matchup_fga_reg", "def_matchup_fg_pct",
+                "def_matchup_3pt_pct",
+                # Scoring context EWM
+                "scr_pct_assisted_2pt", "scr_pct_unassisted_2pt",
+                "scr_pct_pts_paint", "scr_pct_pts_midrange"]
     for col in ewm_cols:
         if col not in pg.columns:
             continue
@@ -3658,8 +3837,8 @@ FEATURE_GROUPS_FOR_ABLATION: dict[str, list[str]] = {
         "pre_trk_catch_shoot_fg3a_avg5", "pre_trk_catch_shoot_fg3a_avg10",
         "pre_trk_catch_shoot_fg3a_ewm5",
         "pre_trk_pull_up_fga_avg5", "pre_trk_pull_up_fg3a_avg5",
-        "pre_trk_contested_shots_avg5", "pre_trk_contested_shots_2pt_avg5", "pre_trk_contested_shots_3pt_avg5",
-        "pre_trk_uncontested_fga_avg5", "pre_trk_uncontested_fgm_avg5",
+        "pre_trk_contested_shots_avg5",
+        "pre_trk_uncontested_fga_avg5",
         "pre_trk_touches_per_min_avg5",
         "pre_trk_drives_per_min_avg5",
         "pre_trk_catch_shoot_fg3a_per_min_avg5",
@@ -3687,11 +3866,28 @@ FEATURE_GROUPS_FOR_ABLATION: dict[str, list[str]] = {
         "pre_trk_screen_assists_per_min_avg5",
         "pre_trk_secondary_assists_avg5", "pre_trk_secondary_assists_avg10",
         "pre_trk_pts_paint_avg5", "pre_trk_pts_paint_avg10",
-        "pre_trk_pts_fast_break_avg5", "pre_trk_pts_off_to_avg5", "pre_trk_pts_second_chance_avg5",
-        "pre_trk_screen_assist_pts_avg5", "pre_trk_charges_drawn_avg5", "pre_trk_switches_on_avg5",
-        "pre_trk_matchup_fg_pct_avg5", "pre_trk_matchup_fga_avg5", "pre_trk_matchup_fgm_avg5",
-        "pre_trk_matchup_3pt_pct_avg5", "pre_trk_matchup_3pa_avg5", "pre_trk_matchup_3pm_avg5",
-        "pre_trk_matchup_player_pts_avg5",
+        "pre_trk_pts_fast_break_avg5", "pre_trk_pts_off_to_avg5",
+    ],
+    "defensive_matchup": [
+        "pre_def_matchup_fga_avg5", "pre_def_matchup_fga_avg10",
+        "pre_def_matchup_fga_per_min_avg5",
+        "pre_def_matchup_fg_pct_avg5", "pre_def_matchup_fg_pct_ewm5",
+        "pre_def_matchup_3pt_pct_avg5", "pre_def_matchup_3pt_pct_ewm5",
+        "pre_def_matchup_fgm_avg5",
+        "pre_def_matchup_3pa_avg5", "pre_def_matchup_3pm_avg5",
+        "pre_def_matchup_player_pts_avg5",
+        "pre_def_switches_on_avg5",
+    ],
+    "scoring_context": [
+        "pre_scr_pct_assisted_2pt_avg5", "pre_scr_pct_assisted_2pt_ewm5",
+        "pre_scr_pct_assisted_3pt_avg5", "pre_scr_pct_assisted_3pt_ewm5",
+        "pre_scr_pct_assisted_fgm_avg5",
+        "pre_scr_pct_unassisted_2pt_avg5", "pre_scr_pct_unassisted_2pt_ewm5",
+        "pre_scr_pct_unassisted_3pt_avg5",
+        "pre_scr_pct_fga_2pt_avg5", "pre_scr_pct_fga_3pt_avg5",
+        "pre_scr_pct_pts_paint_avg5", "pre_scr_pct_pts_paint_ewm5",
+        "pre_scr_pct_pts_midrange_avg5", "pre_scr_pct_pts_midrange_ewm5",
+        "pre_scr_pct_pts_fastbreak_avg5",
     ],
 }
 
@@ -3914,7 +4110,6 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             "pre_trk_drives_avg3", "pre_trk_drives_ewm5",
             "pre_trk_passes_avg5",
             "pre_trk_contested_shots_avg5",
-            "pre_trk_contested_shots_2pt_avg5", "pre_trk_contested_shots_3pt_avg5",
             # Per-minute tracking rates
             "pre_trk_touches_per_min_avg5",
             "pre_trk_drives_per_min_avg5",
@@ -3922,9 +4117,6 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             "pre_trk_deflections_avg5", "pre_trk_deflections_avg10",
             "pre_trk_deflections_per_min_avg5",
             "pre_trk_loose_balls_avg5",
-            # Matchup-defense context
-            "pre_trk_matchup_fg_pct_avg5",
-            "pre_trk_matchup_3pt_pct_avg5",
         ]
     if USE_BOXSCORE_ADV_FEATURES:
         common += [
@@ -3992,9 +4184,14 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
                 "pre_trk_pts_paint_avg5", "pre_trk_pts_paint_avg10",
                 "pre_trk_pts_fast_break_avg5",
                 "pre_trk_pts_off_to_avg5",
-                "pre_trk_pts_second_chance_avg5",
-                "pre_trk_screen_assist_pts_avg5",
-                "pre_trk_matchup_player_pts_avg5",
+                # Scoring context: shot creation vs assisted (from stats.nba.com)
+                "pre_scr_pct_unassisted_2pt_avg5", "pre_scr_pct_unassisted_2pt_ewm5",
+                "pre_scr_pct_pts_paint_avg5", "pre_scr_pct_pts_paint_ewm5",
+                "pre_scr_pct_pts_midrange_avg5", "pre_scr_pct_pts_midrange_ewm5",
+                "pre_scr_pct_pts_fastbreak_avg5",
+                "pre_scr_pct_fga_2pt_avg5", "pre_scr_pct_fga_3pt_avg5",
+                # Defensive matchup: opponent FG% allowed (quality of defense)
+                "pre_def_matchup_fg_pct_avg5", "pre_def_matchup_fg_pct_ewm5",
             ]
         if two_stage:
             specific.append("pred_minutes")
@@ -4046,6 +4243,9 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
                 "pre_trk_reb_chances_avg10", "pre_trk_reb_chances_ewm5",
                 "pre_trk_reb_chances_per_min_avg5",
                 "pre_trk_reb_chances_off_avg5", "pre_trk_reb_chances_def_avg5",
+                # Defensive engagement: more matchup FGA = more involved on defense = more rebounding
+                "pre_def_matchup_fga_avg5", "pre_def_matchup_fga_avg10",
+                "pre_def_matchup_fga_per_min_avg5",
             ]
         if two_stage:
             specific.append("pred_minutes")
@@ -4071,12 +4271,15 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
         if USE_TRACKING_FEATURES:
             specific += [
                 # Passes are the strongest leading indicator for assists
-                "pre_trk_passes_avg10",
+                "pre_trk_passes_avg5", "pre_trk_passes_avg10",
                 # Screen assists + secondary assists capture playmaking style
                 "pre_trk_screen_assists_avg5", "pre_trk_screen_assists_avg10",
                 "pre_trk_screen_assists_per_min_avg5",
                 "pre_trk_secondary_assists_avg5", "pre_trk_secondary_assists_avg10",
-                "pre_trk_screen_assist_pts_avg5",
+                # Scoring context: how much of team's offense is assisted (playmaker signal)
+                "pre_scr_pct_assisted_2pt_avg5", "pre_scr_pct_assisted_2pt_ewm5",
+                "pre_scr_pct_assisted_3pt_avg5",
+                "pre_scr_pct_assisted_fgm_avg5",
             ]
         if two_stage:
             specific.append("pred_minutes")
@@ -4110,9 +4313,12 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
                 # Pull-up 3PA: secondary 3-point source
                 "pre_trk_pull_up_fg3a_avg5",
                 "pre_trk_catch_shoot_fg3a_per_min_avg5",
-                # Opponent contest profile
-                "pre_trk_matchup_3pa_avg5", "pre_trk_matchup_3pm_avg5",
-                "pre_trk_matchup_3pt_pct_avg5",
+                # Scoring context: 3pt shot share + assisted vs self-created 3s
+                "pre_scr_pct_fga_3pt_avg5",
+                "pre_scr_pct_assisted_3pt_avg5", "pre_scr_pct_assisted_3pt_ewm5",
+                "pre_scr_pct_unassisted_3pt_avg5",
+                # Defensive matchup: 3pt% allowed (opponent perimeter D quality)
+                "pre_def_matchup_3pt_pct_avg5", "pre_def_matchup_3pt_pct_ewm5",
             ]
         if two_stage:
             specific.append("pred_minutes")
@@ -4130,8 +4336,7 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             f"line_available_{target}",
         ]
 
-    # Deduplicate while preserving order to prevent train/predict feature-name mismatches.
-    return list(dict.fromkeys(common + specific + market_feats))
+    return common + specific + market_feats
 
 
 def filter_features(features: list[str], df: pd.DataFrame) -> list[str]:
@@ -4143,10 +4348,6 @@ def filter_features(features: list[str], df: pd.DataFrame) -> list[str]:
         s = df[f]
         if hasattr(s, "notna") and not bool(s.notna().any()):
             continue
-        if f.startswith("pre_trk_"):
-            nn_rate = float(s.notna().mean()) if len(s) else 0.0
-            if nn_rate < MIN_TRACKING_FEATURE_NONNULL_RATE:
-                continue
         out.append(f)
     return out
 
