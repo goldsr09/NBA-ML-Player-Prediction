@@ -4,3 +4,30 @@ __pycache__/
 
 # Regenerable API fetch cache (large)
 analysis/output/nba_2025_26_advanced_cache/
+analysis/output/historical_cache/
+analysis/output/models/
+analysis/output/odds_snapshots/
+analysis/output/prop_cache/
+analysis/output/prop_logs/
+analysis/output/prop_lines/
+analysis/output/kalshi_logs/
+analysis/output/predictions/
+scripts/__pycache__/
+
+# Generated data (changes every run)
+analysis/output/*.csv
+analysis/output/*.json
+
+# Generated audit/report artifacts
+analysis/output/prop_pipeline_audit_report.md
+analysis/output/prop_pipeline_audit_wave1_findings.csv
+
+# Claude Code internal state
+.claude/
+scripts/.claude/
+
+# Accidental output dirs
+scripts/analysis/
+
+# API keys
+.odds_api_key

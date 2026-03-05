@@ -321,6 +321,13 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
+def kelly_from_ev(ev: float, cap: float = 0.10) -> float:
+    """Convert post-vig EV to a capped Kelly fraction."""
+    if not np.isfinite(ev) or ev <= 0:
+        return 0.0
+    return clamp(float(ev) / VIG_FACTOR, 0.0, cap)
+
+
 def normal_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
@@ -1197,6 +1204,7 @@ def load_tuned_params() -> dict[str, Any] | None:
                 out = {
                     "win_params": tuned_params.get("win_enhanced"),
                     "total_params": tuned_params.get("total_enhanced"),
+                    "margin_params": tuned_params.get("margin_enhanced"),
                     "win_market_params": tuned_params.get("win_market"),
                     "total_market_params": tuned_params.get("total_market"),
                     "margin_residual_params": tuned_params.get("margin_residual_market"),
@@ -1207,6 +1215,7 @@ def load_tuned_params() -> dict[str, Any] | None:
             return {
                 "win_params": models.get("tuned_win_params"),
                 "total_params": models.get("tuned_total_params"),
+                "margin_params": models.get("tuned_margin_params"),
                 "feature_lists": models.get("feature_lists", {}),
             }
         except Exception:
@@ -1378,9 +1387,7 @@ def recompute_market_signals(
         spread_edges.append(spread_edge)
         spread_evs.append(spread_ev)
         spread_signals.append(spread_sig)
-        spread_kelly_pcts.append(
-            clamp(spread_ev / VIG_FACTOR, 0.0, 0.10) if spread_sig != "NO BET" and spread_ev > 0 else 0.0
-        )
+        spread_kelly_pcts.append(kelly_from_ev(spread_ev) if spread_sig != "NO BET" else 0.0)
 
         # --- Moneyline edge from current win probability ---
         fair_home = one.get("market_home_implied_prob_close", np.nan) if has_market else np.nan
@@ -1407,11 +1414,7 @@ def recompute_market_signals(
         ml_edges.append(ml_home_edge)
         ml_evs.append(ml_ev)
         ml_signals.append(ml_sig)
-        ml_kelly_pcts.append(
-            clamp(abs(ml_home_edge) / VIG_FACTOR, 0.0, 0.10)
-            if ml_sig != "NO BET" and ml_ev > 0 and pd.notna(ml_home_edge)
-            else 0.0
-        )
+        ml_kelly_pcts.append(kelly_from_ev(ml_ev) if ml_sig != "NO BET" else 0.0)
 
         # --- Total edge from current p_over ---
         if has_market and pd.notna(p_over):
@@ -1437,11 +1440,7 @@ def recompute_market_signals(
         total_edges.append(over_edge)
         total_evs.append(total_ev)
         total_signals.append(total_sig)
-        total_kelly_pcts.append(
-            clamp(abs(over_edge) / VIG_FACTOR, 0.0, 0.10)
-            if total_sig != "NO BET" and total_ev > 0 and pd.notna(over_edge)
-            else 0.0
-        )
+        total_kelly_pcts.append(kelly_from_ev(total_ev) if total_sig != "NO BET" else 0.0)
 
     out["p_over"] = p_overs
     out["p_under"] = p_unders
@@ -1615,6 +1614,7 @@ def _run_backtest(
     team_games: pd.DataFrame,
     win_params: dict[str, Any] | None,
     total_params: dict[str, Any] | None,
+    margin_params: dict[str, Any] | None,
 ) -> None:
     """Run backtest on held-out last 20% of current season (Phase 3E)."""
     from nba_evaluate import (
@@ -1642,10 +1642,11 @@ def _run_backtest(
     win_feats = [f for f in WIN_FEATURES_BASE if f in train.columns]
     total_feats = [f for f in TOTAL_FEATURES_BASE if f in train.columns]
     margin_feats = [f for f in MARGIN_FEATURES_BASE if f in train.columns]
+    margin_train_params = margin_params
 
     win_imp, win_model = fit_xgb_classifier(train, win_feats, "home_win", win_params)
     total_imp, total_model = fit_xgb_regressor(train, total_feats, "total_points", total_params)
-    margin_imp, margin_model = fit_xgb_regressor(train, margin_feats, "home_margin", total_params)
+    margin_imp, margin_model = fit_xgb_regressor(train, margin_feats, "home_margin", margin_train_params)
 
     y_prob = predict_with_model(win_imp, win_model, test, win_feats, proba=True)
     y_total = predict_with_model(total_imp, total_model, test, total_feats)
@@ -1653,7 +1654,7 @@ def _run_backtest(
 
     market_prob = test["market_home_implied_prob_close"].values if "market_home_implied_prob_close" in test.columns else None
     market_total = test["market_total_close"].values if "market_total_close" in test.columns else None
-    spread = -test["market_home_spread_close"].values if "market_home_spread_close" in test.columns else None
+    spread = test["market_home_spread_close"].values if "market_home_spread_close" in test.columns else None
 
     win_eval = evaluate_win_model_comprehensive(
         test["home_win"].values, y_prob,
@@ -1775,6 +1776,7 @@ def main() -> None:
     tuned = load_tuned_params()
     win_params = tuned.get("win_params") if tuned else None
     total_params = tuned.get("total_params") if tuned else None
+    margin_params = tuned.get("margin_params") if tuned else None
     margin_residual_params = tuned.get("margin_residual_params") if tuned else None
     total_residual_params = tuned.get("total_residual_params") if tuned else None
     feature_lists = (tuned or {}).get("feature_lists", {}) if tuned else {}
@@ -1790,7 +1792,7 @@ def main() -> None:
     # --- Backtest mode (Phase 3E) ---
     if args.backtest:
         print("Running backtest on held-out games...", flush=True)
-        _run_backtest(games_hist, team_games, win_params, total_params)
+        _run_backtest(games_hist, team_games, win_params, total_params, margin_params)
         return
 
     print("Loading full regular-season schedule and upcoming games...", flush=True)
@@ -1836,11 +1838,12 @@ def main() -> None:
 
     # --- Train models on all completed games ---
     print("Training models...", flush=True)
+    margin_train_params = margin_params
 
     # Base models (no market features) - used in Bayesian blending
     win_base_imp, win_base_model = fit_xgb_classifier(games_hist, win_base_features, "home_win", win_params)
     total_base_imp, total_base_model = fit_xgb_regressor(games_hist, total_base_features, "total_points", total_params)
-    margin_base_imp, margin_base_model = fit_xgb_regressor(games_hist, margin_base_features, "home_margin", total_params)
+    margin_base_imp, margin_base_model = fit_xgb_regressor(games_hist, margin_base_features, "home_margin", margin_train_params)
 
     # Calibrated win model (Phase 2D: Platt scaling)
     print("Fitting calibrated win model...", flush=True)
@@ -2015,10 +2018,7 @@ def main() -> None:
         win_edges.append(home_edge)
         win_evs.append(ev)
         spread_signals.append(sig)
-        if sig != "NO BET" and ev > 0:
-            spread_kelly_pcts.append(clamp(ev / VIG_FACTOR, 0.0, 0.10))
-        else:
-            spread_kelly_pcts.append(0.0)
+        spread_kelly_pcts.append(kelly_from_ev(ev) if sig != "NO BET" else 0.0)
 
         # --- Moneyline edge: compare win probability to market implied prob ---
         fair_home = one["market_home_implied_prob_close"].iloc[0] if has_market else np.nan
@@ -2045,10 +2045,7 @@ def main() -> None:
         ml_edges.append(ml_home_edge)
         ml_evs.append(ml_ev)
         ml_signals.append(ml_sig)
-        if ml_sig != "NO BET" and ml_ev > 0:
-            ml_kelly_pcts.append(clamp(abs(ml_home_edge) / VIG_FACTOR, 0.0, 0.10))
-        else:
-            ml_kelly_pcts.append(0.0)
+        ml_kelly_pcts.append(kelly_from_ev(ml_ev) if ml_sig != "NO BET" else 0.0)
 
         # --- Total edge ---
         if has_market and pd.notna(p_over):
@@ -2075,11 +2072,8 @@ def main() -> None:
         total_edges.append(over_edge)
         total_evs.append(t_ev)
         total_signals.append(t_sig)
-        # Kelly criterion for total bet (simplified: edge / vig_factor, capped at 10%)
-        if t_sig != "NO BET" and t_ev > 0:
-            total_kelly_pcts.append(clamp(abs(over_edge) / VIG_FACTOR, 0.0, 0.10))
-        else:
-            total_kelly_pcts.append(0.0)
+        # Kelly criterion for total bet from post-vig EV, capped at 10%.
+        total_kelly_pcts.append(kelly_from_ev(t_ev) if t_sig != "NO BET" else 0.0)
 
         # --- Model agreement and confidence ---
         # Collect individual model picks (home=1, away=0)
@@ -2138,7 +2132,23 @@ def main() -> None:
         pred_df[col] = ci_df[col].values
 
     pred_df = apply_live_adjustments(pred_df)
-    pred_df = recompute_market_signals(pred_df, residual_std=residual_std, total_residual_std=total_residual_std)
+    live_changed = False
+    if all(
+        c in pred_df.columns
+        for c in ["pregame_home_win_prob", "pregame_pred_total", "pregame_pred_home_margin"]
+    ):
+        delta_mask = (
+            (pred_df["home_win_prob"] - pred_df["pregame_home_win_prob"]).abs() > 1e-9
+        ) | (
+            (pred_df["pred_total"] - pred_df["pregame_pred_total"]).abs() > 1e-9
+        ) | (
+            (pred_df["pred_home_margin"] - pred_df["pregame_pred_home_margin"]).abs() > 1e-9
+        )
+        live_changed = bool(delta_mask.any())
+    if live_changed:
+        pred_df = recompute_market_signals(
+            pred_df, residual_std=residual_std, total_residual_std=total_residual_std
+        )
 
     # --- Confidence-weighted Kelly sizing ---
     # Scale Kelly percentages by model confidence to reduce sizing on uncertain bets.
@@ -2303,7 +2313,7 @@ def main() -> None:
         print(f"\n=== MODEL RECENT PERFORMANCE (out-of-sample, last {len(test_oos)} games) ===")
         # Fit quick models on the holdout-excluded training set
         oos_win_imp, oos_win_model = fit_xgb_classifier(train_oos, win_base_features, "home_win", win_params)
-        oos_margin_imp, oos_margin_model = fit_xgb_regressor(train_oos, MARGIN_FEATURES_BASE, "home_margin", total_params)
+        oos_margin_imp, oos_margin_model = fit_xgb_regressor(train_oos, MARGIN_FEATURES_BASE, "home_margin", margin_train_params)
         oos_total_imp, oos_total_model = fit_xgb_regressor(train_oos, total_base_features, "total_points", total_params)
 
         oos_win_probs = predict_with_model(oos_win_imp, oos_win_model, test_oos, win_base_features, proba=True)
@@ -2317,10 +2327,13 @@ def main() -> None:
 
         # ATS accuracy (if spread data available)
         if "market_home_spread_close" in test_oos.columns:
-            spread_vals = -test_oos["market_home_spread_close"].values
-            valid_ats = ~np.isnan(spread_vals)
+            spread_home = test_oos["market_home_spread_close"].values
+            valid_ats = ~np.isnan(spread_home)
             if valid_ats.sum() >= 10:
-                ats_correct = ((oos_margins[valid_ats] > spread_vals[valid_ats]) == (test_oos["home_margin"].values[valid_ats] > spread_vals[valid_ats])).sum()
+                ats_correct = (
+                    (oos_margins[valid_ats] > -spread_home[valid_ats])
+                    == (test_oos["home_margin"].values[valid_ats] > -spread_home[valid_ats])
+                ).sum()
                 ats_total = int(valid_ats.sum())
                 ats_pct = ats_correct / ats_total
                 print(f"  ATS:          {ats_correct}/{ats_total} ({100*ats_pct:.1f}%)")

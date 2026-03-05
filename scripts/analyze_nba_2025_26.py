@@ -4,14 +4,12 @@ import concurrent.futures as cf
 import json
 import math
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import requests
-from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.metrics import (
@@ -267,7 +265,6 @@ def build_game_level(team_games: pd.DataFrame) -> pd.DataFrame:
     games = home.merge(away, on=["game_id", "game_time_utc"], how="inner")
     games["home_win"] = games["home_win"].astype(int)
     games["total_points"] = games["home_team_score"] + games["away_team_score"]
-    games["home_margin"] = games["home_margin"]
     games["rest_diff"] = games["home_days_since_prev"] - games["away_days_since_prev"]
     games["home_b2b_adv"] = games["away_b2b"] - games["home_b2b"]
     games["combined_pre_pace5"] = games["home_pre_possessions_avg5"] + games["away_pre_possessions_avg5"]
