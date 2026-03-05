@@ -44,6 +44,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -52,10 +53,16 @@ from pandas.errors import PerformanceWarning
 from scipy import stats as sp_stats
 from sklearn.impute import SimpleImputer
 from sklearn.isotonic import IsotonicRegression
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 from xgboost import XGBRegressor
+
+try:
+    from lightgbm import LGBMRegressor
+    _HAS_LGBM = True
+except ImportError:
+    _HAS_LGBM = False
 
 from analyze_nba_2025_26_advanced import (
     BOXSCORE_CACHE,
@@ -96,9 +103,10 @@ MARKET_MODEL_MIN_ROWS = 500
 MARKET_CALIB_MIN_ROWS = 250
 _EXTENDED_STATS_CACHE: pd.DataFrame | None = None  # Invalidated when new fields are added
 _BOX_ADV_CACHE: pd.DataFrame | None = None
+_ESPN_ATHLETE_DISK_CACHE_LOADED = False
 PLAYER_FEATURE_CACHE_FILE = MODEL_DIR / "player_features_cache.pkl"
 PLAYER_FEATURE_CACHE_META = MODEL_DIR / "player_features_cache_meta.json"
-PLAYER_FEATURE_CACHE_VERSION = "v5"  # v5: minutes model + recency + matchup deltas
+PLAYER_FEATURE_CACHE_VERSION = "v9"  # v9: opp 3pt defense, tracking stats, implied pace/minutes
 NO_LINES_RETRY_SECS_SAME_DAY = 45 * 60
 BOX_ADV_REQUEST_SLEEP_SECS = 1.0
 BOX_ADV_DEFAULT_RETRIES = 5
@@ -111,8 +119,11 @@ PROP_TARGETS = ["points", "rebounds", "assists", "minutes"]
 DEFAULT_MIN_GAMES = 20
 
 # Betting parameters for props
-VIG_FACTOR = 0.9524        # net payout per $1 at ~-110 juice
+VIG_FACTOR = 0.9524        # net payout per $1 at ~-105 juice
 BREAKEVEN_PROB = 1.0 / (1.0 + VIG_FACTOR)  # ~0.5122
+# Post-calibration clipping to avoid saturated 0/1 probabilities in outputs.
+PROB_CLIP_FLOOR = 0.005
+PROB_CLIP_CEILING = 0.995
 
 # Signal thresholds
 MIN_EDGE_PCT = 15.0        # minimum edge% to signal (e.g., pred 23 vs line 20 = 15%)
@@ -123,6 +134,36 @@ MAX_SIGNALS_PER_PLAYER = 2       # cap signals per player (already enforced in p
 MAX_SIGNALS_PER_GAME = 4         # cap signals from a single game
 MAX_SIGNALS_PER_TEAM = 3         # cap signals from one team's players
 USE_BOXSCORE_ADV_FEATURES = True
+USE_ENSEMBLE = _HAS_LGBM  # XGBoost + LightGBM stacking (requires lightgbm)
+USE_QUANTILE_UNCERTAINTY = True  # Quantile regression for uncertainty (Step 2)
+USE_PLAYER_TARGET_ENCODING = False  # Per-player target encoding (Step 4, experimental)
+USE_MARKET_LINE_BLENDING = False  # Market line blending (Step 6, gated)
+MARKET_LINE_BLEND_ALPHA = 0.5  # Weight on model prediction (vs 1-alpha on market line)
+
+# OVER signal hardening: drop LEAN OVER, require lineup confirmation + low injury risk
+SUPPRESS_LEAN_OVER = True  # Only allow BEST BET OVER; LEAN OVER → NO BET
+OVER_REQUIRE_LINEUP_CONFIRMED = True  # OVER signals require lineup_confirmed == 1
+OVER_MAX_INJURY_PROB = 0.15  # Max injury_unavailability_prob for OVER signals
+
+# Points bias correction (rolling residual shrinkage)
+USE_POINTS_BIAS_CORRECTION = True
+POINTS_BIAS_SHRINK_K = 120  # Shrinkage strength (higher = more conservative)
+POINTS_BIAS_CAP = 1.5  # Max absolute correction in points
+POINTS_BIAS_MIN_SAMPLE = 75  # Minimum graded rows to activate
+POINTS_BIAS_LOOKBACK_DAYS = 30  # Rolling window for points bias estimation
+POINTS_BIAS_FILE = PROP_LOG_DIR / "points_bias.json"
+
+# Star-out heuristic floor boost
+# When forward injury pressure is extreme (>p95 of training), apply a floor boost
+# to the top remaining scorers to compensate for model under-extrapolation.
+STAR_OUT_PRESSURE_THRESHOLD = 38.0  # ~p95 of training team_injury_pressure
+STAR_OUT_BOOST_SCALE = 0.6  # Scale factor on role_beta * pressure for floor boost
+STAR_OUT_MAX_BOOST = 5.0  # Max boost in raw stat units
+STAR_OUT_TOP_N_PLAYERS = 3  # Apply boost to top N scorers per team
+STAR_OUT_STAT_TARGETS = {"points", "rebounds", "assists"}  # Stats eligible for boost
+
+# CLV gate robustness
+DEPLOY_CLV_MIN_SAMPLE = 50  # Minimum rows with nonzero line movement for CLV gate
 
 # Signal policy controls
 SIGNAL_POINTS_ONLY = False
@@ -130,12 +171,14 @@ MIN_SIGNAL_PRED_MINUTES = 20.0
 MIN_SIGNAL_PRE_MINUTES_AVG10 = 18.0
 
 # Side-specific thresholds (stricter for OVER to counter observed over-bias)
+# Phase 12: Widened asymmetry until shrinkage features are validated.
+# OVER requires ~33% more edge than UNDER to compensate for momentum-chasing bias.
 MIN_EDGE_PCT_BY_SIDE = {
-    "OVER": 18.0,
+    "OVER": 20.0,
     "UNDER": MIN_EDGE_PCT,
 }
 MIN_EV_BY_SIDE = {
-    "OVER": 0.25,
+    "OVER": 0.30,
     "UNDER": MIN_EV,
 }
 
@@ -172,7 +215,7 @@ DEPLOY_GATES_ENFORCE = False  # advisory mode initially
 
 # Canonical results history (Phase 1)
 PROP_RESULTS_HISTORY_FILE = PREDICTIONS_DIR / "prop_results_history.csv"
-MODEL_VERSION = "v4"  # Bump when model architecture changes significantly
+MODEL_VERSION = "v6"  # v6: forward-injury-pressure inference override + coverage gates
 
 # Persistent monitoring logs
 MARKET_PROGRESS_LOG = PROP_LOG_DIR / "market_data_progress.csv"
@@ -193,8 +236,8 @@ SIGNAL_POLICY_PRESETS: dict[str, dict[str, Any]] = {
         "signal_points_only": False,
         "min_pred_minutes": 18.0,
         "min_pre_minutes_avg10": 16.0,
-        "min_edge_pct_by_side": {"OVER": 16.0, "UNDER": 13.0},
-        "min_ev_by_side": {"OVER": 0.22, "UNDER": 0.17},
+        "min_edge_pct_by_side": {"OVER": 18.0, "UNDER": 13.0},
+        "min_ev_by_side": {"OVER": 0.26, "UNDER": 0.17},
         "best_bet_ev": 0.35,
         "max_signals_per_day": 12,
     },
@@ -202,8 +245,8 @@ SIGNAL_POLICY_PRESETS: dict[str, dict[str, Any]] = {
         "signal_points_only": False,
         "min_pred_minutes": 22.0,
         "min_pre_minutes_avg10": 20.0,
-        "min_edge_pct_by_side": {"OVER": 20.0, "UNDER": 17.0},
-        "min_ev_by_side": {"OVER": 0.30, "UNDER": 0.24},
+        "min_edge_pct_by_side": {"OVER": 23.0, "UNDER": 17.0},
+        "min_ev_by_side": {"OVER": 0.35, "UNDER": 0.24},
         "best_bet_ev": 0.45,
         "max_signals_per_day": 8,
     },
@@ -230,6 +273,10 @@ POSITION_GROUPS = {
 ESPN_SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event={event_id}"
 INJURY_REMOVE_STATUSES = {"out", "suspension", "ofs"}
 INJURY_HIGH_RISK_STATUSES = {"doubtful"}
+INJURY_FORWARD_STATUSES = {"out", "doubtful", "questionable", "suspension"}
+INJURY_FORWARD_MIN_UNAVAIL = 0.20
+INJURY_FEED_STALE_HOURS = 6.0
+INJURY_FEED_MIN_ROWS = 8
 
 
 def normalize_player_name(name: Any) -> str:
@@ -244,18 +291,109 @@ def normalize_player_name(name: Any) -> str:
     return s
 
 
-def generate_prediction_id(date: str, name_norm: str, stat_type: str) -> str:
-    """Deterministic dedup key for canonical results: '{date}_{name_norm}_{stat_type}'."""
+def _match_actual_player_rows(
+    actual_df: pd.DataFrame,
+    player_name: str,
+    team: str = "",
+    player_id: Any | None = None,
+) -> pd.DataFrame:
+    """Strict player matcher for grading/backtests.
+
+    Order:
+    1) exact player_id (+team when provided)
+    2) exact normalized name (+team when provided)
+    Returns exactly-one-row match or empty frame.
+    """
+    if actual_df.empty:
+        return actual_df.iloc[0:0]
+
+    team = str(team or "")
+    pid = _to_float(player_id)
+    if pd.notna(pid) and "player_id" in actual_df.columns:
+        ids = pd.to_numeric(actual_df["player_id"], errors="coerce")
+        mask = ids.eq(pid)
+        if team:
+            mask = mask & actual_df["team"].astype(str).eq(team)
+        matched = actual_df[mask]
+        if len(matched) == 1:
+            return matched
+
+    name_norm = normalize_player_name(player_name)
+    norm_series = actual_df["player_name"].map(normalize_player_name)
+    mask = norm_series.eq(name_norm)
+    if team:
+        mask = mask & actual_df["team"].astype(str).eq(team)
+    matched = actual_df[mask]
+    if len(matched) == 1:
+        return matched
+    return actual_df.iloc[0:0]
+
+
+def generate_prediction_id(
+    date: str,
+    name_norm: str,
+    stat_type: str,
+    team: str | None = None,
+    player_id: Any | None = None,
+    home_team: str | None = None,
+    away_team: str | None = None,
+) -> str:
+    """Deterministic dedup key for canonical results.
+
+    Preferred key: '{date}_{home}_{away}_{team}_{player_id}_{stat_type}'
+    Fallback key uses game/team context when available:
+    '{date}_{home}_{away}_{team}_{name_norm}_{stat_type}'.
+    Legacy fallback: '{date}_{name_norm}_{stat_type}'.
+    """
+    pid = _to_float(player_id)
+    if pd.notna(pid):
+        home = str(home_team or "").upper()
+        away = str(away_team or "").upper()
+        tm = str(team or "").upper()
+        return f"{date}_{home}_{away}_{tm}_{int(pid)}_{stat_type}"
+    home = str(home_team or "").upper()
+    away = str(away_team or "").upper()
+    tm = str(team or "").upper()
+    if home or away or tm:
+        return f"{date}_{home}_{away}_{tm}_{name_norm}_{stat_type}"
     return f"{date}_{name_norm}_{stat_type}"
+
+
+def parse_asof_utc(asof_str: str | None) -> pd.Timestamp:
+    """Parse optional run context timestamp; defaults to now UTC."""
+    if not asof_str:
+        return pd.Timestamp.now(tz="UTC")
+    ts = pd.to_datetime(asof_str, utc=True, errors="coerce")
+    if pd.isna(ts):
+        raise ValueError(f"Invalid --asof-utc: {asof_str}")
+    return ts
+
+
+def _canonical_latest_view(history: pd.DataFrame) -> pd.DataFrame:
+    """Return latest snapshot rows per game date for canonical metrics/gates."""
+    if history.empty:
+        return history
+    out = history.copy()
+    if "is_latest" in out.columns:
+        return out[out["is_latest"].fillna(0).astype(int) == 1].copy()
+    if "prediction_created_at" in out.columns:
+        out["_created"] = pd.to_datetime(out["prediction_created_at"], errors="coerce")
+        if out["_created"].notna().sum() == 0:
+            return out.drop(columns=["_created"]).copy()
+        out = out.sort_values(["game_date_est", "_created"]).copy()
+        idx = out.groupby("game_date_est")["_created"].transform("max") == out["_created"]
+        return out[idx].drop(columns=["_created"]).copy()
+    return out
 
 
 def _injury_key(team: str, player_name: str) -> str:
     return f"{(team or '').upper()}|{normalize_player_name(player_name)}"
 
 
-def fetch_injury_status_map(target_date: str) -> dict[str, dict[str, Any]]:
+def fetch_injury_status_map(target_date: str, asof_utc: pd.Timestamp | None = None) -> dict[str, dict[str, Any]]:
     """Fetch injury report rows indexed by `TEAM|normalized_player_name`."""
     injuries = fetch_espn_injury_report(cache_key=target_date)
+    fetched_at_utc = (asof_utc if asof_utc is not None else pd.Timestamp.now(tz="UTC")).isoformat()
     out: dict[str, dict[str, Any]] = {}
     for inj in injuries:
         team = str(inj.get("team", "")).upper()
@@ -271,8 +409,262 @@ def fetch_injury_status_map(target_date: str) -> dict[str, dict[str, Any]]:
             "player_name": name,
             "status": status,
             "availability_prob": float(np.clip(avail_prob, 0.0, 1.0)),
+            "espn_player_id": inj.get("espn_player_id"),
+            "report_date": inj.get("report_date", ""),
+            "fetched_at_utc": fetched_at_utc,
         }
     return out
+
+
+def _forward_pressure_clip_bounds(team_games: pd.DataFrame) -> tuple[float, float]:
+    """Get robust clip bounds for forward pressure from historical training range."""
+    candidate_cols = ["injury_proxy_missing_points5", "team_injury_pressure"]
+    for col in candidate_cols:
+        if col in team_games.columns:
+            s = pd.to_numeric(team_games[col], errors="coerce").dropna()
+            if len(s) >= 100:
+                lo = float(s.quantile(0.01))
+                hi = float(s.quantile(0.99))
+                if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                    return lo, hi
+    return 0.0, 60.0
+
+
+def evaluate_injury_feed_coverage(
+    injury_status_map: dict[str, dict[str, Any]],
+    teams: list[str],
+    now_utc: pd.Timestamp | None = None,
+) -> dict[str, Any]:
+    """Assess injury-feed freshness/coverage, globally and per-team."""
+    now_utc = now_utc if now_utc is not None else pd.Timestamp.now(tz="UTC")
+    by_team: dict[str, list[dict[str, Any]]] = {t: [] for t in teams}
+    report_ts: list[pd.Timestamp] = []
+    for inj in injury_status_map.values():
+        team = str(inj.get("team", "")).upper()
+        if team in by_team:
+            by_team[team].append(inj)
+        rts = pd.to_datetime(inj.get("report_date", ""), utc=True, errors="coerce")
+        if pd.notna(rts):
+            report_ts.append(rts)
+
+    max_report_age_hours = np.nan
+    if report_ts:
+        latest_report = max(report_ts)
+        max_report_age_hours = float((now_utc - latest_report).total_seconds() / 3600.0)
+
+    global_reasons: list[str] = []
+    total_rows = len(injury_status_map)
+    if total_rows < INJURY_FEED_MIN_ROWS:
+        global_reasons.append(f"low_rows:{total_rows}")
+    if pd.notna(max_report_age_hours) and max_report_age_hours > INJURY_FEED_STALE_HOURS:
+        global_reasons.append(f"stale_hours:{max_report_age_hours:.1f}")
+    if total_rows == 0:
+        global_reasons.append("empty_feed")
+    global_stale = bool(global_reasons)
+
+    team_meta: dict[str, dict[str, Any]] = {}
+    for team in teams:
+        rows = by_team.get(team, [])
+        out_doubt = sum(
+            str(r.get("status", "")).strip().lower() in {"out", "doubtful", "suspension"}
+            for r in rows
+        )
+        team_reasons: list[str] = []
+        if global_stale:
+            team_reasons.append("global_stale")
+        if len(rows) == 0:
+            team_reasons.append("no_team_rows")
+        if len(rows) > 0 and out_doubt == 0:
+            team_reasons.append("zero_out_doubtful")
+        team_meta[team] = {
+            "rows": int(len(rows)),
+            "out_doubtful_count": int(out_doubt),
+            "zero_out_doubtful": int(out_doubt == 0),
+            "stale": int(bool(team_reasons)),
+            "stale_reason": "|".join(team_reasons),
+        }
+
+    return {
+        "global_stale": int(global_stale),
+        "global_reason": "|".join(global_reasons),
+        "max_report_age_hours": max_report_age_hours,
+        "total_rows": int(total_rows),
+        "teams": team_meta,
+    }
+
+
+def compute_forward_injury_pressure(
+    injury_status_map: dict[str, dict[str, Any]],
+    player_games: pd.DataFrame,
+    teams: list[str],
+    clip_bounds: tuple[float, float],
+) -> dict[str, dict[str, Any]]:
+    """Compute forward-looking team injury pressure using current injury report + recent form."""
+    teams_u = [str(t).upper() for t in teams]
+    base = {
+        t: {
+            "fwd_missing_points": 0.0,
+            "fwd_missing_minutes": 0.0,
+            "fwd_missing_assists": 0.0,
+            "fwd_missing_rebounds": 0.0,
+            "fwd_star_absent_flag": 0,
+            "fwd_top1_missing_points": 0.0,
+            "fwd_top2_missing_points": 0.0,
+            "top_players_out": [],
+        }
+        for t in teams_u
+    }
+    if not injury_status_map or player_games.empty:
+        return base
+
+    pg = player_games.copy()
+    if "played" in pg.columns:
+        pg = pg[pg["played"] == 1].copy()
+    if pg.empty:
+        return base
+    if "game_time_utc" not in pg.columns or "player_id" not in pg.columns or "team" not in pg.columns:
+        return base
+
+    pg["team"] = pg["team"].astype(str).str.upper()
+    pg = pg[pg["team"].isin(teams_u)].copy()
+    if pg.empty:
+        return base
+    pg = pg.sort_values(["team", "player_id", "game_time_utc", "game_id"])
+    pg["name_norm"] = pg["player_name"].map(normalize_player_name)
+    if "espn_player_id" in pg.columns:
+        pg["espn_player_id"] = pd.to_numeric(pg["espn_player_id"], errors="coerce")
+
+    def _tail_mean(df: pd.DataFrame, col: str) -> float:
+        if col not in df.columns:
+            return np.nan
+        s = pd.to_numeric(df[col], errors="coerce")
+        return float(s.mean()) if s.notna().any() else np.nan
+
+    snapshots: list[dict[str, Any]] = []
+    for (team, pid), grp in pg.groupby(["team", "player_id"], sort=False):
+        tail = grp.tail(5)
+        latest = grp.iloc[-1]
+        snapshots.append({
+            "team": team,
+            "player_id": int(pid),
+            "player_name": str(latest.get("player_name", "")),
+            "name_norm": str(latest.get("name_norm", "")),
+            "espn_player_id": _to_float(latest.get("espn_player_id", np.nan)),
+            "pre_points_avg5": _tail_mean(tail, "points"),
+            "pre_minutes_avg5": _tail_mean(tail, "minutes"),
+            "pre_assists_avg5": _tail_mean(tail, "assists"),
+            "pre_rebounds_avg5": _tail_mean(tail, "rebounds"),
+        })
+
+    snap_df = pd.DataFrame(snapshots)
+    if snap_df.empty:
+        return base
+
+    # Team "star" reference = top 2 by recent points.
+    top2_by_team: dict[str, set[int]] = {}
+    for team, grp in snap_df.groupby("team"):
+        top2 = grp.sort_values("pre_points_avg5", ascending=False).head(2)
+        top2_by_team[team] = set(top2["player_id"].astype(int).tolist())
+
+    lo_clip, hi_clip = clip_bounds
+    for inj in injury_status_map.values():
+        team = str(inj.get("team", "")).upper()
+        if team not in base:
+            continue
+        status = str(inj.get("status", "")).strip().lower()
+        unavail = 1.0 - float(np.clip(_nan_or(inj.get("availability_prob"), 0.5), 0.0, 1.0))
+        if status not in INJURY_FORWARD_STATUSES and unavail < INJURY_FORWARD_MIN_UNAVAIL:
+            continue
+
+        team_rows = snap_df[snap_df["team"] == team]
+        if team_rows.empty:
+            continue
+
+        matched = pd.DataFrame()
+        espn_id = _to_float(inj.get("espn_player_id"))
+        if pd.notna(espn_id) and "espn_player_id" in team_rows.columns:
+            matched = team_rows[team_rows["espn_player_id"] == espn_id]
+
+        if matched.empty:
+            nn = normalize_player_name(inj.get("player_name", ""))
+            if nn:
+                matched = team_rows[team_rows["name_norm"] == nn]
+
+        if matched.empty:
+            continue
+
+        m = matched.sort_values("pre_minutes_avg5", ascending=False).iloc[0]
+        miss_pts = float(_nan_or(m.get("pre_points_avg5"), 0.0) * unavail)
+        miss_min = float(_nan_or(m.get("pre_minutes_avg5"), 0.0) * unavail)
+        miss_ast = float(_nan_or(m.get("pre_assists_avg5"), 0.0) * unavail)
+        miss_reb = float(_nan_or(m.get("pre_rebounds_avg5"), 0.0) * unavail)
+        is_star = int(int(m.get("player_id", -1)) in top2_by_team.get(team, set()))
+
+        base[team]["fwd_missing_points"] += miss_pts
+        base[team]["fwd_missing_minutes"] += miss_min
+        base[team]["fwd_missing_assists"] += miss_ast
+        base[team]["fwd_missing_rebounds"] += miss_reb
+        if is_star:
+            base[team]["fwd_star_absent_flag"] = 1
+        base[team]["top_players_out"].append({
+            "player_name": str(m.get("player_name", inj.get("player_name", ""))),
+            "status": status,
+            "availability_prob": float(1.0 - unavail),
+            "unavailability_prob": float(unavail),
+            "missing_points": round(miss_pts, 2),
+            "missing_minutes": round(miss_min, 2),
+            "is_team_top2_scorer": is_star,
+        })
+
+    for team in teams_u:
+        base[team]["fwd_missing_points"] = float(np.clip(base[team]["fwd_missing_points"], lo_clip, hi_clip))
+        # minutes tracks points scale to preserve proportionality after clipping
+        base[team]["fwd_missing_minutes"] = float(max(0.0, base[team]["fwd_missing_minutes"]))
+        players = sorted(base[team]["top_players_out"], key=lambda d: d.get("missing_points", 0.0), reverse=True)
+        base[team]["top_players_out"] = players
+        base[team]["fwd_top1_missing_points"] = float(players[0]["missing_points"]) if len(players) >= 1 else 0.0
+        base[team]["fwd_top2_missing_points"] = float(sum(p["missing_points"] for p in players[:2])) if players else 0.0
+
+    return base
+
+
+def save_injury_snapshot(
+    target_date: str,
+    teams: list[str],
+    injury_status_map: dict[str, dict[str, Any]],
+    coverage: dict[str, Any],
+    forward_pressure: dict[str, dict[str, Any]],
+    asof_utc: pd.Timestamp | None = None,
+) -> Path:
+    """Persist a run-level injury snapshot for audit/debug."""
+    PROP_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    path = PROP_LOG_DIR / f"injury_snapshot_{target_date}.json"
+    rows = sorted(
+        [
+            {
+                "team": str(v.get("team", "")).upper(),
+                "player_name": v.get("player_name", ""),
+                "espn_player_id": v.get("espn_player_id"),
+                "status": v.get("status", ""),
+                "availability_prob": v.get("availability_prob"),
+                "report_date": v.get("report_date", ""),
+                "fetched_at_utc": v.get("fetched_at_utc", ""),
+            }
+            for v in injury_status_map.values()
+        ],
+        key=lambda r: (r["team"], normalize_player_name(r["player_name"])),
+    )
+    asof_utc = asof_utc if asof_utc is not None else pd.Timestamp.now(tz="UTC")
+    payload = {
+        "target_date": str(target_date),
+        "generated_at_utc": asof_utc.isoformat(),
+        "coverage": coverage,
+        "teams": [str(t).upper() for t in teams],
+        "injuries": rows,
+        "forward_pressure": forward_pressure,
+    }
+    path.write_text(json.dumps(payload, indent=2, default=str))
+    return path
 
 
 def fetch_confirmed_starters_for_event(espn_event_id: str) -> dict[str, set[str]]:
@@ -312,6 +704,7 @@ def fetch_confirmed_starters(
     upcoming: pd.DataFrame,
     lock_minutes: int = 30,
     force: bool = False,
+    now_utc: pd.Timestamp | None = None,
 ) -> dict[tuple[str, str, str], dict[str, set[str]]]:
     """Fetch confirmed starters for games near tip.
 
@@ -319,7 +712,7 @@ def fetch_confirmed_starters(
     """
     if upcoming.empty:
         return {}
-    now_utc = pd.Timestamp.now(tz="UTC")
+    now_utc = now_utc if now_utc is not None else pd.Timestamp.now(tz="UTC")
     out: dict[tuple[str, str, str], dict[str, set[str]]] = {}
     for _, row in upcoming.iterrows():
         key = (
@@ -429,6 +822,21 @@ def _american_odds_to_decimal(odds: Any) -> float:
         return 100.0 / (-odds)
     elif odds > 0:
         return odds / 100.0
+    return np.nan
+
+
+def _american_odds_to_implied_prob(odds: Any) -> float:
+    """Convert American odds to implied probability."""
+    if pd.isna(odds) or odds is None:
+        return np.nan
+    try:
+        odds = float(odds)
+    except (ValueError, TypeError):
+        return np.nan
+    if odds < 0:
+        return (-odds) / (-odds + 100.0)
+    elif odds > 0:
+        return 100.0 / (odds + 100.0)
     return np.nan
 
 
@@ -596,6 +1004,7 @@ def load_boxscore_advanced_stats(
         missing_ids = [gid for gid in wanted_ids if not (BOX_ADV_CACHE_DIR / f"{gid}.json").exists()]
         if max_fetch > 0:
             missing_ids = missing_ids[:max_fetch]
+        fetched_any = False
         for i, gid in enumerate(missing_ids, start=1):
             cache_path = BOX_ADV_CACHE_DIR / f"{gid}.json"
             try:
@@ -604,10 +1013,14 @@ def load_boxscore_advanced_stats(
                     params={"GameID": gid},
                     cache_path=cache_path,
                 )
+                fetched_any = True
                 if i < len(missing_ids):
                     time.sleep(BOX_ADV_REQUEST_SLEEP_SECS)
             except Exception as exc:
                 print(f"  Warning: BoxScoreAdvancedV3 fetch failed for {gid}: {exc}", flush=True)
+        # Invalidate in-memory cache so newly fetched games are visible in this run.
+        if fetched_any:
+            _BOX_ADV_CACHE = None
 
     # Build cache once per process from available raw files.
     if _BOX_ADV_CACHE is None:
@@ -629,6 +1042,184 @@ def load_boxscore_advanced_stats(
     if _BOX_ADV_CACHE is None or _BOX_ADV_CACHE.empty:
         return pd.DataFrame()
     out = _BOX_ADV_CACHE
+    if wanted_ids is not None:
+        out = out[out["game_id"].astype(str).isin(wanted_ids)]
+    return out.copy()
+
+
+# ---------------------------------------------------------------------------
+# Player Tracking Stats (touches, drives, catch-and-shoot, speed, distance)
+# ---------------------------------------------------------------------------
+STATS_NBA_TRACKING_URL = "https://stats.nba.com/stats/boxscoreplayertrackv3"
+TRACKING_CACHE_DIR = PROP_CACHE_DIR / "player_tracking_raw"
+_TRACKING_CACHE: pd.DataFrame | None = None
+USE_TRACKING_FEATURES = True
+
+
+def _parse_tracking_payload(payload: dict[str, Any], game_id: str) -> list[dict[str, Any]]:
+    """Parse player tracking stats from a BoxScorePlayerTrackV3 payload."""
+    rows: list[dict[str, Any]] = []
+
+    # Shape A: resultSets style (stats.nba.com standard)
+    result_sets = payload.get("resultSets")
+    if isinstance(result_sets, list):
+        for rs in result_sets:
+            headers = rs.get("headers") or rs.get("Headers") or []
+            rowset = rs.get("rowSet") or rs.get("row_set") or []
+            if not headers or not rowset:
+                continue
+            h = [str(x) for x in headers]
+
+            def idx(*names: str) -> int:
+                for n in names:
+                    if n in h:
+                        return h.index(n)
+                return -1
+
+            pid_i = idx("PLAYER_ID", "PERSON_ID")
+            team_i = idx("TEAM_ABBREVIATION", "TEAM_TRICODE")
+            touches_i = idx("TOUCHES")
+            drives_i = idx("DRIVES")
+            passes_i = idx("PASSES")
+            c_and_s_fga_i = idx("CATCH_SHOOT_FGA")
+            c_and_s_fgm_i = idx("CATCH_SHOOT_FGM")
+            c_and_s_fg3a_i = idx("CATCH_SHOOT_FG3A")
+            c_and_s_fg3m_i = idx("CATCH_SHOOT_FG3M")
+            pull_up_fga_i = idx("PULL_UP_FGA")
+            pull_up_fgm_i = idx("PULL_UP_FGM")
+            pull_up_fg3a_i = idx("PULL_UP_FG3A")
+            dist_i = idx("DIST_MILES", "DIST")
+            speed_i = idx("AVG_SPEED", "SPEED")
+            cont_shots_i = idx("CONTESTED_SHOTS", "CONT_SHOTS")
+            uncontested_fga_i = idx("UNCONTESTED_FGA")
+            if pid_i < 0 or team_i < 0:
+                continue
+            for r in rowset:
+                if not isinstance(r, (list, tuple)):
+                    continue
+                pid = r[pid_i] if pid_i < len(r) else None
+                team = str(r[team_i]).upper().strip() if team_i < len(r) else ""
+                if pid is None or not team:
+                    continue
+                rows.append({
+                    "game_id": str(game_id),
+                    "team": team,
+                    "player_id": int(pid),
+                    "trk_touches": _to_float(r[touches_i]) if touches_i >= 0 and touches_i < len(r) else np.nan,
+                    "trk_drives": _to_float(r[drives_i]) if drives_i >= 0 and drives_i < len(r) else np.nan,
+                    "trk_passes": _to_float(r[passes_i]) if passes_i >= 0 and passes_i < len(r) else np.nan,
+                    "trk_catch_shoot_fga": _to_float(r[c_and_s_fga_i]) if c_and_s_fga_i >= 0 and c_and_s_fga_i < len(r) else np.nan,
+                    "trk_catch_shoot_fgm": _to_float(r[c_and_s_fgm_i]) if c_and_s_fgm_i >= 0 and c_and_s_fgm_i < len(r) else np.nan,
+                    "trk_catch_shoot_fg3a": _to_float(r[c_and_s_fg3a_i]) if c_and_s_fg3a_i >= 0 and c_and_s_fg3a_i < len(r) else np.nan,
+                    "trk_catch_shoot_fg3m": _to_float(r[c_and_s_fg3m_i]) if c_and_s_fg3m_i >= 0 and c_and_s_fg3m_i < len(r) else np.nan,
+                    "trk_pull_up_fga": _to_float(r[pull_up_fga_i]) if pull_up_fga_i >= 0 and pull_up_fga_i < len(r) else np.nan,
+                    "trk_pull_up_fgm": _to_float(r[pull_up_fgm_i]) if pull_up_fgm_i >= 0 and pull_up_fgm_i < len(r) else np.nan,
+                    "trk_pull_up_fg3a": _to_float(r[pull_up_fg3a_i]) if pull_up_fg3a_i >= 0 and pull_up_fg3a_i < len(r) else np.nan,
+                    "trk_dist_miles": _to_float(r[dist_i]) if dist_i >= 0 and dist_i < len(r) else np.nan,
+                    "trk_avg_speed": _to_float(r[speed_i]) if speed_i >= 0 and speed_i < len(r) else np.nan,
+                    "trk_contested_shots": _to_float(r[cont_shots_i]) if cont_shots_i >= 0 and cont_shots_i < len(r) else np.nan,
+                    "trk_uncontested_fga": _to_float(r[uncontested_fga_i]) if uncontested_fga_i >= 0 and uncontested_fga_i < len(r) else np.nan,
+                })
+        if rows:
+            return rows
+
+    # Shape B: nested homeTeam/awayTeam (newer NBA CDN format)
+    trk_root = payload.get("boxScorePlayerTrack") or payload.get("boxscoreplayertrackv3") or payload
+    for side_key in ("homeTeam", "awayTeam"):
+        side = trk_root.get(side_key) if isinstance(trk_root, dict) else None
+        if not isinstance(side, dict):
+            continue
+        team = str(
+            side.get("teamTricode") or side.get("teamCode") or side.get("teamAbbreviation") or ""
+        ).upper().strip()
+        for p in side.get("players", []) or []:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("personId") or p.get("playerId") or p.get("PLAYER_ID")
+            if pid is None:
+                continue
+            stats = p.get("statistics") or {}
+            if not team:
+                team = str(p.get("teamTricode") or p.get("teamCode") or "").upper().strip()
+            rows.append({
+                "game_id": str(game_id),
+                "team": team,
+                "player_id": int(pid),
+                "trk_touches": _to_float(stats.get("touches") or stats.get("TOUCHES")),
+                "trk_drives": _to_float(stats.get("drives") or stats.get("DRIVES")),
+                "trk_passes": _to_float(stats.get("passes") or stats.get("PASSES")),
+                "trk_catch_shoot_fga": _to_float(stats.get("catchShootFga") or stats.get("CATCH_SHOOT_FGA")),
+                "trk_catch_shoot_fgm": _to_float(stats.get("catchShootFgm") or stats.get("CATCH_SHOOT_FGM")),
+                "trk_catch_shoot_fg3a": _to_float(stats.get("catchShootFg3a") or stats.get("CATCH_SHOOT_FG3A")),
+                "trk_catch_shoot_fg3m": _to_float(stats.get("catchShootFg3m") or stats.get("CATCH_SHOOT_FG3M")),
+                "trk_pull_up_fga": _to_float(stats.get("pullUpFga") or stats.get("PULL_UP_FGA")),
+                "trk_pull_up_fgm": _to_float(stats.get("pullUpFgm") or stats.get("PULL_UP_FGM")),
+                "trk_pull_up_fg3a": _to_float(stats.get("pullUpFg3a") or stats.get("PULL_UP_FG3A")),
+                "trk_dist_miles": _to_float(stats.get("distanceMiles") or stats.get("DIST_MILES") or stats.get("dist")),
+                "trk_avg_speed": _to_float(stats.get("averageSpeed") or stats.get("AVG_SPEED") or stats.get("speed")),
+                "trk_contested_shots": _to_float(stats.get("contestedShots") or stats.get("CONTESTED_SHOTS")),
+                "trk_uncontested_fga": _to_float(stats.get("uncontestedFga") or stats.get("UNCONTESTED_FGA")),
+            })
+    return rows
+
+
+def load_player_tracking_stats(
+    game_ids: list[str] | pd.Series | np.ndarray | None = None,
+    fetch_missing: bool = False,
+    max_fetch: int = 0,
+) -> pd.DataFrame:
+    """Load player tracking stats from local cache, optionally fetching misses."""
+    global _TRACKING_CACHE
+    TRACKING_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if game_ids is None:
+        wanted_ids = None
+    else:
+        wanted_ids = sorted({str(g) for g in list(game_ids) if str(g).strip()})
+        if not wanted_ids:
+            return pd.DataFrame()
+
+    if fetch_missing and wanted_ids:
+        missing_ids = [gid for gid in wanted_ids if not (TRACKING_CACHE_DIR / f"{gid}.json").exists()]
+        if max_fetch > 0:
+            missing_ids = missing_ids[:max_fetch]
+        fetched_any = False
+        for i, gid in enumerate(missing_ids, start=1):
+            cache_path = TRACKING_CACHE_DIR / f"{gid}.json"
+            try:
+                _stats_nba_fetch_json(
+                    STATS_NBA_TRACKING_URL,
+                    params={"GameID": gid},
+                    cache_path=cache_path,
+                )
+                fetched_any = True
+                if i < len(missing_ids):
+                    time.sleep(BOX_ADV_REQUEST_SLEEP_SECS)
+            except Exception as exc:
+                print(f"  Warning: Tracking stats fetch failed for {gid}: {exc}", flush=True)
+        if fetched_any:
+            _TRACKING_CACHE = None
+
+    # Build cache once per process from available raw files.
+    if _TRACKING_CACHE is None:
+        rows: list[dict[str, Any]] = []
+        files = sorted(TRACKING_CACHE_DIR.glob("*.json"))
+        for f in files:
+            gid = f.stem
+            try:
+                payload = json.loads(f.read_text())
+                rows.extend(_parse_tracking_payload(payload, gid))
+            except Exception:
+                continue
+        if not rows:
+            _TRACKING_CACHE = pd.DataFrame()
+        else:
+            df = pd.DataFrame(rows).drop_duplicates(subset=["game_id", "team", "player_id"], keep="last")
+            _TRACKING_CACHE = df.reset_index(drop=True)
+
+    if _TRACKING_CACHE is None or _TRACKING_CACHE.empty:
+        return pd.DataFrame()
+    out = _TRACKING_CACHE
     if wanted_ids is not None:
         out = out[out["game_id"].astype(str).isin(wanted_ids)]
     return out.copy()
@@ -913,19 +1504,21 @@ def _get_espn_event_ids(date_str: str) -> list[dict[str, Any]]:
 
 def _resolve_espn_athlete(athlete_id: str, athlete_cache: dict[str, str]) -> str:
     """Resolve an ESPN athlete ID to a display name, with in-memory + disk caching."""
-    if athlete_id in athlete_cache:
-        return athlete_cache[athlete_id]
+    global _ESPN_ATHLETE_DISK_CACHE_LOADED
 
-    # Check disk cache
+    # Hydrate from disk once per process even when in-memory cache is partially preloaded.
     disk_cache = PROP_CACHE_DIR / "espn_athlete_cache.json"
-    if not athlete_cache and disk_cache.exists():
+    if not _ESPN_ATHLETE_DISK_CACHE_LOADED and disk_cache.exists():
         try:
             loaded = json.loads(disk_cache.read_text())
-            athlete_cache.update(loaded)
-            if athlete_id in athlete_cache:
-                return athlete_cache[athlete_id]
+            if isinstance(loaded, dict):
+                athlete_cache.update({str(k): str(v) for k, v in loaded.items()})
         except Exception:
             pass
+        _ESPN_ATHLETE_DISK_CACHE_LOADED = True
+
+    if athlete_id in athlete_cache:
+        return athlete_cache[athlete_id]
 
     # Fetch from ESPN
     url = (
@@ -1334,8 +1927,8 @@ def fetch_player_prop_lines(date_str: str, override_path: str | None = None) -> 
     # 1) Check for manual override
     manual = load_manual_prop_lines(date_str, override_path)
     if not manual.empty:
+        manual = _normalize_and_dedupe_prop_lines(manual, default_date=date_str)
         print(f"  Loaded {len(manual)} manual prop lines", flush=True)
-        _add_implied_probs(manual)
         manual.to_csv(cache_file, index=False)
         no_lines_file.unlink(missing_ok=True)
         return manual
@@ -1345,29 +1938,34 @@ def fetch_player_prop_lines(date_str: str, override_path: str | None = None) -> 
         try:
             cached = pd.read_csv(cache_file)
             if not cached.empty:
+                cached = _normalize_and_dedupe_prop_lines(cached, default_date=date_str)
                 print(f"  Loaded {len(cached)} cached prop lines for {date_str}", flush=True)
-                _add_implied_probs(cached)
                 no_lines_file.unlink(missing_ok=True)
                 return cached
         except Exception:
             pass
 
-    # 3) Try ESPN
+    # 3) Try ESPN, then optionally merge Odds API for better executable pricing.
     print("  Trying ESPN player props API...", flush=True)
     espn_lines = fetch_espn_player_props(date_str)
     if not espn_lines.empty:
         print(f"  Found {len(espn_lines)} ESPN prop lines", flush=True)
-        _add_implied_probs(espn_lines)
-        espn_lines.to_csv(cache_file, index=False)
+        odds_api_lines = fetch_odds_api_player_props(date_str)
+        combined = [espn_lines]
+        if not odds_api_lines.empty:
+            print(f"  Found {len(odds_api_lines)} Odds API prop lines (merge)", flush=True)
+            combined.append(odds_api_lines)
+        merged = _normalize_and_dedupe_prop_lines(pd.concat(combined, ignore_index=True), default_date=date_str)
+        merged.to_csv(cache_file, index=False)
         no_lines_file.unlink(missing_ok=True)
-        return espn_lines
+        return merged
 
     # 4) Try The Odds API
     print("  ESPN props not available. Trying The Odds API...", flush=True)
     odds_api_lines = fetch_odds_api_player_props(date_str)
     if not odds_api_lines.empty:
+        odds_api_lines = _normalize_and_dedupe_prop_lines(odds_api_lines, default_date=date_str)
         print(f"  Found {len(odds_api_lines)} Odds API prop lines", flush=True)
-        _add_implied_probs(odds_api_lines)
         odds_api_lines.to_csv(cache_file, index=False)
         no_lines_file.unlink(missing_ok=True)
         return odds_api_lines
@@ -1404,27 +2002,9 @@ def load_prop_lines_for_dates(
         if df.empty:
             continue
 
-        if "game_date_est" not in df.columns:
-            if "date" in df.columns:
-                df["game_date_est"] = (
-                    df["date"].astype(str).str.replace("-", "", regex=False).str.slice(0, 8)
-                )
-            else:
-                df["game_date_est"] = date_str
-        else:
-            df["game_date_est"] = df["game_date_est"].astype(str).str.replace("-", "", regex=False).str.slice(0, 8)
-
-        if "stat_type" in df.columns:
-            df["stat_type"] = df["stat_type"].astype(str).str.strip().str.lower()
-        if "player_name" in df.columns:
-            df["player_name"] = df["player_name"].astype(str).str.strip()
-        if "team" in df.columns:
-            df["team"] = _normalize_team_series(df["team"])
-        else:
-            df["team"] = ""
-
-        _add_implied_probs(df)
-        all_lines.append(df)
+        norm_df = _normalize_and_dedupe_prop_lines(df, default_date=date_str)
+        if not norm_df.empty:
+            all_lines.append(norm_df)
 
     if not all_lines:
         return pd.DataFrame()
@@ -1442,6 +2022,78 @@ def _add_implied_probs(df: pd.DataFrame) -> None:
         df["under_implied_prob"] = df["under_odds"].apply(_american_odds_to_prob)
     else:
         df["under_implied_prob"] = np.nan
+
+
+def _prop_source_priority(source_val: Any) -> int:
+    """Rank prop-line sources for dedupe tie-breaks (higher is preferred)."""
+    src = str(source_val or "").lower()
+    if src.startswith("manual"):
+        return 5
+    if "espn" in src:
+        return 4
+    if "odds_api" in src:
+        return 3
+    if src.startswith("cached"):
+        return 2
+    return 1
+
+
+def _normalize_and_dedupe_prop_lines(
+    lines_df: pd.DataFrame,
+    default_date: str | None = None,
+) -> pd.DataFrame:
+    """Normalize schema and keep one best executable line per player/stat/date/team."""
+    if lines_df is None or lines_df.empty:
+        return pd.DataFrame()
+
+    df = lines_df.copy()
+    required = {"player_name", "stat_type", "line"}
+    if not required.issubset(df.columns):
+        return pd.DataFrame()
+
+    if "game_date_est" not in df.columns:
+        if "date" in df.columns:
+            df["game_date_est"] = (
+                df["date"].astype(str).str.replace("-", "", regex=False).str.slice(0, 8)
+            )
+        else:
+            df["game_date_est"] = default_date or ""
+    df["game_date_est"] = df["game_date_est"].astype(str).str.replace("-", "", regex=False).str.slice(0, 8)
+
+    df["player_name"] = df["player_name"].astype(str).str.strip()
+    df["player_name_norm"] = df["player_name"].map(normalize_player_name)
+    df["stat_type"] = df["stat_type"].astype(str).str.strip().str.lower()
+    if "team" in df.columns:
+        df["team"] = _normalize_team_series(df["team"])
+    else:
+        df["team"] = ""
+    df["team"] = df["team"].fillna("").astype(str).str.strip().str.upper()
+    if "source" not in df.columns:
+        df["source"] = "unknown"
+
+    for col in ["line", "open_line", "over_odds", "under_odds", "open_over_odds", "open_under_odds"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    _add_implied_probs(df)
+    over_imp = pd.to_numeric(df.get("over_implied_prob", np.nan), errors="coerce")
+    under_imp = pd.to_numeric(df.get("under_implied_prob", np.nan), errors="coerce")
+    df["vig"] = np.where(over_imp.notna() & under_imp.notna(), over_imp + under_imp - 1.0, np.inf)
+    df["source_pri"] = df["source"].map(_prop_source_priority)
+    df["has_team"] = df["team"].ne("")
+
+    # Prefer team-scoped lines over blank-team rows when both exist.
+    grp_base = ["game_date_est", "player_name_norm", "stat_type"]
+    has_team_any = df.groupby(grp_base)["has_team"].transform("max").astype(bool)
+    df = df[(~has_team_any) | df["has_team"]].copy()
+
+    # One row per (date, player, stat, team), best vig then preferred source.
+    sort_cols = ["game_date_est", "player_name_norm", "stat_type", "team", "vig", "source_pri"]
+    df = df.sort_values(sort_cols, ascending=[True, True, True, True, True, False])
+    df = df.drop_duplicates(subset=grp_base + ["team"], keep="first").copy()
+
+    drop_cols = ["player_name_norm", "vig", "source_pri", "has_team"]
+    return df.drop(columns=[c for c in drop_cols if c in df.columns]).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1746,6 +2398,34 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
         if c not in pg.columns:
             pg[c] = np.nan
 
+    # --- Load and merge Player Tracking stats (touches, drives, catch-and-shoot) ---
+    trk_cols = [
+        "trk_touches", "trk_drives", "trk_passes",
+        "trk_catch_shoot_fga", "trk_catch_shoot_fgm",
+        "trk_catch_shoot_fg3a", "trk_catch_shoot_fg3m",
+        "trk_pull_up_fga", "trk_pull_up_fgm", "trk_pull_up_fg3a",
+        "trk_dist_miles", "trk_avg_speed",
+        "trk_contested_shots", "trk_uncontested_fga",
+    ]
+    if USE_TRACKING_FEATURES:
+        trk = load_player_tracking_stats(
+            game_ids=pg["game_id"].astype(str).unique().tolist(),
+            fetch_missing=box_adv_fetch_missing,
+            max_fetch=box_adv_max_fetch,
+        )
+        if not trk.empty:
+            pg = pg.merge(
+                trk[["game_id", "team", "player_id"] + [c for c in trk_cols if c in trk.columns]],
+                on=["game_id", "team", "player_id"],
+                how="left",
+            )
+            _trk_avail = [c for c in trk_cols if c in trk.columns]
+            _trk_pct = trk[_trk_avail].notna().any(axis=1).mean() * 100
+            print(f"  Merged tracking stats: {len(trk)} rows, {_trk_pct:.0f}% coverage", flush=True)
+    for c in trk_cols:
+        if c not in pg.columns:
+            pg[c] = np.nan
+
     # --- OT regulation adjustment ---
     # Scale counting stats to regulation-equivalent for rolling averages.
     # OT inflates counting stats by ~10% per OT period; per-minute rates are unaffected.
@@ -1755,7 +2435,12 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
     # Create regulation-adjusted counting stats for rolling averages
     _counting_stats = ["points", "rebounds", "assists", "fg3m", "fga", "fgm",
                        "fg3a", "fta", "ftm", "tov", "steals", "blocks", "orb", "drb",
-                       "fouls_personal", "fouls_drawn", "pts_in_paint", "pts_fast_break"]
+                       "fouls_personal", "fouls_drawn", "pts_in_paint", "pts_fast_break",
+                       "trk_touches", "trk_drives", "trk_passes",
+                       "trk_catch_shoot_fga", "trk_catch_shoot_fgm",
+                       "trk_catch_shoot_fg3a", "trk_catch_shoot_fg3m",
+                       "trk_pull_up_fga", "trk_pull_up_fgm", "trk_pull_up_fg3a",
+                       "trk_contested_shots", "trk_uncontested_fga"]
     for col in _counting_stats:
         if col in pg.columns:
             pg[f"{col}_reg"] = pg[col] * reg_factor
@@ -1770,6 +2455,13 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
     pg["fg3a_per_min"] = pg["fg3a"] / safe_mins
     pg["fta_per_min"] = pg["fta"] / safe_mins
     pg["fouls_drawn_per_min"] = pg["fouls_drawn"] / safe_mins
+    # Tracking per-minute rates (more stable than raw counts across different minute loads)
+    if "trk_touches" in pg.columns:
+        pg["trk_touches_per_min"] = pg["trk_touches"].fillna(0) / safe_mins
+    if "trk_drives" in pg.columns:
+        pg["trk_drives_per_min"] = pg["trk_drives"].fillna(0) / safe_mins
+    if "trk_catch_shoot_fg3a" in pg.columns:
+        pg["trk_catch_shoot_fg3a_per_min"] = pg["trk_catch_shoot_fg3a"].fillna(0) / safe_mins
 
     # --- Player rolling features ---
     player_group = ["team", "player_id", "season"] if "season" in pg.columns else ["team", "player_id"]
@@ -1792,11 +2484,21 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
                     "adv_usage_pct", "adv_pace", "adv_possessions", "adv_off_rating",
                     "adv_ast_pct", "adv_reb_pct", "adv_ts_pct",
                     "pts_per_min", "reb_per_min", "ast_per_min", "fg3m_per_min",
-                    "fga_per_min", "fg3a_per_min", "fta_per_min", "fouls_drawn_per_min"]
+                    "fga_per_min", "fg3a_per_min", "fta_per_min", "fouls_drawn_per_min",
+                    # Player tracking stats (touches, drives, catch-and-shoot)
+                    "trk_touches_reg", "trk_drives_reg", "trk_passes_reg",
+                    "trk_catch_shoot_fga_reg", "trk_catch_shoot_fg3a_reg",
+                    "trk_pull_up_fga_reg", "trk_pull_up_fg3a_reg",
+                    "trk_contested_shots_reg", "trk_uncontested_fga_reg",
+                    # Tracking per-minute rates
+                    "trk_touches_per_min", "trk_drives_per_min",
+                    "trk_catch_shoot_fg3a_per_min"]
     # Last-3-game hot streak features (faster than avg5 for capturing streaks)
     avg3_cols = ["points_reg", "rebounds_reg", "assists_reg", "minutes", "fg3m_reg",
                  "fg3a_reg", "fouls_drawn_reg", "adv_usage_pct",
-                 "pts_per_min", "reb_per_min", "ast_per_min", "fg3m_per_min"]
+                 "pts_per_min", "reb_per_min", "ast_per_min", "fg3m_per_min",
+                 # Tracking: touches and drives are strong usage signals
+                 "trk_touches_reg", "trk_drives_reg"]
     for col in rolling_cols:
         if col not in pg.columns:
             continue
@@ -1815,7 +2517,10 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
                 "adv_usage_pct", "adv_pace", "adv_possessions", "adv_off_rating",
                 "adv_ast_pct", "adv_reb_pct", "adv_ts_pct",
                 "pts_per_min", "reb_per_min", "ast_per_min", "fg3m_per_min",
-                "fga_per_min", "fg3a_per_min", "fta_per_min", "fouls_drawn_per_min"]
+                "fga_per_min", "fg3a_per_min", "fta_per_min", "fouls_drawn_per_min",
+                # Tracking EWM (touches and drives most important)
+                "trk_touches_reg", "trk_drives_reg",
+                "trk_catch_shoot_fg3a_reg", "trk_pull_up_fg3a_reg"]
     for col in ewm_cols:
         if col not in pg.columns:
             continue
@@ -1843,7 +2548,7 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
     if rename_map:
         pg = pg.rename(columns=rename_map)
     # Drop the intermediate _reg columns (raw counting stat × reg_factor)
-    reg_drop = [c for c in pg.columns if c.endswith("_reg") and c.startswith(("points_", "rebounds_", "assists_", "fg3m_", "fga_", "fgm_", "fg3a_", "fta_", "ftm_", "tov_", "steals_", "blocks_", "orb_", "drb_", "fouls_personal_", "fouls_drawn_", "pts_in_paint_", "pts_fast_break_"))]
+    reg_drop = [c for c in pg.columns if c.endswith("_reg") and c.startswith(("points_", "rebounds_", "assists_", "fg3m_", "fga_", "fgm_", "fg3a_", "fta_", "ftm_", "tov_", "steals_", "blocks_", "orb_", "drb_", "fouls_personal_", "fouls_drawn_", "pts_in_paint_", "pts_fast_break_", "trk_"))]
     if reg_drop:
         pg.drop(columns=reg_drop, inplace=True, errors="ignore")
 
@@ -1889,26 +2594,85 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
 
         # Momentum / trend: slope of last 5 games via linear regression
         if raw_col:
-            def _rolling_slope(s: pd.Series) -> pd.Series:
-                shifted = s.shift(1)
-                out = pd.Series(np.nan, index=s.index, dtype=float)
-                for i in range(4, len(shifted)):
-                    window = shifted.iloc[max(0, i - 4):i + 1].dropna()
-                    if len(window) >= 3:
-                        x = np.arange(len(window), dtype=float)
-                        y = window.values.astype(float)
-                        if np.std(x) > 0:
-                            slope = float(np.polyfit(x, y, 1)[0])
-                            out.iloc[i] = slope
-                return out
+            def _window_slope(arr: np.ndarray) -> float:
+                valid = np.isfinite(arr)
+                if valid.sum() < 3:
+                    return np.nan
+                x = np.arange(arr.shape[0], dtype=float)[valid]
+                y = arr[valid].astype(float)
+                x_centered = x - x.mean()
+                denom = float(np.dot(x_centered, x_centered))
+                if denom <= 0:
+                    return np.nan
+                y_centered = y - y.mean()
+                return float(np.dot(x_centered, y_centered) / denom)
 
-            pg[f"pre_{col}_trend5"] = pg.groupby(player_group)[raw_col].transform(_rolling_slope)
+            pg[f"pre_{col}_trend5"] = pg.groupby(player_group)[raw_col].transform(
+                lambda s: s.shift(1).rolling(5, min_periods=3).apply(_window_slope, raw=True)
+            )
 
         # Recency ratio: avg3 / season_avg (>1 = hot streak)
         avg3_col = f"pre_{col}_avg3"
         if avg3_col in pg.columns and season_col and season_col in pg.columns:
             safe_season = pg[season_col].clip(lower=0.1)
             pg[f"pre_{col}_recent_vs_season"] = pg[avg3_col].fillna(0) / safe_season
+
+    # --- Phase 12: Bayesian shrinkage features ---
+    # Mild stabilizer: blend avg5 toward avg10/season to dampen streak-chasing.
+    # Uses avg10 as primary anchor (more responsive than season) with season as fallback.
+    # Weight on avg5 is high (0.6-0.85) so this acts as a gentle pull, not a heavy anchor.
+    shrinkage_cols = ["points", "rebounds", "assists", "fg3m", "minutes"]
+    _game_num = pg.groupby(player_group).cumcount() + 1
+    for col in shrinkage_cols:
+        avg5_col = f"pre_{col}_avg5"
+        avg10_col = f"pre_{col}_avg10"
+        season_col = f"pre_{col}_season"
+        std10_col = f"pre_{col}_std10"
+        if avg5_col not in pg.columns or season_col not in pg.columns:
+            continue
+        # Anchor: prefer avg10 (responsive), fall back to season for early-season
+        anchor = pg[avg10_col].fillna(pg[season_col]) if avg10_col in pg.columns else pg[season_col]
+        # w on avg5: ramp from 0.6 (few games, trust anchor more) to 0.85 (many games)
+        games_w = (_game_num.clip(lower=1) / 40.0).clip(upper=0.85).clip(lower=0.6)
+        # Volatility adjustment: high-variance players get slightly more shrinkage
+        if std10_col in pg.columns:
+            safe_mean = anchor.clip(lower=0.5)
+            cv = (pg[std10_col].fillna(0) / safe_mean).clip(upper=2.0)
+            # Reduce w by up to 0.15 for very volatile players
+            stability_adj = (0.15 * cv).clip(upper=0.15)
+        else:
+            stability_adj = 0.0
+        w = (games_w - stability_adj).clip(lower=0.5, upper=0.85)
+        pg[f"pre_{col}_shrunk"] = w * pg[avg5_col].fillna(0) + (1.0 - w) * anchor.fillna(0)
+
+    # --- Phase 12: Role-change detection flags ---
+    # Detect sustained minutes/usage regime shifts so true role changes are not over-shrunk.
+    if "pre_minutes_avg5" in pg.columns and "pre_minutes_avg10" in pg.columns:
+        min_shift = pg["pre_minutes_avg5"] - pg["pre_minutes_avg10"]
+        min_avg10 = pg["pre_minutes_avg10"].clip(lower=1.0)
+        # Role change = avg5 minutes differ from avg10 by >15% (sustained, not noise)
+        pg["role_change_flag"] = (min_shift.abs() / min_avg10 > 0.15).astype(float)
+        # Direction: positive = expanded role, negative = reduced role
+        pg["role_change_direction"] = np.sign(min_shift) * pg["role_change_flag"]
+    # Usage regime shift: detect via points-per-minute ratio change (avg5 vs avg10)
+    if "pre_pts_per_min_avg5" in pg.columns and "pre_pts_per_min_ewm5" in pg.columns:
+        # Use per-minute scoring rate as usage proxy (available at this point)
+        ppm5 = pg["pre_pts_per_min_avg5"].fillna(0)
+        ppm_ewm = pg["pre_pts_per_min_ewm5"].fillna(0)
+        # Compare short-term rate to its longer EWM; >15% divergence = usage regime shift
+        safe_ppm = ppm_ewm.clip(lower=0.01)
+        ppm_shift = (ppm5 - ppm_ewm).abs() / safe_ppm
+        pg["usage_regime_shift"] = (ppm_shift > 0.15).astype(float)
+    else:
+        pg["usage_regime_shift"] = 0.0
+    # Interaction: shrinkage should be weaker (trust recent more) during role changes
+    for col in shrinkage_cols:
+        shrunk_col = f"pre_{col}_shrunk"
+        avg5_col = f"pre_{col}_avg5"
+        if shrunk_col in pg.columns and avg5_col in pg.columns and "role_change_flag" in pg.columns:
+            # During role changes, shift shrunk estimate 50% back toward avg5 (less shrinkage)
+            rc = pg["role_change_flag"]
+            pg[shrunk_col] = pg[shrunk_col] * (1.0 - 0.5 * rc) + pg[avg5_col].fillna(0) * (0.5 * rc)
 
     # Defragment after heavy rolling-window feature construction.
     pg = pg.copy()
@@ -1965,6 +2729,18 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
     # Player game count (for filtering)
     pg["player_game_num"] = pg.groupby(player_group).cumcount() + 1
 
+    # --- Step 3: Cumulative season load features ---
+    # Players degrade in the second half of season, especially high-minute players on B2Bs.
+    # All features shifted by 1 to prevent leakage (value from before current game).
+    pg["season_games_played"] = pg.groupby(player_group).cumcount()  # 0-indexed = shifted by 1
+    if "minutes" in pg.columns:
+        pg["season_total_minutes"] = pg.groupby(player_group)["minutes"].transform(
+            lambda s: s.shift(1).cumsum()
+        ).fillna(0.0)
+    else:
+        pg["season_total_minutes"] = 0.0
+    pg["high_load_flag"] = (pg["season_total_minutes"] > 1800).astype(float)
+
     # --- Player rest and home/away ---
     pg["player_is_home"] = pg["is_home"]
 
@@ -1982,6 +2758,9 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
     # Fatigue interactions
     pg["b2b_x_minutes"] = pg["is_b2b"] * pg.get("pre_minutes_avg5", pd.Series(0.0, index=pg.index)).fillna(0)
     pg["b2b_x_starter"] = pg["is_b2b"] * pg.get("pre_starter_rate", pd.Series(0.0, index=pg.index)).fillna(0)
+
+    # Step 3: Load interaction features (load_x_age deferred until player_career_games exists)
+    pg["load_x_b2b"] = pg["high_load_flag"] * pg["is_b2b"]
 
     # --- Team context features ---
     tg = team_games.copy()
@@ -2048,10 +2827,14 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
     # If star players are absent, remaining players get more usage
     if "team_injury_proxy_missing_points5" in pg.columns:
         pg["team_injury_pressure"] = pg["team_injury_proxy_missing_points5"].fillna(0)
+        pg["team_injury_pressure_bwd"] = pg["team_injury_pressure"]
+        pg["injury_pressure_delta"] = 0.0
         pg["usage_boost_proxy"] = pg["team_injury_pressure"] * pg["pre_usage_proxy"].fillna(0)
         pg["minutes_x_injury_pressure"] = pg["pre_minutes_avg5"].fillna(0) * pg["team_injury_pressure"]
     else:
         pg["team_injury_pressure"] = 0.0
+        pg["team_injury_pressure_bwd"] = 0.0
+        pg["injury_pressure_delta"] = 0.0
         pg["minutes_x_injury_pressure"] = 0.0
         pg["usage_boost_proxy"] = pg["pre_usage_proxy"].fillna(0)
 
@@ -2209,34 +2992,58 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
         pg["pos_group"] = pg["position"].map(pos_map).fillna("F")
 
         # Build per-game defense profile: stats scored BY each position group AGAINST each team
+        _agg_dict: dict[str, tuple[str, str]] = {
+            "pts_allowed": ("points", "sum"),
+            "reb_allowed": ("rebounds", "sum"),
+            "ast_allowed": ("assists", "sum"),
+        }
+        if "fg3m" in pg.columns:
+            _agg_dict["fg3m_allowed"] = ("fg3m", "sum")
+        if "fg3a" in pg.columns:
+            _agg_dict["fg3a_allowed"] = ("fg3a", "sum")
         defense_stats = pg.groupby(["game_id", "game_time_utc", "opp", "pos_group"]).agg(
-            pts_allowed=("points", "sum"),
-            reb_allowed=("rebounds", "sum"),
-            ast_allowed=("assists", "sum"),
+            **_agg_dict
         ).reset_index()
 
         # Compute rolling averages per defending team and position group
         defense_stats = defense_stats.sort_values("game_time_utc")
-        for stat in ["pts", "reb", "ast"]:
+        for stat in ["pts", "reb", "ast", "fg3m", "fg3a"]:
             col = f"{stat}_allowed"
+            if col not in defense_stats.columns:
+                continue
             grp = defense_stats.groupby(["opp", "pos_group"])[col]
             defense_stats[f"opp_{stat}_allowed_to_pos_avg10"] = grp.transform(
                 lambda s: s.shift(1).rolling(10, min_periods=3).mean()
             )
 
+        # Derived: opponent 3-point percentage allowed to position group
+        if "opp_fg3m_allowed_to_pos_avg10" in defense_stats.columns and "opp_fg3a_allowed_to_pos_avg10" in defense_stats.columns:
+            safe_fg3a = defense_stats["opp_fg3a_allowed_to_pos_avg10"].clip(lower=0.1)
+            defense_stats["opp_fg3_pct_allowed_to_pos_avg10"] = (
+                defense_stats["opp_fg3m_allowed_to_pos_avg10"] / safe_fg3a
+            )
+
         # Merge back: player's opp + pos_group + game_id -> opponent defensive profile
-        defense_merge = defense_stats[[
+        _def_merge_cols = [
             "game_id", "opp", "pos_group",
             "opp_pts_allowed_to_pos_avg10",
             "opp_reb_allowed_to_pos_avg10",
             "opp_ast_allowed_to_pos_avg10",
-        ]].copy()
+        ]
+        for _dc in ["opp_fg3m_allowed_to_pos_avg10", "opp_fg3a_allowed_to_pos_avg10",
+                     "opp_fg3_pct_allowed_to_pos_avg10"]:
+            if _dc in defense_stats.columns:
+                _def_merge_cols.append(_dc)
+        defense_merge = defense_stats[_def_merge_cols].copy()
         pg = pg.merge(defense_merge, on=["game_id", "opp", "pos_group"], how="left")
     else:
         pg["pos_group"] = "F"
         pg["opp_pts_allowed_to_pos_avg10"] = np.nan
         pg["opp_reb_allowed_to_pos_avg10"] = np.nan
         pg["opp_ast_allowed_to_pos_avg10"] = np.nan
+        pg["opp_fg3m_allowed_to_pos_avg10"] = np.nan
+        pg["opp_fg3a_allowed_to_pos_avg10"] = np.nan
+        pg["opp_fg3_pct_allowed_to_pos_avg10"] = np.nan
 
     # --- Phase 8: Matchup delta features ---
     # Player's recent average minus what the opponent allows to that position
@@ -2258,6 +3065,12 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
         )
     else:
         pg["player_vs_opp_ast_delta"] = 0.0
+    if "pre_fg3m_avg10" in pg.columns and "opp_fg3m_allowed_to_pos_avg10" in pg.columns:
+        pg["player_vs_opp_fg3m_delta"] = (
+            pg["pre_fg3m_avg10"].fillna(0) - pg["opp_fg3m_allowed_to_pos_avg10"].fillna(0)
+        )
+    else:
+        pg["player_vs_opp_fg3m_delta"] = 0.0
 
     # --- Live-only fields (filled at prediction time) ---
     # Keep these columns in training so feature schemas stay stable.
@@ -2302,6 +3115,32 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
         pg["spread_x_starter"] = np.nan
         pg["is_big_favorite"] = np.nan
 
+    # --- Derived Vegas features: implied pace and minutes context ---
+    # League average total (~228) and pace (~100) are rough anchors; the ratio
+    # converts an implied game total into an implied pace.  A 240-total game
+    # implies ~5% faster pace than average, meaning more possessions and more
+    # counting-stat opportunities for everyone.
+    _LEAGUE_AVG_TOTAL = 228.0
+    _LEAGUE_AVG_PACE = 100.0
+    impl_total = pg["implied_total"]
+    impl_team_total = pg.get("implied_team_total", pd.Series(np.nan, index=pg.index))
+    # Implied pace: proportional scaling of league-average pace by game total
+    pg["implied_pace"] = impl_total / _LEAGUE_AVG_TOTAL * _LEAGUE_AVG_PACE
+    # Implied team scoring rate relative to their recent average
+    team_ppg = pg.get("team_pre_off_rating_avg5", pd.Series(np.nan, index=pg.index))
+    team_poss = pg.get("team_pre_possessions_avg5", pd.Series(np.nan, index=pg.index))
+    team_recent_ppg = (team_ppg.fillna(110) * team_poss.fillna(100) / 100.0)
+    safe_recent_ppg = team_recent_ppg.clip(lower=80.0)
+    # How many more/fewer points does Vegas expect vs the team's recent average?
+    pg["implied_team_total_vs_recent"] = impl_team_total - safe_recent_ppg
+    # Implied minutes context: if Vegas expects higher team scoring, starters
+    # should play closer to full minutes (game stays competitive / high-paced)
+    pre_min = pg.get("pre_minutes_avg5", pd.Series(np.nan, index=pg.index)).fillna(0)
+    pg["implied_minutes_boost"] = pre_min * (impl_team_total / safe_recent_ppg - 1.0)
+    # Implied pace delta vs player's recent pace environment
+    player_recent_pace = pg.get("matchup_pace_avg", pd.Series(np.nan, index=pg.index))
+    pg["implied_pace_delta"] = pg["implied_pace"] - player_recent_pace.fillna(pg["implied_pace"])
+
     # --- Player career / age-rest interactions (computed from training data) ---
     # Cumulative game count across all seasons for this player
     pg["player_career_games"] = pg.groupby("player_id").cumcount() + 1
@@ -2309,6 +3148,9 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
     rest = pg["player_days_rest"].fillna(2.0)
     pg["veteran_rest_effect"] = pg["is_veteran"] * rest
     pg["career_x_rest"] = pg["player_career_games"] * rest
+
+    # Step 3: load_x_age deferred here so player_career_games exists
+    pg["load_x_age"] = pg["season_total_minutes"] * pg["player_career_games"]
 
     # --- Referee crew features (merged from game-level monolith data) ---
     _ref_cols = ["ref_crew_avg_total", "ref_crew_avg_fta", "ref_crew_avg_fouls",
@@ -2345,26 +3187,39 @@ def add_market_line_features(
     files to find the opening line. Uses only open_line (safe timestamp).
 
     Features added:
-      - prop_open_line: opening line for this player/stat
-      - prop_line_vs_avg5: open_line - pre_{stat}_avg5
-      - prop_line_vs_avg10: open_line - pre_{stat}_avg10
-      - implied_over_prob: market-implied P(over) from opening odds
-      - line_available: 1 if a line was found, 0 otherwise
+      - Generic fallback fields (`prop_open_line`, etc.) chosen once by fixed
+        stat priority (no overwrite across stat types).
+      - Stat-specific fields (`prop_open_line_points`, etc.) for coherent
+        per-target modeling.
     """
     df = player_df.copy()
     cache_dir = prop_cache_dir or PROP_CACHE_DIR
+    stat_types = ["points", "rebounds", "assists", "fg3m", "minutes"]
 
-    # Initialize columns
+    # Initialize generic columns (backward compatibility)
     for col in ["prop_open_line", "prop_line_vs_avg5", "prop_line_vs_avg10",
                 "implied_over_prob", "line_available"]:
         df[col] = np.nan
+    df["prop_line_stat_type"] = ""
     df["line_available"] = 0.0
+
+    # Initialize stat-specific columns
+    for stat in stat_types:
+        for col in [
+            f"prop_open_line_{stat}",
+            f"prop_line_vs_avg5_{stat}",
+            f"prop_line_vs_avg10_{stat}",
+            f"implied_over_prob_{stat}",
+            f"line_available_{stat}",
+        ]:
+            df[col] = np.nan
+        df[f"line_available_{stat}"] = 0.0
 
     if "game_date_est" not in df.columns:
         return df
 
     # Build lookup from cached prop line files
-    line_lookup: dict[str, dict[str, float]] = {}  # "{date}_{name_norm}_{stat}" -> {open_line, over_implied, ...}
+    line_lookup: dict[str, dict[str, float]] = {}  # "{date}_{name_norm}_{team}_{stat}" -> {open_line, over_implied, ...}
 
     # Check both prop_cache and predictions directories for prop line files
     search_dirs = [cache_dir, PREDICTIONS_DIR, PROP_LINES_DIR]
@@ -2388,42 +3243,69 @@ def add_market_line_features(
                 continue
             if lines_df.empty or "player_name" not in lines_df.columns:
                 continue
+            lines_df = _normalize_and_dedupe_prop_lines(lines_df, default_date=file_date)
+            if lines_df.empty:
+                continue
+            _add_implied_probs(lines_df)
             for _, lr in lines_df.iterrows():
                 name_norm = normalize_player_name(lr.get("player_name", ""))
                 stat = str(lr.get("stat_type", ""))
+                team_val = lr.get("team", "")
+                team_norm = normalize_espn_abbr(str(team_val).strip()) if pd.notna(team_val) and str(team_val).strip() else ""
                 if not name_norm or not stat:
                     continue
-                key = f"{file_date}_{name_norm}_{stat}"
                 open_line = lr.get("open_line", lr.get("line", np.nan))
                 over_implied = lr.get("over_implied_prob", np.nan)
-                if pd.notna(open_line):
-                    line_lookup[key] = {
-                        "open_line": float(open_line),
-                        "over_implied": float(over_implied) if pd.notna(over_implied) else np.nan,
-                    }
+                under_implied = lr.get("under_implied_prob", np.nan)
+                if pd.isna(open_line):
+                    continue
+                vig = (
+                    float(over_implied + under_implied - 1.0)
+                    if pd.notna(over_implied) and pd.notna(under_implied)
+                    else np.inf
+                )
+                key = f"{file_date}_{name_norm}_{team_norm}_{stat}"
+                payload = {
+                    "open_line": float(open_line),
+                    "over_implied": float(over_implied) if pd.notna(over_implied) else np.nan,
+                    "vig": vig,
+                    "source_pri": _prop_source_priority(lr.get("source", "")),
+                }
+                prev = line_lookup.get(key)
+                if (
+                    prev is None
+                    or payload["vig"] < float(prev.get("vig", np.inf))
+                    or (
+                        payload["vig"] == float(prev.get("vig", np.inf))
+                        and payload["source_pri"] > int(prev.get("source_pri", 0))
+                    )
+                ):
+                    line_lookup[key] = payload
 
     if not line_lookup:
         return df
 
-    # For each stat type that has market lines, add features
-    stat_types = ["points", "rebounds", "assists", "fg3m", "minutes"]
-
     # Process row by row, matching player + date + stat_type
-    # We need to know which stat this row's features are for — but in training data,
-    # each row is a player-game, and we have all stats. So we look up each stat type.
     dates = df["game_date_est"].astype(str)
     player_norms = df["player_name"].map(normalize_player_name) if "player_name" in df.columns else pd.Series("", index=df.index)
+    if "team" in df.columns:
+        team_norms = df["team"].map(
+            lambda t: normalize_espn_abbr(str(t).strip()) if pd.notna(t) and str(t).strip() else ""
+        )
+    else:
+        team_norms = pd.Series("", index=df.index)
 
-    # For the primary stat types, find the best-matching line
-    # In training, we pick the stat with the highest coverage for market context
+    # Fill stat-specific fields for every available stat, and fill generic once
+    # in a stable priority order to avoid last-write-wins overwrite behavior.
     for stat in stat_types:
         avg5_col = f"pre_{stat}_avg5"
         avg10_col = f"pre_{stat}_avg10"
         if avg5_col not in df.columns:
             continue
 
-        keys = dates + "_" + player_norms + f"_{stat}"
-        matched = keys.map(line_lookup).dropna()
+        keys_team = dates + "_" + player_norms + "_" + team_norms + f"_{stat}"
+        keys_any_team = dates + "_" + player_norms + "__" + stat
+        matched = keys_team.map(line_lookup).combine_first(keys_any_team.map(line_lookup)).dropna()
         if matched.empty:
             continue
 
@@ -2433,17 +3315,31 @@ def add_market_line_features(
             open_line = match_data.get("open_line", np.nan)
             if pd.isna(open_line):
                 continue
-            df.loc[idx, "prop_open_line"] = open_line
-            df.loc[idx, "line_available"] = 1.0
-            if pd.notna(match_data.get("over_implied")):
-                df.loc[idx, "implied_over_prob"] = match_data["over_implied"]
+            # Stat-specific
+            df.loc[idx, f"prop_open_line_{stat}"] = open_line
+            df.loc[idx, f"line_available_{stat}"] = 1.0
+            over_implied = match_data.get("over_implied")
+            if pd.notna(over_implied):
+                df.loc[idx, f"implied_over_prob_{stat}"] = over_implied
             # Compute line vs averages
             avg5_val = df.loc[idx, avg5_col] if avg5_col in df.columns else np.nan
             avg10_val = df.loc[idx, avg10_col] if avg10_col in df.columns else np.nan
             if pd.notna(avg5_val):
-                df.loc[idx, "prop_line_vs_avg5"] = open_line - float(avg5_val)
+                df.loc[idx, f"prop_line_vs_avg5_{stat}"] = open_line - float(avg5_val)
             if pd.notna(avg10_val):
-                df.loc[idx, "prop_line_vs_avg10"] = open_line - float(avg10_val)
+                df.loc[idx, f"prop_line_vs_avg10_{stat}"] = open_line - float(avg10_val)
+
+            # Generic fallback: populate once using stat priority.
+            if float(df.loc[idx, "line_available"]) == 0.0:
+                df.loc[idx, "prop_open_line"] = open_line
+                df.loc[idx, "line_available"] = 1.0
+                df.loc[idx, "prop_line_stat_type"] = stat
+                if pd.notna(over_implied):
+                    df.loc[idx, "implied_over_prob"] = over_implied
+                if pd.notna(avg5_val):
+                    df.loc[idx, "prop_line_vs_avg5"] = open_line - float(avg5_val)
+                if pd.notna(avg10_val):
+                    df.loc[idx, "prop_line_vs_avg10"] = open_line - float(avg10_val)
 
     n_with_lines = int(df["line_available"].sum())
     print(f"  Market line features: {n_with_lines}/{len(df)} rows with prop lines", flush=True)
@@ -2534,6 +3430,16 @@ FEATURE_GROUPS_FOR_ABLATION: dict[str, list[str]] = {
     "market_lines": [
         "prop_open_line", "prop_line_vs_avg5", "prop_line_vs_avg10",
         "implied_over_prob", "line_available",
+        "prop_open_line_points", "prop_line_vs_avg5_points", "prop_line_vs_avg10_points",
+        "implied_over_prob_points", "line_available_points",
+        "prop_open_line_rebounds", "prop_line_vs_avg5_rebounds", "prop_line_vs_avg10_rebounds",
+        "implied_over_prob_rebounds", "line_available_rebounds",
+        "prop_open_line_assists", "prop_line_vs_avg5_assists", "prop_line_vs_avg10_assists",
+        "implied_over_prob_assists", "line_available_assists",
+        "prop_open_line_fg3m", "prop_line_vs_avg5_fg3m", "prop_line_vs_avg10_fg3m",
+        "implied_over_prob_fg3m", "line_available_fg3m",
+        "prop_open_line_minutes", "prop_line_vs_avg5_minutes", "prop_line_vs_avg10_minutes",
+        "implied_over_prob_minutes", "line_available_minutes",
     ],
     "boxscore_advanced": [
         "pre_adv_usage_pct_avg5", "pre_adv_usage_pct_avg10", "pre_adv_usage_pct_ewm5",
@@ -2547,10 +3453,9 @@ FEATURE_GROUPS_FOR_ABLATION: dict[str, list[str]] = {
     ],
     "injury_context": [
         "team_injury_pressure", "team_injury_proxy_missing_minutes5",
+        "team_injury_pressure_bwd",
         "team_injury_proxy_missing_points5", "team_star_player_absent_flag",
         "team_active_count",
-        "injury_availability_prob", "injury_unavailability_prob",
-        "injury_is_out", "injury_is_doubtful", "injury_is_questionable", "injury_is_probable",
         "usage_boost_proxy", "minutes_x_injury_pressure", "pace_x_injury_pressure",
         "role_pts_injury_beta20", "role_reb_injury_beta20",
         "role_ast_injury_beta20", "role_min_injury_beta20",
@@ -2559,7 +3464,10 @@ FEATURE_GROUPS_FOR_ABLATION: dict[str, list[str]] = {
         "matchup_pace_avg", "matchup_off_vs_def", "pace_diff_vs_recent",
         "opp_pts_allowed_to_pos_avg10", "opp_reb_allowed_to_pos_avg10",
         "opp_ast_allowed_to_pos_avg10",
+        "opp_fg3m_allowed_to_pos_avg10", "opp_fg3a_allowed_to_pos_avg10",
+        "opp_fg3_pct_allowed_to_pos_avg10",
         "player_vs_opp_pts_delta", "player_vs_opp_reb_delta", "player_vs_opp_ast_delta",
+        "player_vs_opp_fg3m_delta",
     ],
     "referee": [
         "ref_crew_avg_total", "ref_crew_avg_fta", "ref_crew_avg_fouls",
@@ -2568,6 +3476,8 @@ FEATURE_GROUPS_FOR_ABLATION: dict[str, list[str]] = {
     "vegas_context": [
         "implied_total", "implied_spread", "implied_team_total",
         "abs_spread", "spread_x_starter", "is_big_favorite",
+        "implied_pace", "implied_team_total_vs_recent",
+        "implied_minutes_boost", "implied_pace_delta",
     ],
     "recency": [
         "pre_points_ewm_var5", "pre_points_trend5", "pre_points_recent_vs_season",
@@ -2575,6 +3485,35 @@ FEATURE_GROUPS_FOR_ABLATION: dict[str, list[str]] = {
         "pre_assists_ewm_var5", "pre_assists_trend5", "pre_assists_recent_vs_season",
         "pre_fg3m_ewm_var5", "pre_fg3m_trend5", "pre_fg3m_recent_vs_season",
         "pre_minutes_ewm_var5", "pre_minutes_trend5", "pre_minutes_recent_vs_season",
+    ],
+    "shrinkage": [
+        "pre_points_shrunk", "pre_rebounds_shrunk", "pre_assists_shrunk",
+        "pre_fg3m_shrunk", "pre_minutes_shrunk",
+        "role_change_flag", "role_change_direction", "usage_regime_shift",
+    ],
+    "tracking": [
+        "pre_trk_touches_avg3", "pre_trk_touches_avg5", "pre_trk_touches_avg10",
+        "pre_trk_touches_ewm5",
+        "pre_trk_drives_avg3", "pre_trk_drives_avg5", "pre_trk_drives_avg10",
+        "pre_trk_drives_ewm5",
+        "pre_trk_passes_avg5", "pre_trk_passes_avg10",
+        "pre_trk_catch_shoot_fga_avg5",
+        "pre_trk_catch_shoot_fg3a_avg5", "pre_trk_catch_shoot_fg3a_avg10",
+        "pre_trk_catch_shoot_fg3a_ewm5",
+        "pre_trk_pull_up_fga_avg5", "pre_trk_pull_up_fg3a_avg5",
+        "pre_trk_contested_shots_avg5",
+        "pre_trk_uncontested_fga_avg5",
+        "pre_trk_touches_per_min_avg5",
+        "pre_trk_drives_per_min_avg5",
+        "pre_trk_catch_shoot_fg3a_per_min_avg5",
+    ],
+    "implied_vegas": [
+        "implied_pace", "implied_team_total_vs_recent",
+        "implied_minutes_boost", "implied_pace_delta",
+    ],
+    "opp_3pt_defense": [
+        "opp_fg3m_allowed_to_pos_avg10", "opp_fg3a_allowed_to_pos_avg10",
+        "opp_fg3_pct_allowed_to_pos_avg10", "player_vs_opp_fg3m_delta",
     ],
 }
 
@@ -2704,9 +3643,6 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
         "pre_starter_rate",
         "pre_minutes_trend",
         "pre_usage_proxy",
-        "pred_starter_prob",
-        "confirmed_starter",
-        "lineup_confirmed",
         "player_days_rest",
         "player_is_home",
         # B2B and schedule fatigue
@@ -2732,13 +3668,7 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
         "team_star_player_absent_flag",
         "team_active_count",
         "team_injury_pressure",
-        # Live injury report context
-        "injury_availability_prob",
-        "injury_unavailability_prob",
-        "injury_is_out",
-        "injury_is_doubtful",
-        "injury_is_questionable",
-        "injury_is_probable",
+        "team_injury_pressure_bwd",
         # Usage boost
         "usage_boost_proxy",
         "minutes_x_injury_pressure",
@@ -2758,15 +3688,29 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
         "abs_spread",
         "spread_x_starter",
         "is_big_favorite",
+        # Derived Vegas: implied pace and minutes context
+        "implied_pace",
+        "implied_team_total_vs_recent",
+        "implied_minutes_boost",
+        "implied_pace_delta",
         # Opponent positional defense
         "opp_pts_allowed_to_pos_avg10",
         "opp_reb_allowed_to_pos_avg10",
         "opp_ast_allowed_to_pos_avg10",
+        "opp_fg3m_allowed_to_pos_avg10",
+        "opp_fg3a_allowed_to_pos_avg10",
+        "opp_fg3_pct_allowed_to_pos_avg10",
         # Player career / age-rest interactions
         "player_career_games",
         "is_veteran",
         "veteran_rest_effect",
         "career_x_rest",
+        # Step 3: Cumulative season load
+        "season_games_played",
+        "season_total_minutes",
+        "high_load_flag",
+        "load_x_b2b",
+        "load_x_age",
         # Referee crew features (from game-level monolith data)
         "ref_crew_avg_total",
         "ref_crew_avg_fta",
@@ -2774,8 +3718,6 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
         "ref_crew_avg_pace",
         "ref_crew_total_over_league_avg",
         "ref_crew_pace_over_league_avg",
-        # OT detection
-        "is_ot",
         # Foul trouble / engagement
         "pre_fouls_personal_avg5",
         "pre_fouls_personal_avg10",
@@ -2783,7 +3725,21 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
         "player_vs_opp_pts_delta",
         "player_vs_opp_reb_delta",
         "player_vs_opp_ast_delta",
+        "player_vs_opp_fg3m_delta",
     ]
+    # Player tracking features (touches, drives, catch-and-shoot)
+    if USE_TRACKING_FEATURES:
+        common += [
+            "pre_trk_touches_avg5", "pre_trk_touches_avg10",
+            "pre_trk_touches_avg3", "pre_trk_touches_ewm5",
+            "pre_trk_drives_avg5", "pre_trk_drives_avg10",
+            "pre_trk_drives_avg3", "pre_trk_drives_ewm5",
+            "pre_trk_passes_avg5",
+            "pre_trk_contested_shots_avg5",
+            # Per-minute tracking rates
+            "pre_trk_touches_per_min_avg5",
+            "pre_trk_drives_per_min_avg5",
+        ]
     if USE_BOXSCORE_ADV_FEATURES:
         common += [
             "pre_adv_usage_pct_avg5", "pre_adv_usage_pct_avg10", "pre_adv_usage_pct_ewm5",
@@ -2806,6 +3762,9 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             "pre_minutes_ewm_var5",
             "pre_minutes_trend5",
             "pre_minutes_recent_vs_season",
+            # Phase 12: Shrinkage + role-change
+            "pre_minutes_shrunk",
+            "role_change_flag", "role_change_direction", "usage_regime_shift",
         ]
     elif target == "points":
         specific = [
@@ -2828,12 +3787,21 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             "pre_pts_per_min_avg3", "pre_pts_per_min_avg5", "pre_pts_per_min_ewm5",
             # Phase 7: Recency features
             "pre_points_ewm_var5", "pre_points_trend5", "pre_points_recent_vs_season",
+            # Phase 12: Shrinkage + role-change
+            "pre_points_shrunk",
+            "role_change_flag", "role_change_direction", "usage_regime_shift",
         ]
         if USE_BOXSCORE_ADV_FEATURES:
             specific += [
                 "pre_adv_usage_pct_avg3",
                 "pre_adv_off_rating_avg10",
                 "pre_adv_ts_pct_avg10",
+            ]
+        if USE_TRACKING_FEATURES:
+            specific += [
+                # Drives → paint scoring, pull-up volume → perimeter scoring
+                "pre_trk_pull_up_fga_avg5",
+                "pre_trk_uncontested_fga_avg5",
             ]
         if two_stage:
             specific.append("pred_minutes")
@@ -2864,6 +3832,9 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             "pre_reb_per_min_avg3", "pre_reb_per_min_avg5", "pre_reb_per_min_ewm5",
             # Phase 7: Recency features
             "pre_rebounds_ewm_var5", "pre_rebounds_trend5", "pre_rebounds_recent_vs_season",
+            # Phase 12: Shrinkage + role-change
+            "pre_rebounds_shrunk",
+            "role_change_flag", "role_change_direction", "usage_regime_shift",
         ]
         if USE_BOXSCORE_ADV_FEATURES:
             specific += [
@@ -2882,11 +3853,19 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             "pre_ast_per_min_avg3", "pre_ast_per_min_avg5", "pre_ast_per_min_ewm5",
             # Phase 7: Recency features
             "pre_assists_ewm_var5", "pre_assists_trend5", "pre_assists_recent_vs_season",
+            # Phase 12: Shrinkage + role-change
+            "pre_assists_shrunk",
+            "role_change_flag", "role_change_direction", "usage_regime_shift",
         ]
         if USE_BOXSCORE_ADV_FEATURES:
             specific += [
                 "pre_adv_ast_pct_avg5", "pre_adv_ast_pct_avg10",
                 "pre_adv_usage_pct_avg3",
+            ]
+        if USE_TRACKING_FEATURES:
+            specific += [
+                # Passes are the strongest leading indicator for assists
+                "pre_trk_passes_avg5", "pre_trk_passes_avg10",
             ]
         if two_stage:
             specific.append("pred_minutes")
@@ -2902,11 +3881,24 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             "pre_fg3m_per_min_avg3", "pre_fg3m_per_min_avg5", "pre_fg3m_per_min_ewm5",
             # Phase 7: Recency features
             "pre_fg3m_ewm_var5", "pre_fg3m_trend5", "pre_fg3m_recent_vs_season",
+            # Phase 12: Shrinkage + role-change
+            "pre_fg3m_shrunk",
+            "role_change_flag", "role_change_direction", "usage_regime_shift",
         ]
         if USE_BOXSCORE_ADV_FEATURES:
             specific += [
                 "pre_adv_usage_pct_avg3",
                 "pre_adv_pace_avg10",
+            ]
+        if USE_TRACKING_FEATURES:
+            specific += [
+                # Catch-and-shoot volume is the strongest predictor of 3PM
+                "pre_trk_catch_shoot_fg3a_avg5", "pre_trk_catch_shoot_fg3a_avg10",
+                "pre_trk_catch_shoot_fg3a_ewm5",
+                "pre_trk_catch_shoot_fga_avg5",
+                # Pull-up 3PA: secondary 3-point source
+                "pre_trk_pull_up_fg3a_avg5",
+                "pre_trk_catch_shoot_fg3a_per_min_avg5",
             ]
         if two_stage:
             specific.append("pred_minutes")
@@ -2917,11 +3909,11 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
     market_feats: list[str] = []
     if use_market_features:
         market_feats = [
-            "prop_open_line",
-            "prop_line_vs_avg5",
-            "prop_line_vs_avg10",
-            "implied_over_prob",
-            "line_available",
+            f"prop_open_line_{target}",
+            f"prop_line_vs_avg5_{target}",
+            f"prop_line_vs_avg10_{target}",
+            f"implied_over_prob_{target}",
+            f"line_available_{target}",
         ]
 
     return common + specific + market_feats
@@ -2946,22 +3938,203 @@ def get_residual_feature_list(target: str) -> list[str]:
     Includes base features plus OOF predictions and interaction features.
     """
     base = get_feature_list(target, two_stage=True, use_market_features=True)
+    line_feature = f"prop_open_line_{target}"
     residual_specific = [
         f"oof_pred_{target}",    # the base OOF prediction itself
         "oof_pred_minutes",       # OOF minutes prediction
         # Market context
-        "prop_open_line",
+        line_feature,
         "oof_pred_vs_line",       # oof_pred - open_line
         # Interaction features
         "oof_pred_x_b2b",            # oof_pred * is_b2b
         "oof_pred_x_injury_pressure",  # oof_pred * team_injury_pressure
     ]
+    # Step 4: Player target encoding (only when enabled)
+    if USE_PLAYER_TARGET_ENCODING:
+        residual_specific.append(f"player_resid_enc_{target}")
     return base + residual_specific
 
 
 # ---------------------------------------------------------------------------
 # Model training and prediction
 # ---------------------------------------------------------------------------
+
+
+def _build_lgbm_regressor(params: dict[str, Any] | None = None) -> Any:
+    """Build a LightGBM regressor with given params (or defaults)."""
+    if not _HAS_LGBM:
+        return None
+    p = params or {}
+    return LGBMRegressor(
+        n_estimators=p.get("n_estimators", 300),
+        max_depth=p.get("max_depth", 5),
+        learning_rate=p.get("learning_rate", 0.05),
+        subsample=p.get("subsample", 0.8),
+        colsample_bytree=p.get("colsample_bytree", 0.8),
+        reg_lambda=p.get("reg_lambda", 1.0),
+        reg_alpha=p.get("reg_alpha", 0.1),
+        min_child_samples=p.get("min_child_samples", 20),
+        num_leaves=p.get("num_leaves", 31),
+        random_state=42,
+        verbosity=-1,
+    )
+
+
+def train_prop_model_lgbm(
+    train_df: pd.DataFrame,
+    features: list[str],
+    target: str,
+    params: dict[str, Any] | None = None,
+    sample_weight: pd.Series | np.ndarray | None = None,
+) -> tuple[SimpleImputer, Any, list[str]]:
+    """Train a LightGBM regressor for a player prop target."""
+    if not _HAS_LGBM:
+        raise ValueError("LightGBM not available")
+    train = train_df.dropna(subset=[target]).copy()
+    if train.empty:
+        raise ValueError(f"No training data for target {target}")
+    feats = [f for f in filter_features(features, train) if train[f].notna().any()]
+    if not feats:
+        raise ValueError(f"No usable features for target {target}")
+
+    X = train[feats]
+    y = train[target]
+
+    imp = SimpleImputer(strategy="median")
+    X_imp = imp.fit_transform(X)
+
+    sw = None
+    if sample_weight is not None:
+        if isinstance(sample_weight, pd.Series):
+            sw = sample_weight.reindex(train.index).to_numpy(dtype=float)
+        else:
+            sw = np.asarray(sample_weight, dtype=float)
+            if len(sw) != len(train):
+                sw = None
+        if sw is not None:
+            sw = np.where(np.isfinite(sw), sw, 1.0)
+            sw = np.clip(sw, 0.05, None)
+
+    p = params or {}
+    lgbm_defaults = {
+        "n_estimators": 300,
+        "max_depth": 5,
+        "learning_rate": 0.05,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_lambda": 1.0,
+        "reg_alpha": 0.1,
+        "min_child_samples": 20,
+        "num_leaves": 31,
+    }
+    if target == "minutes":
+        lgbm_defaults.update({
+            "n_estimators": 400,
+            "max_depth": 4,
+            "learning_rate": 0.04,
+            "reg_lambda": 2.0,
+            "reg_alpha": 0.2,
+            "min_child_samples": 25,
+        })
+    model = _build_lgbm_regressor({**lgbm_defaults, **p})
+    model.fit(X_imp, y, sample_weight=sw)
+    return imp, model, feats
+
+
+def _time_series_oof_ensemble(
+    df: pd.DataFrame,
+    features: list[str],
+    target: str,
+    sample_weight: pd.Series | np.ndarray | None = None,
+    min_rows: int = 500,
+) -> tuple[pd.Series, pd.Series]:
+    """Generate OOF predictions from both XGBoost and LightGBM for stacking.
+
+    Returns (oof_xgb, oof_lgbm) as separate Series aligned to df.index.
+    """
+    valid = df.dropna(subset=[target]).copy()
+    oof_xgb = pd.Series(np.nan, index=df.index, dtype=float)
+    oof_lgbm = pd.Series(np.nan, index=df.index, dtype=float)
+
+    if len(valid) < min_rows or not _HAS_LGBM:
+        return oof_xgb, oof_lgbm
+
+    n_splits = min(5, max(2, len(valid) // 1200))
+    if n_splits < 2:
+        return oof_xgb, oof_lgbm
+
+    splitter = TimeSeriesSplit(n_splits=n_splits)
+    xgb_oof = pd.Series(np.nan, index=valid.index, dtype=float)
+    lgbm_oof = pd.Series(np.nan, index=valid.index, dtype=float)
+
+    for train_idx, val_idx in splitter.split(valid):
+        fold_train = valid.iloc[train_idx].copy()
+        fold_val = valid.iloc[val_idx].copy()
+        if fold_train.empty or fold_val.empty:
+            continue
+        if len(val_idx) < OOF_MIN_VAL_FOLD_SIZE:
+            continue
+
+        fold_sw = None
+        if sample_weight is not None:
+            if isinstance(sample_weight, pd.Series):
+                fold_sw = sample_weight.reindex(fold_train.index)
+            else:
+                sw_arr = np.asarray(sample_weight, dtype=float)
+                if len(sw_arr) == len(df):
+                    fold_sw = pd.Series(sw_arr, index=df.index).reindex(fold_train.index)
+
+        try:
+            imp_x, model_x, feats_x = train_prop_model(
+                fold_train, features, target, sample_weight=fold_sw,
+            )
+            xgb_oof.loc[fold_val.index] = predict_prop(imp_x, model_x, feats_x, fold_val)
+        except ValueError:
+            pass
+
+        try:
+            imp_l, model_l, feats_l = train_prop_model_lgbm(
+                fold_train, features, target, sample_weight=fold_sw,
+            )
+            lgbm_oof.loc[fold_val.index] = predict_prop(imp_l, model_l, feats_l, fold_val)
+        except ValueError:
+            pass
+
+    oof_xgb.loc[xgb_oof.index] = xgb_oof
+    oof_lgbm.loc[lgbm_oof.index] = lgbm_oof
+    return oof_xgb, oof_lgbm
+
+
+def train_stacked_model(
+    oof_xgb: pd.Series,
+    oof_lgbm: pd.Series,
+    y: pd.Series,
+) -> Ridge | None:
+    """Train Ridge regression meta-learner on OOF predictions from XGB + LGBM.
+
+    Returns fitted Ridge model or None if insufficient data.
+    """
+    valid = oof_xgb.notna() & oof_lgbm.notna() & y.notna()
+    if valid.sum() < 100:
+        return None
+    meta_X = np.column_stack([oof_xgb[valid].values, oof_lgbm[valid].values])
+    meta_y = y[valid].values
+    meta = Ridge(alpha=1.0)
+    meta.fit(meta_X, meta_y)
+    return meta
+
+
+def predict_stacked(
+    xgb_pred: np.ndarray,
+    lgbm_pred: np.ndarray,
+    meta_model: Ridge | None,
+) -> np.ndarray:
+    """Generate stacked prediction from XGB + LGBM base predictions."""
+    if meta_model is None:
+        return 0.5 * xgb_pred + 0.5 * lgbm_pred
+    meta_X = np.column_stack([xgb_pred, lgbm_pred])
+    return meta_model.predict(meta_X)
+
 
 def train_prop_model(
     train_df: pd.DataFrame,
@@ -3110,6 +4283,41 @@ def _time_series_oof_predictions(
     return out
 
 
+def compute_player_target_encoding(
+    df: pd.DataFrame,
+    oof_preds: pd.Series,
+    target: str,
+    shrinkage_n: int = 30,
+) -> pd.Series:
+    """Compute per-player expanding-window mean residual from OOF predictions.
+
+    For each player: expanding mean of (actual - oof_pred) with shift(1) to prevent
+    leakage, shrunk toward zero: adj = (n * player_mean_resid) / (n + shrinkage_n).
+
+    Returns a Series aligned to df.index with the shrunk residual encoding.
+    """
+    work = df[[target, "player_id"]].copy()
+    work["_oof_pred"] = oof_preds
+    work["_resid"] = work[target] - work["_oof_pred"]
+
+    valid = work["_resid"].notna()
+    result = pd.Series(0.0, index=df.index, dtype=float)
+
+    if not valid.any():
+        return result
+
+    # Per-player expanding mean of residuals, shifted by 1
+    grouped = work.loc[valid].groupby("player_id")["_resid"]
+    expanding_mean = grouped.transform(lambda s: s.shift(1).expanding(min_periods=3).mean())
+    expanding_count = grouped.transform(lambda s: s.shift(1).expanding(min_periods=3).count())
+
+    # Bayesian shrinkage toward zero
+    shrunk = (expanding_count * expanding_mean) / (expanding_count + shrinkage_n)
+    result.loc[expanding_mean.index] = shrunk.fillna(0.0)
+
+    return result
+
+
 def train_oof_residual_models(
     train_df: pd.DataFrame,
     two_stage_models: dict[str, Any],
@@ -3163,7 +4371,8 @@ def train_oof_residual_models(
         valid_df[residual_target] = valid_df[target] - valid_df[oof_col]
 
         # Build interaction features for residual model
-        valid_df["oof_pred_vs_line"] = valid_df[oof_col] - valid_df.get("prop_open_line", np.nan)
+        line_col = f"prop_open_line_{target}"
+        valid_df["oof_pred_vs_line"] = valid_df[oof_col] - valid_df.get(line_col, np.nan)
         valid_df["oof_pred_x_b2b"] = valid_df[oof_col] * valid_df.get("is_b2b", 0).astype(float)
         valid_df["oof_pred_x_injury_pressure"] = valid_df[oof_col] * valid_df.get("team_injury_pressure", 0).astype(float)
 
@@ -3247,10 +4456,11 @@ def train_uncertainty_models(
         valid_df[abs_error_col] = np.abs(valid_df[target] - valid_df[oof_col])
 
         # Features: same as stat model + oof prediction + market features
+        line_col = f"prop_open_line_{target}"
         unc_features = stat_features + [
             oof_col,
             "oof_pred_minutes",
-            "prop_open_line",
+            line_col,
         ]
 
         # Conservative hyperparameters for uncertainty model
@@ -3283,15 +4493,159 @@ def train_uncertainty_models(
     return uncertainty_models
 
 
+def train_quantile_uncertainty_models(
+    train_df: pd.DataFrame,
+    two_stage_models: dict[str, Any],
+    min_oof_rows: int = 500,
+) -> dict[str, dict[str, tuple[SimpleImputer, XGBRegressor, list[str]]]]:
+    """Train quantile regression models for uncertainty estimation.
+
+    For each stat target, trains XGBoost with reg:quantileerror objective at
+    alpha=0.25 and alpha=0.75. Derives robust std from IQR / 1.35.
+    Optionally adds 10th/90th percentile models for tail risk.
+
+    Returns dict mapping target -> {"q25": (imp, model, feats), "q75": ...}.
+    """
+    quantile_models: dict[str, dict[str, tuple[SimpleImputer, XGBRegressor, list[str]]]] = {}
+    stat_targets = ["points", "rebounds", "assists"]
+    if "fg3m" in train_df.columns and train_df["fg3m"].notna().sum() > 200:
+        stat_targets.append("fg3m")
+
+    # Need OOF minutes predictions
+    min_features = get_feature_list("minutes", two_stage=False)
+    oof_minutes = _time_series_oof_predictions(
+        train_df, min_features, "minutes", min_rows=min_oof_rows,
+    )
+    train_df = train_df.copy()
+    train_df["oof_pred_minutes"] = oof_minutes
+
+    quantile_params_base = {
+        "n_estimators": 250,
+        "max_depth": 4,
+        "learning_rate": 0.03,
+        "subsample": 0.85,
+        "colsample_bytree": 0.8,
+        "reg_lambda": 3.0,
+        "reg_alpha": 0.3,
+        "min_child_weight": 5,
+    }
+
+    for target in stat_targets:
+        if target not in train_df.columns:
+            continue
+
+        stat_features = get_feature_list(target, two_stage=True)
+        oof_preds = _time_series_oof_predictions(
+            train_df, stat_features, target, min_rows=min_oof_rows,
+        )
+        oof_col = f"oof_pred_{target}"
+        train_df[oof_col] = oof_preds
+        valid_mask = train_df[oof_col].notna() & train_df[target].notna()
+        valid_df = train_df[valid_mask].copy()
+
+        if len(valid_df) < min_oof_rows:
+            continue
+
+        line_col = f"prop_open_line_{target}"
+        unc_features = stat_features + [oof_col, "oof_pred_minutes", line_col]
+
+        target_quantile_models: dict[str, tuple[SimpleImputer, XGBRegressor, list[str]]] = {}
+        for alpha, label in [(0.25, "q25"), (0.75, "q75"), (0.10, "q10"), (0.90, "q90")]:
+            try:
+                feats = [f for f in filter_features(unc_features, valid_df)
+                         if valid_df[f].notna().any()]
+                if not feats:
+                    continue
+
+                X = valid_df[feats]
+                y = valid_df[target]
+
+                imp = SimpleImputer(strategy="median")
+                X_imp = imp.fit_transform(X)
+
+                model = XGBRegressor(
+                    n_estimators=quantile_params_base["n_estimators"],
+                    max_depth=quantile_params_base["max_depth"],
+                    learning_rate=quantile_params_base["learning_rate"],
+                    subsample=quantile_params_base["subsample"],
+                    colsample_bytree=quantile_params_base["colsample_bytree"],
+                    reg_lambda=quantile_params_base["reg_lambda"],
+                    reg_alpha=quantile_params_base["reg_alpha"],
+                    min_child_weight=quantile_params_base["min_child_weight"],
+                    objective="reg:quantileerror",
+                    quantile_alpha=alpha,
+                    eval_metric="mae",
+                    random_state=42,
+                    verbosity=0,
+                )
+                model.fit(X_imp, y)
+                target_quantile_models[label] = (imp, model, feats)
+            except Exception as e:
+                print(f"    Quantile {target} {label}: failed ({e})", flush=True)
+                continue
+
+        if "q25" in target_quantile_models and "q75" in target_quantile_models:
+            quantile_models[target] = target_quantile_models
+            print(
+                f"    Quantile {target}: trained {', '.join(sorted(target_quantile_models.keys()))} "
+                f"on {len(valid_df)} rows",
+                flush=True,
+            )
+
+    return quantile_models
+
+
+def predict_quantile_std(
+    quantile_models: dict[str, dict[str, tuple[SimpleImputer, XGBRegressor, list[str]]]],
+    stat_type: str,
+    pred_row: pd.Series,
+) -> tuple[float, float, float]:
+    """Compute std and P(over) from quantile models for a single prediction row.
+
+    Returns (quantile_std, p_over_nonparam, iqr) where:
+    - quantile_std = IQR / 1.35 (robust std estimate)
+    - p_over_nonparam = non-parametric P(over) from quantile position (NaN if unavailable)
+    - iqr = raw IQR for diagnostics
+    """
+    if stat_type not in quantile_models:
+        return np.nan, np.nan, np.nan
+
+    models = quantile_models[stat_type]
+    row_df = pd.DataFrame([pred_row])
+
+    predictions = {}
+    for label, (imp, model, feats) in models.items():
+        try:
+            pred = predict_prop(imp, model, feats, row_df)
+            predictions[label] = float(pred[0])
+        except Exception:
+            pass
+
+    q25 = predictions.get("q25", np.nan)
+    q75 = predictions.get("q75", np.nan)
+
+    if not (np.isfinite(q25) and np.isfinite(q75)):
+        return np.nan, np.nan, np.nan
+
+    iqr = q75 - q25
+    # Robust std: IQR / 1.35 (for normal distribution, IQR ≈ 1.35 * sigma)
+    quantile_std = max(iqr / 1.35, 0.5)  # Floor at 0.5 to prevent degenerate std
+
+    return quantile_std, np.nan, iqr
+
+
 def train_two_stage_models(
     train_df: pd.DataFrame,
 ) -> dict[str, Any]:
     """Train two-stage models: minutes first, then stats with predicted minutes.
 
-    Stage 1: Train minutes model
+    Stage 1: Train minutes model (XGBoost, optionally + LightGBM ensemble)
     Stage 2: For each stat target, train model that includes predicted minutes as feature
+    Stage 3: OOF residual correction models
+    Phase 4: Uncertainty models (quantile or abs-error based)
     """
     models: dict[str, Any] = {}
+    ensemble_active = USE_ENSEMBLE and _HAS_LGBM
 
     # Stage 1: Train minutes model
     min_features = get_feature_list("minutes", two_stage=False)
@@ -3318,15 +4672,60 @@ def train_two_stage_models(
         )
         models["minutes"] = (min_imp, min_model, min_feats)
 
+        # Train LightGBM minutes model for ensemble
+        if ensemble_active:
+            try:
+                lgbm_min_imp, lgbm_min_model, lgbm_min_feats = train_prop_model_lgbm(
+                    train_for_minutes, min_features, "minutes", sample_weight=recency_weight,
+                )
+                models["_lgbm_minutes"] = (lgbm_min_imp, lgbm_min_model, lgbm_min_feats)
+            except ValueError:
+                pass
+
         # Leakage-safe Stage 2 input: prefer OOF minutes predictions.
         stage2_train = train_for_minutes.copy()
-        oof_minutes = _time_series_oof_predictions(
-            stage2_train,
-            min_features,
-            "minutes",
-            sample_weight=recency_weight,
-            min_rows=700,
-        )
+
+        if ensemble_active:
+            # Generate OOF from both models for stacking
+            oof_min_xgb, oof_min_lgbm = _time_series_oof_ensemble(
+                stage2_train, min_features, "minutes",
+                sample_weight=recency_weight, min_rows=700,
+            )
+            valid_both = oof_min_xgb.notna() & oof_min_lgbm.notna()
+            if valid_both.sum() >= 100:
+                min_meta = train_stacked_model(
+                    oof_min_xgb, oof_min_lgbm,
+                    stage2_train["minutes"],
+                )
+                models["_meta_minutes"] = min_meta
+                # Use stacked OOF as pred_minutes for stage 2
+                oof_minutes = pd.Series(np.nan, index=stage2_train.index, dtype=float)
+                if min_meta is not None:
+                    stacked = predict_stacked(
+                        oof_min_xgb[valid_both].values,
+                        oof_min_lgbm[valid_both].values,
+                        min_meta,
+                    )
+                    oof_minutes.loc[valid_both[valid_both].index] = stacked
+                else:
+                    oof_minutes.loc[valid_both[valid_both].index] = (
+                        0.5 * oof_min_xgb[valid_both] + 0.5 * oof_min_lgbm[valid_both]
+                    )
+                # Fill non-stacked rows with XGB OOF
+                oof_minutes = oof_minutes.fillna(oof_min_xgb)
+                print(f"  Ensemble minutes: {valid_both.sum()} stacked OOF rows", flush=True)
+            else:
+                # Fall back to XGB-only OOF
+                oof_minutes = _time_series_oof_predictions(
+                    stage2_train, min_features, "minutes",
+                    sample_weight=recency_weight, min_rows=700,
+                )
+        else:
+            oof_minutes = _time_series_oof_predictions(
+                stage2_train, min_features, "minutes",
+                sample_weight=recency_weight, min_rows=700,
+            )
+
         fallback_minutes = predict_prop(min_imp, min_model, min_feats, stage2_train)
         stage2_train["pred_minutes"] = oof_minutes.reindex(stage2_train.index)
         stage2_train["pred_minutes"] = stage2_train["pred_minutes"].fillna(
@@ -3355,6 +4754,27 @@ def train_two_stage_models(
                 stage2_train, features, target, sample_weight=stat_recency_weight,
             )
             models[target] = (imp, model, feats)
+
+            # Train LightGBM for ensemble
+            if ensemble_active:
+                try:
+                    lgbm_imp, lgbm_model, lgbm_feats = train_prop_model_lgbm(
+                        stage2_train, features, target, sample_weight=stat_recency_weight,
+                    )
+                    models[f"_lgbm_{target}"] = (lgbm_imp, lgbm_model, lgbm_feats)
+
+                    # Train stacking meta-learner from OOF predictions
+                    oof_xgb, oof_lgbm = _time_series_oof_ensemble(
+                        stage2_train, features, target,
+                        sample_weight=stat_recency_weight, min_rows=500,
+                    )
+                    meta = train_stacked_model(oof_xgb, oof_lgbm, stage2_train[target])
+                    if meta is not None:
+                        models[f"_meta_{target}"] = meta
+                        n_stacked = (oof_xgb.notna() & oof_lgbm.notna()).sum()
+                        print(f"  Ensemble {target}: stacked meta-learner on {n_stacked} OOF rows", flush=True)
+                except ValueError:
+                    pass
         except ValueError:
             # Fall back: train without pred_minutes
             features_no_stage = get_feature_list(target, two_stage=False)
@@ -3366,6 +4786,23 @@ def train_two_stage_models(
             except ValueError:
                 continue
 
+    # Step 4: Per-player target encoding (experimental, off by default)
+    if USE_PLAYER_TARGET_ENCODING and "player_id" in stage2_train.columns:
+        print("  Computing per-player target encodings...", flush=True)
+        for target in stat_targets:
+            if target not in models:
+                continue
+            stat_features = get_feature_list(target, two_stage=True)
+            oof_preds = _time_series_oof_predictions(
+                stage2_train, stat_features, target, min_rows=500,
+            )
+            enc_col = f"player_resid_enc_{target}"
+            stage2_train[enc_col] = compute_player_target_encoding(
+                stage2_train, oof_preds, target,
+            )
+            n_nonzero = (stage2_train[enc_col].abs() > 0.01).sum()
+            print(f"    {target}: {n_nonzero} players with non-trivial encoding", flush=True)
+
     # Stage 3 (Phase 4): OOF residual models
     print("  Training Stage 3 residual models (OOF)...", flush=True)
     residual_models = train_oof_residual_models(stage2_train, models, min_oof_rows=500)
@@ -3375,14 +4812,28 @@ def train_two_stage_models(
     else:
         print("  Stage 3: no residual models trained (insufficient OOF data)", flush=True)
 
-    # Phase 4: Uncertainty models (predict abs(actual - oof_pred))
-    print("  Training uncertainty models (Phase 4)...", flush=True)
-    uncertainty_models = train_uncertainty_models(stage2_train, models, min_oof_rows=500)
-    if uncertainty_models:
-        models["_uncertainty"] = uncertainty_models
-        print(f"  Uncertainty models: {', '.join(sorted(uncertainty_models.keys()))}", flush=True)
+    # Phase 4: Uncertainty models
+    if USE_QUANTILE_UNCERTAINTY:
+        print("  Training quantile uncertainty models...", flush=True)
+        quantile_models = train_quantile_uncertainty_models(stage2_train, models, min_oof_rows=500)
+        if quantile_models:
+            models["_uncertainty_quantile"] = quantile_models
+            print(f"  Quantile uncertainty: {', '.join(sorted(quantile_models.keys()))}", flush=True)
+        else:
+            print("  Quantile uncertainty: no models trained", flush=True)
+            # Fall back to abs-error uncertainty
+            print("  Falling back to abs-error uncertainty models...", flush=True)
+            uncertainty_models = train_uncertainty_models(stage2_train, models, min_oof_rows=500)
+            if uncertainty_models:
+                models["_uncertainty"] = uncertainty_models
     else:
-        print("  Uncertainty: no models trained (insufficient OOF data)", flush=True)
+        print("  Training uncertainty models (Phase 4)...", flush=True)
+        uncertainty_models = train_uncertainty_models(stage2_train, models, min_oof_rows=500)
+        if uncertainty_models:
+            models["_uncertainty"] = uncertainty_models
+            print(f"  Uncertainty models: {', '.join(sorted(uncertainty_models.keys()))}", flush=True)
+        else:
+            print("  Uncertainty: no models trained (insufficient OOF data)", flush=True)
 
     return models
 
@@ -3391,7 +4842,11 @@ def predict_two_stage(
     models: dict[str, Any],
     pred_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Generate two-stage predictions: minutes first, then use predicted minutes for stats."""
+    """Generate two-stage predictions: minutes first, then use predicted minutes for stats.
+
+    When ensemble models (LightGBM + meta-learner) are available, generates stacked
+    predictions from XGBoost + LightGBM via Ridge meta-learner.
+    """
     pred_df = pred_df.copy()
 
     # Stage 0: starter probability from historical rate with confirmed starter override.
@@ -3403,10 +4858,19 @@ def predict_two_stage(
         if known_mask.any():
             pred_df.loc[known_mask, "pred_starter_prob"] = pred_df.loc[known_mask, "confirmed_starter"].astype(float)
 
-    # Stage 1: Predict minutes
+    # Stage 1: Predict minutes (with optional ensemble)
     if "minutes" in models:
         min_imp, min_model, min_feats = models["minutes"]
-        pred_df["pred_minutes"] = predict_prop(min_imp, min_model, min_feats, pred_df)
+        xgb_minutes = predict_prop(min_imp, min_model, min_feats, pred_df)
+
+        if "_lgbm_minutes" in models:
+            lgbm_imp, lgbm_model, lgbm_feats = models["_lgbm_minutes"]
+            lgbm_minutes = predict_prop(lgbm_imp, lgbm_model, lgbm_feats, pred_df)
+            meta = models.get("_meta_minutes")
+            pred_df["pred_minutes"] = predict_stacked(xgb_minutes, lgbm_minutes, meta)
+        else:
+            pred_df["pred_minutes"] = xgb_minutes
+
         pred_df["pred_minutes"] = pred_df["pred_minutes"].clip(lower=0.0)
     else:
         return pred_df
@@ -3421,11 +4885,22 @@ def predict_two_stage(
             base_adj = np.where(pred_df["injury_is_out"].astype(float) > 0, 0.0, base_adj)
         pred_df["pred_minutes"] = pred_df["pred_minutes"] * np.clip(base_adj, 0.0, 1.0)
 
-    # Stage 2: Predict stats using predicted minutes
+    # Stage 2: Predict stats using predicted minutes (with optional ensemble)
     for target in ["points", "rebounds", "assists", "fg3m"]:
-        if target in models:
-            imp, model, feats = models[target]
-            pred_df[f"pred_{target}"] = predict_prop(imp, model, feats, pred_df)
+        if target not in models:
+            continue
+        imp, model, feats = models[target]
+        xgb_pred = predict_prop(imp, model, feats, pred_df)
+
+        lgbm_key = f"_lgbm_{target}"
+        meta_key = f"_meta_{target}"
+        if lgbm_key in models:
+            lgbm_imp, lgbm_model, lgbm_feats = models[lgbm_key]
+            lgbm_pred = predict_prop(lgbm_imp, lgbm_model, lgbm_feats, pred_df)
+            meta = models.get(meta_key)
+            pred_df[f"pred_{target}"] = predict_stacked(xgb_pred, lgbm_pred, meta)
+        else:
+            pred_df[f"pred_{target}"] = xgb_pred
 
     # Stage 3 (Phase 4): Apply residual correction with clipping
     residual_models = models.get("_residual", {})
@@ -3437,9 +4912,10 @@ def predict_two_stage(
 
             # Build residual interaction features for prediction
             oof_col = f"oof_pred_{target}"
+            line_col = f"prop_open_line_{target}"
             pred_df[oof_col] = pred_df[pred_col]  # at prediction time, base pred serves as "oof" input
             pred_df["oof_pred_minutes"] = pred_df.get("pred_minutes", np.nan)
-            pred_df["oof_pred_vs_line"] = pred_df[pred_col] - pred_df.get("prop_open_line", np.nan)
+            pred_df["oof_pred_vs_line"] = pred_df[pred_col] - pred_df.get(line_col, np.nan)
             pred_df["oof_pred_x_b2b"] = pred_df[pred_col] * pred_df.get("is_b2b", 0).astype(float)
             pred_df["oof_pred_x_injury_pressure"] = pred_df[pred_col] * pred_df.get("team_injury_pressure", 0).astype(float)
 
@@ -3493,13 +4969,19 @@ def compute_prop_residual_stds(
     single_models: dict[str, tuple[SimpleImputer, XGBRegressor, list[str]]] | None = None,
     leakage_safe: bool = True,
 ) -> dict[str, float]:
-    """Compute residual standard deviations for each prop target."""
+    """Compute residual standard deviations for each prop target.
+
+    When pre-trained models are supplied and ``leakage_safe`` is False, this
+    reuses those models instead of retraining, which keeps a single-model
+    version across downstream consumers in the same run.
+    """
     player_df = player_df.sort_values("game_time_utc").reset_index(drop=True)
     cut = int(len(player_df) * (1.0 - test_frac))
     train = player_df.iloc[:cut].copy()
     test = player_df.iloc[cut:].copy()
 
-    # Use train-split-fitted models by default to avoid in-sample leakage in uncertainty estimates.
+    # Use train-split-fitted models by default to avoid in-sample leakage in
+    # uncertainty estimates. Reuse pre-trained models when explicitly allowed.
     if leakage_safe or two_stage_models is None or single_models is None:
         two_stage_models, single_models = train_prediction_models(train)
 
@@ -3602,6 +5084,25 @@ def _apply_probability_calibrator(p_raw: float, calibrator: dict[str, Any] | Non
     return p
 
 
+def _sanitize_probability_pair(
+    p_over: float,
+    p_under: float,
+    floor: float = PROB_CLIP_FLOOR,
+    ceiling: float = PROB_CLIP_CEILING,
+) -> tuple[float, float]:
+    """Clip calibrated probabilities away from 0/1 and renormalize."""
+    if not (pd.notna(p_over) and pd.notna(p_under)):
+        return p_over, p_under
+    po = float(np.clip(p_over, floor, ceiling))
+    pu = float(np.clip(p_under, floor, ceiling))
+    s = po + pu
+    if not np.isfinite(s) or s <= 0:
+        return np.nan, np.nan
+    po = float(np.clip(po / s, floor, ceiling))
+    pu = float(np.clip(1.0 - po, floor, ceiling))
+    return po, pu
+
+
 def load_cached_prop_lines(max_dates: int = 180) -> pd.DataFrame:
     """Load cached prop lines from PROP_CACHE_DIR."""
     if not PROP_CACHE_DIR.exists():
@@ -3625,23 +5126,10 @@ def load_cached_prop_lines(max_dates: int = 180) -> pd.DataFrame:
             continue
         if df.empty:
             continue
-        if "game_date_est" not in df.columns:
-            if "date" in df.columns:
-                df["game_date_est"] = df["date"].astype(str).str.replace("-", "", regex=False).str.slice(0, 8)
-            else:
-                df["game_date_est"] = date_str
-        df["game_date_est"] = df["game_date_est"].astype(str).str.replace("-", "", regex=False).str.slice(0, 8)
-        if "stat_type" in df.columns:
-            df["stat_type"] = df["stat_type"].astype(str).str.lower().str.strip()
-        if "team" in df.columns:
-            df["team"] = _normalize_team_series(df["team"])
-        else:
-            df["team"] = ""
-        if "player_name" in df.columns:
-            df["player_name_norm"] = df["player_name"].map(normalize_player_name)
-        else:
+        df = _normalize_and_dedupe_prop_lines(df, default_date=date_str)
+        if df.empty:
             continue
-        _add_implied_probs(df)
+        df["player_name_norm"] = df["player_name"].map(normalize_player_name)
         frames.append(df)
     if not frames:
         return pd.DataFrame()
@@ -3714,8 +5202,6 @@ def _build_market_training_frame(
             "matchup_off_vs_def",
             "team_injury_pressure",
             "pred_starter_prob",
-            "confirmed_starter",
-            "injury_unavailability_prob",
             f"pre_{stat}_avg5",
             f"pre_{stat}_avg10",
         ]
@@ -3792,30 +5278,55 @@ def train_market_residual_models(
             "matchup_off_vs_def",
             "team_injury_pressure",
             "pred_starter_prob",
-            "confirmed_starter",
-            "injury_unavailability_prob",
         ]
         feat_cols = [c for c in feat_cols if c in st_df.columns]
         use = st_df.dropna(subset=["target_resid"]).copy()
-        if len(use) >= 80 and feat_cols:
-            imp = SimpleImputer(strategy="median")
-            X = imp.fit_transform(use[feat_cols])
-            y = use["target_resid"].to_numpy(dtype=float)
-            model = XGBRegressor(
-                n_estimators=260,
-                max_depth=4,
-                learning_rate=0.045,
-                subsample=0.9,
-                colsample_bytree=0.85,
-                reg_lambda=2.5,
-                reg_alpha=0.1,
-                min_child_weight=2,
-                eval_metric="mae",
-                random_state=42,
-                verbosity=0,
-            )
-            model.fit(X, y)
-            residual_models[stat] = {"imputer": imp, "model": model, "features": feat_cols, "n_train": int(len(use))}
+        holdout_mae = np.nan
+        baseline_holdout_mae = np.nan
+        if len(use) >= 100 and feat_cols:
+            # Time-ordered inner holdout to reduce residual-layer overfit.
+            split_idx = int(len(use) * 0.8)
+            train_slice = use.iloc[:split_idx].copy()
+            holdout_slice = use.iloc[split_idx:].copy()
+            if len(train_slice) >= 80 and len(holdout_slice) >= 20:
+                # Drop split-specific all-NaN features before imputation to avoid
+                # unstable warnings and train/predict shape mismatch.
+                fit_feat_cols = [c for c in feat_cols if train_slice[c].notna().any()]
+                if fit_feat_cols:
+                    imp = SimpleImputer(strategy="median")
+                    X_train = imp.fit_transform(train_slice[fit_feat_cols])
+                    y_train = train_slice["target_resid"].to_numpy(dtype=float)
+                    model = XGBRegressor(
+                        n_estimators=260,
+                        max_depth=4,
+                        learning_rate=0.045,
+                        subsample=0.9,
+                        colsample_bytree=0.85,
+                        reg_lambda=2.5,
+                        reg_alpha=0.1,
+                        min_child_weight=2,
+                        eval_metric="mae",
+                        random_state=42,
+                        verbosity=0,
+                    )
+                    model.fit(X_train, y_train)
+
+                    X_holdout = imp.transform(holdout_slice[fit_feat_cols])
+                    y_holdout = holdout_slice["target_resid"].to_numpy(dtype=float)
+                    pred_holdout = model.predict(X_holdout)
+                    holdout_mae = float(mean_absolute_error(y_holdout, pred_holdout))
+                    baseline_holdout_mae = float(np.mean(np.abs(y_holdout)))  # zero-adjust baseline
+
+                    if np.isfinite(holdout_mae) and np.isfinite(baseline_holdout_mae) and holdout_mae < baseline_holdout_mae:
+                        residual_models[stat] = {
+                            "imputer": imp,
+                            "model": model,
+                            "features": fit_feat_cols,
+                            "n_train": int(len(train_slice)),
+                            "n_holdout": int(len(holdout_slice)),
+                            "holdout_mae": round(holdout_mae, 4),
+                            "holdout_baseline_mae": round(baseline_holdout_mae, 4),
+                        }
 
         # Probability calibrators on historical market lines (by stat + side).
         resid_std = float(np.std(st_df["actual_value"].to_numpy(dtype=float) - st_df["pred_value"].to_numpy(dtype=float)))
@@ -3839,6 +5350,8 @@ def train_market_residual_models(
         diagnostics["per_stat"][stat] = {
             "n_rows": int(len(st_df)),
             "residual_model": int(len(use)) if len(use) else 0,
+            "residual_holdout_mae": round(float(holdout_mae), 4) if pd.notna(holdout_mae) else None,
+            "residual_holdout_baseline_mae": round(float(baseline_holdout_mae), 4) if pd.notna(baseline_holdout_mae) else None,
             "calibrator_rows": int(non_push.sum()),
             "calib_over": bool(calib_over is not None),
             "calib_under": bool(calib_under is not None),
@@ -3943,6 +5456,102 @@ def _predict_market_residual_adjustment(
     return resid
 
 
+# ---------------------------------------------------------------------------
+# Rolling Bias Correction (Points)
+# ---------------------------------------------------------------------------
+
+def compute_points_bias(history: pd.DataFrame) -> dict[str, Any]:
+    """Compute rolling bias for points predictions from graded history.
+
+    Uses Bayesian shrinkage: adj = (n * raw_bias) / (n + k), capped at ±POINTS_BIAS_CAP.
+    Returns a dict with bias stats to be stored as JSON sidecar.
+    Auto-disables (sets adj to 0) if sign of raw bias flips vs prior saved bias.
+    """
+    graded = history[
+        (history["actual_value"].notna())
+        & (history["stat_type"] == "points")
+        & (history["pred_value"].notna())
+    ].copy()
+
+    # Rolling window to avoid anchoring on stale regime data.
+    if not graded.empty and "game_date_est" in graded.columns:
+        dates = graded["game_date_est"].astype(str).str.replace("-", "", regex=False).str.slice(0, 8)
+        cutoff = (datetime.now() - timedelta(days=POINTS_BIAS_LOOKBACK_DAYS)).strftime("%Y%m%d")
+        graded = graded[dates >= cutoff].copy()
+
+    result: dict[str, Any] = {
+        "n": 0,
+        "raw_bias": 0.0,
+        "shrunk_bias": 0.0,
+        "active": False,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "lookback_days": POINTS_BIAS_LOOKBACK_DAYS,
+        "reason": "",
+    }
+
+    if len(graded) < POINTS_BIAS_MIN_SAMPLE:
+        result["reason"] = f"insufficient_sample ({len(graded)} < {POINTS_BIAS_MIN_SAMPLE})"
+        return result
+
+    residuals = graded["actual_value"].astype(float) - graded["pred_value"].astype(float)
+    raw_bias = float(residuals.mean())
+    n = len(graded)
+
+    # Bayesian shrinkage
+    shrunk = (n * raw_bias) / (n + POINTS_BIAS_SHRINK_K)
+    shrunk = max(-POINTS_BIAS_CAP, min(POINTS_BIAS_CAP, shrunk))
+
+    # Check for sign flip vs prior bias (auto-disable if sign changed)
+    prior = load_points_bias()
+    if prior.get("active") and prior.get("shrunk_bias", 0) != 0:
+        prior_sign = np.sign(prior["shrunk_bias"])
+        new_sign = np.sign(shrunk)
+        if prior_sign != new_sign and new_sign != 0:
+            result["n"] = n
+            result["raw_bias"] = round(raw_bias, 4)
+            result["shrunk_bias"] = 0.0
+            result["active"] = False
+            result["reason"] = f"sign_flip (prior={prior['shrunk_bias']:+.3f}, new={shrunk:+.3f})"
+            return result
+
+    result["n"] = n
+    result["raw_bias"] = round(raw_bias, 4)
+    result["shrunk_bias"] = round(shrunk, 4)
+    result["active"] = True
+    result["reason"] = "ok"
+    return result
+
+
+def save_points_bias(bias_info: dict[str, Any]) -> None:
+    """Save bias correction to JSON sidecar."""
+    if POINTS_BIAS_FILE is None:
+        return
+    POINTS_BIAS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(POINTS_BIAS_FILE, "w") as f:
+        json.dump(bias_info, f, indent=2)
+
+
+def load_points_bias() -> dict[str, Any]:
+    """Load bias correction from JSON sidecar. Returns empty dict if not found."""
+    if POINTS_BIAS_FILE is None or not POINTS_BIAS_FILE.exists():
+        return {}
+    try:
+        with open(POINTS_BIAS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def get_active_points_bias() -> float:
+    """Return the active bias correction amount for points, or 0.0 if inactive."""
+    if not USE_POINTS_BIAS_CORRECTION:
+        return 0.0
+    bias = load_points_bias()
+    if bias.get("active"):
+        return float(bias.get("shrunk_bias", 0.0))
+    return 0.0
+
+
 def compute_prop_edges(
     predictions: pd.DataFrame,
     prop_lines: pd.DataFrame,
@@ -3951,39 +5560,75 @@ def compute_prop_edges(
     prob_calibrators: dict[str, dict[str, Any]] | None = None,
     calibration_degraded_stats: set[str] | None = None,
     uncertainty_models: dict[str, tuple[SimpleImputer, XGBRegressor, list[str]]] | None = None,
+    quantile_uncertainty_models: dict[str, dict[str, tuple[SimpleImputer, XGBRegressor, list[str]]]] | None = None,
 ) -> pd.DataFrame:
     """Compute edges between model predictions and prop lines."""
     if predictions.empty or prop_lines.empty:
         return pd.DataFrame()
+
+    prop_lines = _normalize_and_dedupe_prop_lines(prop_lines)
+    if prop_lines.empty:
+        return pd.DataFrame()
+
+    pred_work = predictions.copy()
+    pred_work["_name_norm"] = pred_work["player_name"].map(normalize_player_name)
+    if "game_date_est" in pred_work.columns:
+        pred_work["_date_key"] = (
+            pred_work["game_date_est"]
+            .astype(str)
+            .str.replace("-", "", regex=False)
+            .str.slice(0, 8)
+        )
+    else:
+        pred_work["_date_key"] = ""
 
     results = []
 
     for _, line_row in prop_lines.iterrows():
         player_name = line_row["player_name"]
         stat_type = line_row["stat_type"]
+        line_date = (
+            str(line_row.get("game_date_est", ""))
+            .replace("-", "")
+            .strip()[:8]
+        )
         line_val = float(line_row["line"])
         team = line_row.get("team", "")
         over_implied = line_row.get("over_implied_prob", np.nan)
         under_implied = line_row.get("under_implied_prob", np.nan)
         over_odds_raw = line_row.get("over_odds", np.nan)
         under_odds_raw = line_row.get("under_odds", np.nan)
+        closing_over_odds = line_row.get("closing_odds_over", line_row.get("close_over_odds", line_row.get("over_odds_close", np.nan)))
+        closing_under_odds = line_row.get("closing_odds_under", line_row.get("close_under_odds", line_row.get("under_odds_close", np.nan)))
 
         pred_col = f"pred_{stat_type}"
         if pred_col not in predictions.columns:
             continue
 
-        # Match player name robustly across accent/punctuation variants
-        pred_norm = predictions["player_name"].map(normalize_player_name)
+        # Match by normalized name (+ team if available). Avoid fuzzy contains to
+        # prevent ambiguous player attribution.
         line_norm = normalize_player_name(player_name)
-        mask = pred_norm.eq(line_norm)
-        if not mask.any() and line_norm:
-            mask = pred_norm.str.contains(re.escape(line_norm), na=False)
+        mask = pred_work["_name_norm"].eq(line_norm)
+        if line_date:
+            mask = mask & pred_work["_date_key"].eq(line_date)
         if team and pd.notna(team):
-            mask = mask & (predictions["team"] == team)
+            mask = mask & pred_work["team"].astype(str).eq(str(team))
 
-        matched = predictions[mask]
+        matched = pred_work[mask]
         if matched.empty:
             continue
+        if len(matched) > 1:
+            lt_home = str(line_row.get("home_team", "") or "").strip()
+            lt_away = str(line_row.get("away_team", "") or "").strip()
+            if lt_home and lt_away and {"home_team", "away_team"}.issubset(matched.columns):
+                by_matchup = matched[
+                    matched["home_team"].astype(str).eq(lt_home)
+                    & matched["away_team"].astype(str).eq(lt_away)
+                ]
+                if len(by_matchup) == 1:
+                    matched = by_matchup
+            if len(matched) > 1:
+                continue
 
         pred_row = matched.iloc[0]
         pred_base = float(pred_row[pred_col])
@@ -3999,31 +5644,61 @@ def compute_prop_edges(
         )
         pred_val = pred_base + resid_adj
 
+        # Step 6: Market line blending (gated, off by default)
+        # Applied here where both model prediction and market line are available.
+        if USE_MARKET_LINE_BLENDING and line_val > 0:
+            alpha = MARKET_LINE_BLEND_ALPHA
+            pred_val = alpha * pred_val + (1 - alpha) * line_val
+
+        # Rolling bias correction for points: shift prediction by shrunk bias
+        bias_adj = 0.0
+        if stat_type == "points":
+            bias_adj = get_active_points_bias()
+            if bias_adj != 0.0:
+                pred_val = pred_val + bias_adj
+
         edge = pred_val - line_val
         edge_pct = (edge / line_val * 100) if line_val != 0 else np.nan
 
         # Compute p_over and p_under using blended (player-specific + global) std
         resid_std = residual_stds.get(stat_type, np.nan)
 
-        # Phase 4: Use uncertainty model if available
-        unc_std = np.nan
-        if uncertainty_models and stat_type in uncertainty_models:
-            u_imp, u_model, u_feats = uncertainty_models[stat_type]
+        # Quantile uncertainty (Step 2): use IQR-based std from quantile regression
+        quantile_std = np.nan
+        if quantile_uncertainty_models and stat_type in quantile_uncertainty_models:
             unc_row = pred_row.copy()
             unc_row[f"oof_pred_{stat_type}"] = pred_base
             unc_row["oof_pred_minutes"] = pred_row.get("pred_minutes", np.nan)
             try:
-                unc_pred = predict_prop(u_imp, u_model, u_feats, pd.DataFrame([unc_row]))
-                predicted_mae = float(unc_pred[0])
-                if np.isfinite(predicted_mae) and predicted_mae > 0:
-                    # Convert predicted MAE to std: std ≈ MAE * sqrt(pi/2)
-                    unc_std = predicted_mae * 1.253
+                quantile_std, _, _ = predict_quantile_std(
+                    quantile_uncertainty_models, stat_type, unc_row,
+                )
             except Exception:
                 pass
 
+        # Phase 4: Use abs-error uncertainty model if available (fallback)
+        unc_std = np.nan
+        if not (pd.notna(quantile_std) and quantile_std > 0):
+            if uncertainty_models and stat_type in uncertainty_models:
+                u_imp, u_model, u_feats = uncertainty_models[stat_type]
+                unc_row = pred_row.copy()
+                unc_row[f"oof_pred_{stat_type}"] = pred_base
+                unc_row["oof_pred_minutes"] = pred_row.get("pred_minutes", np.nan)
+                try:
+                    unc_pred = predict_prop(u_imp, u_model, u_feats, pd.DataFrame([unc_row]))
+                    predicted_mae = float(unc_pred[0])
+                    if np.isfinite(predicted_mae) and predicted_mae > 0:
+                        # Convert predicted MAE to std: std ≈ MAE * sqrt(pi/2)
+                        unc_std = predicted_mae * 1.253
+                except Exception:
+                    pass
+
         player_std = pred_row.get(f"pre_{stat_type}_std10", np.nan)
-        if pd.notna(unc_std) and unc_std > 0:
-            # Use uncertainty model output as the blended std
+        if pd.notna(quantile_std) and quantile_std > 0:
+            # Priority 0: Quantile regression IQR-derived std
+            blended_std = quantile_std
+        elif pd.notna(unc_std) and unc_std > 0:
+            # Priority 1: Abs-error uncertainty model
             blended_std = unc_std
         elif pd.notna(player_std) and player_std > 0 and pd.notna(resid_std):
             n_games = pred_row.get("player_game_num", 10)
@@ -4049,6 +5724,7 @@ def compute_prop_edges(
             else:
                 p_over = _apply_probability_calibrator(p_over_raw, stat_calibs if isinstance(stat_calibs, dict) else None)
                 p_under = 1.0 - p_over
+            p_over, p_under = _sanitize_probability_pair(p_over, p_under)
         else:
             p_over_raw = np.nan
             p_over = np.nan
@@ -4120,6 +5796,41 @@ def compute_prop_edges(
                 else:
                     confidence = "LEAN"
 
+            # --- OVER signal gates ---
+            if signal == "OVER":
+                # Gate: suppress LEAN OVER entirely
+                if SUPPRESS_LEAN_OVER and confidence == "LEAN":
+                    signal = "NO BET"
+                    confidence = ""
+                    signal_blocked_reason = "lean_over_suppressed"
+                # Gate: require confirmed lineup for OVER
+                elif OVER_REQUIRE_LINEUP_CONFIRMED:
+                    lineup_conf = pd.to_numeric(pred_row.get("confirmed_starter"), errors="coerce")
+                    if not (pd.notna(lineup_conf) and lineup_conf >= 1.0):
+                        signal = "NO BET"
+                        confidence = ""
+                        signal_blocked_reason = "over_lineup_not_confirmed"
+                # Gate: max injury probability for OVER
+                if signal == "OVER" and OVER_MAX_INJURY_PROB < 1.0:
+                    inj_prob = pd.to_numeric(pred_row.get("injury_unavailability_prob"), errors="coerce")
+                    if pd.notna(inj_prob) and inj_prob > OVER_MAX_INJURY_PROB:
+                        signal = "NO BET"
+                        confidence = ""
+                        signal_blocked_reason = "over_injury_gate"
+
+            # Injury coverage stale gate (team-scoped/global): suppress OVER and downgrade confidence.
+            stale_global = int(_nan_or(pred_row.get("injury_feed_global_stale"), 0)) == 1
+            stale_team = int(_nan_or(pred_row.get("injury_feed_team_stale"), 0)) == 1
+            zero_out_cov = int(_nan_or(pred_row.get("injury_feed_team_zero_out_doubtful"), 0)) == 1
+            if stale_global or stale_team or zero_out_cov:
+                if signal == "OVER":
+                    signal = "NO BET"
+                    confidence = ""
+                    stale_tag = "GLOBAL" if stale_global else str(pred_row.get("team", "TEAM"))
+                    signal_blocked_reason = f"injury_coverage_stale:{stale_tag}"
+                elif signal != "NO BET" and confidence == "BEST BET":
+                    confidence = "LEAN"
+
         # Line movement signal: compare current line to open line
         open_line_val = line_row.get("open_line", np.nan)
         if pd.notna(open_line_val) and float(open_line_val) > 0:
@@ -4140,15 +5851,19 @@ def compute_prop_edges(
         results.append({
             "game_date_est": str(line_row.get("game_date_est", pred_row.get("game_date_est", ""))),
             "player_name": player_name,
+            "player_id": pred_row.get("player_id", np.nan),
             "team": team if (team and pd.notna(team)) else pred_row.get("team", ""),
             "opp": pred_row.get("opp", ""),
             "home_team": pred_row.get("home_team", ""),
             "away_team": pred_row.get("away_team", ""),
+            "run_id": pred_row.get("run_id", ""),
+            "asof_utc": pred_row.get("asof_utc", ""),
             "stat_type": stat_type,
             "prop_line": line_val,
             "pred_value": round(pred_val, 1),
             "pred_value_base": round(pred_base, 1),
             "market_resid_adj": round(resid_adj, 2),
+            "bias_adj": round(bias_adj, 3),
             "edge": round(edge, 1),
             "edge_pct": round(edge_pct, 1) if pd.notna(edge_pct) else np.nan,
             "p_over_raw": round(p_over_raw, 3) if pd.notna(p_over_raw) else np.nan,
@@ -4164,6 +5879,8 @@ def compute_prop_edges(
             "open_line": line_row.get("open_line", np.nan),
             "open_over_odds": line_row.get("open_over_odds", np.nan),
             "open_under_odds": line_row.get("open_under_odds", np.nan),
+            "closing_odds_over": closing_over_odds,
+            "closing_odds_under": closing_under_odds,
             "line_move": round(line_move, 1) if pd.notna(line_move) else np.nan,
             "line_move_pct": round(line_move_pct, 1) if pd.notna(line_move_pct) else np.nan,
             "line_confirms_model": line_confirms_model if not isinstance(line_confirms_model, float) else np.nan,
@@ -4173,10 +5890,19 @@ def compute_prop_edges(
             "pre_avg5": pred_row.get(f"pre_{stat_type}_avg5", np.nan),
             "pre_avg10": pred_row.get(f"pre_{stat_type}_avg10", np.nan),
             "pre_season": pred_row.get(f"pre_{stat_type}_season", np.nan),
+            "player_vs_opp_pts_delta": pred_row.get("player_vs_opp_pts_delta", np.nan),
+            "player_vs_opp_reb_delta": pred_row.get("player_vs_opp_reb_delta", np.nan),
+            "player_vs_opp_ast_delta": pred_row.get("player_vs_opp_ast_delta", np.nan),
             "lineup_confirmed": pred_row.get("lineup_confirmed", np.nan),
             "confirmed_starter": pred_row.get("confirmed_starter", np.nan),
             "injury_status": pred_row.get("injury_status", ""),
             "injury_unavailability_prob": pred_row.get("injury_unavailability_prob", np.nan),
+            "team_injury_pressure_fwd": pred_row.get("team_injury_pressure_fwd", np.nan),
+            "team_injury_pressure_bwd": pred_row.get("team_injury_pressure_bwd", np.nan),
+            "injury_pressure_delta": pred_row.get("injury_pressure_delta", np.nan),
+            "injury_feed_global_stale": pred_row.get("injury_feed_global_stale", np.nan),
+            "injury_feed_team_stale": pred_row.get("injury_feed_team_stale", np.nan),
+            "injury_feed_team_zero_out_doubtful": pred_row.get("injury_feed_team_zero_out_doubtful", np.nan),
             "signal_blocked_reason": signal_blocked_reason,
         })
 
@@ -4370,21 +6096,14 @@ def run_market_line_backtest(
         side = str(r.get("signal", ""))
         if stat not in actual.columns:
             continue
-        pname_norm = normalize_player_name(r.get("player_name", ""))
-        m = (
-            (actual["game_date_est"] == date)
-            & (actual["team"] == team)
-            & (actual["player_name_norm"] == pname_norm)
+        date_slice = actual[actual["game_date_est"] == date]
+        matches = _match_actual_player_rows(
+            date_slice,
+            player_name=str(r.get("player_name", "")),
+            team=team,
+            player_id=r.get("player_id", np.nan),
         )
-        matches = actual[m]
-        if matches.empty and pname_norm:
-            m2 = (
-                (actual["game_date_est"] == date)
-                & (actual["team"] == team)
-                & (actual["player_name_norm"].str.contains(re.escape(pname_norm), na=False))
-            )
-            matches = actual[m2]
-        if matches.empty:
+        if matches.empty or len(matches) != 1:
             unmatched += 1
             continue
         a = matches.iloc[0]
@@ -4856,6 +6575,15 @@ def run_walk_forward_backtest(
 
     fold_results: list[dict[str, Any]] = []
 
+    def _wilson_ci(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
+        if n <= 0:
+            return np.nan, np.nan
+        p = wins / n
+        denom = 1.0 + (z * z) / n
+        center = (p + (z * z) / (2.0 * n)) / denom
+        spread = z * math.sqrt((p * (1.0 - p) + (z * z) / (4.0 * n)) / n) / denom
+        return max(0.0, center - spread), min(1.0, center + spread)
+
     # Use each season (except the first two) as test, all prior as train
     for i in range(2, len(seasons)):
         test_season = seasons[i]
@@ -4925,9 +6653,11 @@ def run_walk_forward_backtest(
             under_hit = int((actual_v[under_mask] < lines_v[under_mask]).sum()) if n_under > 0 else 0
 
             n_bets = n_over + n_under
+            total_wins = over_hit + under_hit
+            wr_low, wr_high = _wilson_ci(total_wins, n_bets)
             total_profit = (
-                (over_hit + under_hit) * bet_size * VIG_FACTOR
-                - (n_bets - over_hit - under_hit) * bet_size
+                total_wins * bet_size * VIG_FACTOR
+                - (n_bets - total_wins) * bet_size
             )
 
             fold_metrics[target] = {
@@ -4941,17 +6671,22 @@ def run_walk_forward_backtest(
                 "n_under": n_under,
                 "under_hit_rate": round(under_hit / n_under, 3) if n_under > 0 else np.nan,
                 "n_bets": n_bets,
-                "total_wins": over_hit + under_hit,
-                "total_win_rate": round((over_hit + under_hit) / n_bets, 3) if n_bets > 0 else np.nan,
+                "total_wins": total_wins,
+                "total_win_rate": round(total_wins / n_bets, 3) if n_bets > 0 else np.nan,
+                "total_win_rate_ci_low": round(wr_low, 3) if pd.notna(wr_low) else np.nan,
+                "total_win_rate_ci_high": round(wr_high, 3) if pd.notna(wr_high) else np.nan,
                 "profit": round(total_profit, 2),
                 "roi_pct": round(100 * total_profit / (n_bets * bet_size), 2) if n_bets > 0 else np.nan,
             }
 
             wr = fold_metrics[target].get("total_win_rate", np.nan)
+            wr_l = fold_metrics[target].get("total_win_rate_ci_low", np.nan)
+            wr_h = fold_metrics[target].get("total_win_rate_ci_high", np.nan)
             wr_s = f"{wr:.1%}" if pd.notna(wr) else "N/A"
+            ci_s = f"[{wr_l:.1%},{wr_h:.1%}]" if pd.notna(wr_l) and pd.notna(wr_h) else ""
             print(
                 f"    {target:>10s}:  MAE={mae:.2f}  R2={r2:.3f}  "
-                f"Bets={n_bets}  WR={wr_s}  "
+                f"Bets={n_bets}  WR={wr_s} {ci_s}  "
                 f"P/L=${total_profit:+.0f}  ROI={fold_metrics[target].get('roi_pct', 0):.1f}%",
                 flush=True,
             )
@@ -5021,6 +6756,9 @@ def run_walk_forward_backtest(
             print("  ASSESSMENT: NO GO -- Negative ROI in walk-forward validation", flush=True)
         print(f"  {'=' * 40}", flush=True)
 
+    # --- Step 5: Gate Checks ---
+    gate_results = _run_walk_forward_gate_checks(agg, fold_results, bet_size)
+
     # Save results
     wf_out = PREDICTIONS_DIR / "walk_forward_props_results.json"
     wf_data = {
@@ -5036,12 +6774,99 @@ def run_walk_forward_backtest(
         },
         "total_profit": total_profit_all,
         "total_bets": total_bets_all,
+        "gate_checks": gate_results,
     }
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
     wf_out.write_text(json.dumps(wf_data, indent=2, default=str))
     print(f"\n  Walk-forward results saved to {wf_out}", flush=True)
 
     return wf_data
+
+
+def _run_walk_forward_gate_checks(
+    agg: dict[str, dict[str, list[float]]],
+    fold_results: list[dict[str, Any]],
+    bet_size: float,
+) -> dict[str, Any]:
+    """Run gate checks on walk-forward results.
+
+    Gate checks (all must pass before proceeding to market blending):
+    1. MAE per stat: test fold MAE below stat-specific threshold
+    2. Win rate: avg win rate on synthetic lines >= 48% per stat
+    3. Overall ROI: >= -5% across all folds (within vig tolerance)
+    4. R² positive: model adds value over naive baseline for each stat
+    """
+    print(f"\n  {'=' * 72}", flush=True)
+    print("  WALK-FORWARD GATE CHECKS", flush=True)
+    print(f"  {'=' * 72}", flush=True)
+
+    gates: dict[str, Any] = {}
+    all_pass = True
+
+    # Gate 1: MAE thresholds per stat (reasonable baselines)
+    mae_thresholds = {
+        "points": 7.0,
+        "rebounds": 2.8,
+        "assists": 2.2,
+        "fg3m": 1.2,
+        "minutes": 8.0,
+    }
+    for target, vals in agg.items():
+        avg_mae = float(np.nanmean(vals["mae"]))
+        threshold = mae_thresholds.get(target, 10.0)
+        passed = avg_mae <= threshold
+        gates[f"mae_{target}"] = {"value": round(avg_mae, 3), "threshold": threshold, "pass": passed}
+        status = "PASS" if passed else "FAIL"
+        print(f"    MAE gate {target}: {avg_mae:.3f} vs {threshold} -> {status}", flush=True)
+        if not passed:
+            all_pass = False
+
+    # Gate 2: Win rate on test folds (proxy for calibration)
+    for target, vals in agg.items():
+        win_rates = vals.get("win_rate", [])
+        if win_rates:
+            avg_wr = float(np.nanmean(win_rates))
+            # Minimum 48% win rate on synthetic lines (above random minus vig)
+            passed = avg_wr >= 0.48
+            gates[f"win_rate_{target}"] = {"value": round(avg_wr, 3), "threshold": 0.48, "pass": passed}
+            status = "PASS" if passed else "FAIL"
+            print(f"    WR gate {target}: {avg_wr:.1%} vs 48% -> {status}", flush=True)
+            if not passed:
+                all_pass = False
+
+    # Gate 3: Overall ROI non-negative
+    total_profit = sum(sum(v["profit"]) for v in agg.values())
+    total_bets = sum(int(sum(v["n_bets"])) for v in agg.values())
+    if total_bets > 0:
+        overall_roi = 100 * total_profit / (total_bets * bet_size)
+        passed = overall_roi >= -5.0  # Allow slight negative (within vig)
+        gates["overall_roi"] = {"value": round(overall_roi, 2), "threshold": -5.0, "pass": passed}
+        status = "PASS" if passed else "FAIL"
+        print(f"    ROI gate: {overall_roi:.1f}% vs -5.0% -> {status}", flush=True)
+        if not passed:
+            all_pass = False
+
+    # Gate 4: R2 positive for test folds (model adds value over baseline)
+    for target, vals in agg.items():
+        avg_r2 = float(np.nanmean(vals["r2"]))
+        passed = avg_r2 > 0.0
+        gates[f"r2_{target}"] = {"value": round(avg_r2, 4), "threshold": 0.0, "pass": passed}
+        status = "PASS" if passed else "FAIL"
+        print(f"    R2 gate {target}: {avg_r2:.4f} vs 0.0 -> {status}", flush=True)
+        if not passed:
+            all_pass = False
+
+    # Overall assessment
+    gates["all_pass"] = all_pass
+    print(f"\n  {'=' * 40}", flush=True)
+    if all_pass:
+        print("  GATE CHECK: ALL GATES PASSED -- Safe to proceed to market blending", flush=True)
+    else:
+        failed = [k for k, v in gates.items() if isinstance(v, dict) and not v.get("pass", True)]
+        print(f"  GATE CHECK: FAILED -- {len(failed)} gate(s) failed: {', '.join(failed)}", flush=True)
+    print(f"  {'=' * 40}", flush=True)
+
+    return gates
 
 
 # ---------------------------------------------------------------------------
@@ -5110,6 +6935,110 @@ def fetch_upcoming_schedule(target_date: str, days: int = 1) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def apply_star_out_floor_boost(pred_df: pd.DataFrame) -> pd.DataFrame:
+    """Apply heuristic floor boost for extreme star-absence scenarios.
+
+    When a team's forward injury pressure exceeds the training p95, the XGBoost
+    model under-extrapolates because it rarely saw such extreme values in training.
+    This function boosts the top remaining scorers' predictions toward the uplift
+    observed in training data (role_beta * pressure), capped conservatively.
+
+    Only applied at prediction time (not training), so it won't contaminate the
+    model's learned relationships.
+    """
+    if pred_df.empty:
+        return pred_df
+
+    pressure_col = "team_injury_pressure_fwd"
+    if pressure_col not in pred_df.columns:
+        return pred_df
+
+    pressure = pd.to_numeric(pred_df[pressure_col], errors="coerce").fillna(0)
+    eligible_mask = pressure > STAR_OUT_PRESSURE_THRESHOLD
+    if not eligible_mask.any():
+        return pred_df
+
+    pred_df = pred_df.copy()
+    boost_log: list[str] = []
+
+    # Identify top N remaining scorers per team (by pre_points_avg5)
+    avg5_col = "pre_points_avg5"
+    if avg5_col not in pred_df.columns:
+        return pred_df
+
+    eligible_teams = pred_df.loc[eligible_mask, "team"].unique()
+    top_pids_per_team: dict[str, set[int]] = {}
+
+    # Exclude players who are OUT/suspended — they won't play and get filtered later
+    is_out_col = "injury_is_out"
+    for team in eligible_teams:
+        team_mask = (pred_df["team"] == team) & eligible_mask
+        team_rows = pred_df[team_mask].drop_duplicates(subset=["player_id"])
+        if is_out_col in team_rows.columns:
+            team_rows = team_rows[team_rows[is_out_col] != 1]
+        if team_rows.empty:
+            continue
+        top_players = team_rows.nlargest(STAR_OUT_TOP_N_PLAYERS, avg5_col)
+        top_pids_per_team[team] = set(top_players["player_id"].astype(int).tolist())
+
+    # Map stat targets to their role beta columns
+    stat_beta_map = {
+        "points": "role_pts_injury_beta20",
+        "rebounds": "role_reb_injury_beta20",
+        "assists": "role_ast_injury_beta20",
+    }
+
+    for stat in STAR_OUT_STAT_TARGETS:
+        pred_col = f"pred_{stat}"
+        avg_col = f"pre_{stat}_avg5"
+        beta_col = stat_beta_map.get(stat, "")
+        if pred_col not in pred_df.columns or avg_col not in pred_df.columns:
+            continue
+
+        for team in eligible_teams:
+            top_pids = top_pids_per_team.get(team, set())
+            if not top_pids:
+                continue
+
+            team_pressure = float(pred_df.loc[pred_df["team"] == team, pressure_col].iloc[0])
+            mask = (
+                (pred_df["team"] == team)
+                & pred_df["player_id"].astype(int).isin(top_pids)
+                & eligible_mask
+            )
+            if not mask.any():
+                continue
+
+            for idx in pred_df.index[mask]:
+                row = pred_df.loc[idx]
+                avg5 = float(_nan_or(row.get(avg_col), 0))
+                model_pred = float(_nan_or(row.get(pred_col), avg5))
+                beta = float(_nan_or(row.get(beta_col), 0.1) if beta_col and beta_col in pred_df.columns else 0.1)
+                beta = max(beta, 0.05)  # Floor beta so boost is never zero
+
+                # Floor = avg5 + scale * beta * pressure (capped)
+                raw_boost = STAR_OUT_BOOST_SCALE * beta * team_pressure
+                capped_boost = min(raw_boost, STAR_OUT_MAX_BOOST)
+                floor_val = avg5 + capped_boost
+
+                if floor_val > model_pred:
+                    delta = floor_val - model_pred
+                    pred_df.at[idx, pred_col] = floor_val
+                    pred_df.at[idx, f"star_out_boost_{stat}"] = round(delta, 2)
+                    boost_log.append(
+                        f"    {row.get('player_name', '?')} ({team}) {stat}: "
+                        f"{model_pred:.1f} -> {floor_val:.1f} (+{delta:.1f}, "
+                        f"beta={beta:.3f}, pressure={team_pressure:.0f})"
+                    )
+
+    if boost_log:
+        print(f"\n  Star-out floor boost applied ({len(boost_log)} adjustments):", flush=True)
+        for line in boost_log:
+            print(line, flush=True)
+
+    return pred_df
+
+
 def build_player_predictions(
     player_df: pd.DataFrame,
     team_games: pd.DataFrame,
@@ -5120,6 +7049,8 @@ def build_player_predictions(
     confirmed_starters: dict[tuple[str, str, str], dict[str, set[str]]] | None = None,
     two_stage_models: dict[str, Any] | None = None,
     single_models: dict[str, tuple[SimpleImputer, XGBRegressor, list[str]]] | None = None,
+    asof_utc: pd.Timestamp | None = None,
+    run_id: str = "",
 ) -> pd.DataFrame:
     """Build predictions for players in upcoming games using two-stage modeling."""
     if two_stage_models is None or single_models is None:
@@ -5142,6 +7073,7 @@ def build_player_predictions(
     pred_rows: list[dict[str, Any]] = []
     injury_status_map = injury_status_map or {}
     confirmed_starters = confirmed_starters or {}
+    asof_utc = asof_utc if asof_utc is not None else pd.Timestamp.now(tz="UTC")
 
     pg = player_games_raw.copy()
     pg = pg[pg["played"] == 1].sort_values(["team", "player_id", "game_time_utc", "game_id"])
@@ -5196,6 +7128,63 @@ def build_player_predictions(
     if "team_injury_proxy_missing_points5" not in pg.columns:
         pg["team_injury_proxy_missing_points5"] = 0.0
 
+    teams_in_scope = sorted(set(upcoming["home_team"].astype(str)).union(set(upcoming["away_team"].astype(str))))
+    clip_bounds = _forward_pressure_clip_bounds(team_games)
+    forward_injury_pressure = compute_forward_injury_pressure(
+        injury_status_map,
+        pg,
+        teams_in_scope,
+        clip_bounds=clip_bounds,
+    )
+    injury_coverage = evaluate_injury_feed_coverage(
+        injury_status_map,
+        teams_in_scope,
+        now_utc=asof_utc,
+    )
+
+    bwd_pressure_by_team: dict[str, float] = {}
+    if "injury_proxy_missing_points5" in team_games.columns:
+        latest_tg = team_games.sort_values("game_time_utc").groupby("team", sort=False).tail(1)
+        bwd_pressure_by_team = {
+            str(r["team"]).upper(): float(_nan_or(r.get("injury_proxy_missing_points5"), 0.0))
+            for _, r in latest_tg.iterrows()
+        }
+
+    print("\n  Injury pressure audit (forward vs backward):", flush=True)
+    for team in teams_in_scope:
+        fwd = float(_nan_or(forward_injury_pressure.get(team, {}).get("fwd_missing_points"), 0.0))
+        bwd = float(_nan_or(bwd_pressure_by_team.get(team, 0.0), 0.0))
+        delta = fwd - bwd
+        cov = injury_coverage.get("teams", {}).get(team, {})
+        if int(cov.get("zero_out_doubtful", 0)) == 1:
+            print(f"    [WARN] {team}: 0 Out/Doubtful/Suspension rows in injury feed", flush=True)
+        print(f"    {team}: forward={fwd:.1f} backward={bwd:.1f} delta={delta:+.1f}", flush=True)
+        top_out = forward_injury_pressure.get(team, {}).get("top_players_out", [])[:3]
+        if top_out:
+            top_s = ", ".join(
+                f"{p.get('player_name','')}({p.get('status','')}, miss_pts={float(p.get('missing_points',0.0)):.1f})"
+                for p in top_out
+            )
+            print(f"      top players out: {top_s}", flush=True)
+
+    if int(injury_coverage.get("global_stale", 0)) == 1:
+        print(f"  [WARN] Injury feed stale globally: {injury_coverage.get('global_reason', 'unknown')}", flush=True)
+
+    snapshot_date = (
+        str(upcoming["game_date_est"].iloc[0])
+        if "game_date_est" in upcoming.columns and not upcoming.empty
+        else datetime.now().strftime("%Y%m%d")
+    )
+    snapshot_path = save_injury_snapshot(
+        snapshot_date,
+        teams_in_scope,
+        injury_status_map,
+        injury_coverage,
+        forward_injury_pressure,
+        asof_utc=asof_utc,
+    )
+    print(f"  Injury snapshot saved: {snapshot_path}", flush=True)
+
     # Determine each player's current team (team of their most recent game by date, not game_id)
     player_current_team = pg.sort_values("game_time_utc").groupby("player_id")["team"].last()
 
@@ -5246,6 +7235,8 @@ def build_player_predictions(
                     "player_is_home": is_home,
                     "player_game_num": len(p_games),
                     "lineup_confirmed": lineup_confirmed,
+                    "run_id": run_id,
+                    "asof_utc": asof_utc.isoformat(),
                 }
 
                 # Player rolling averages + EWM
@@ -5352,10 +7343,13 @@ def build_player_predictions(
                 for col in ["points", "rebounds", "assists", "minutes", "fg3m"]:
                     if col not in p_games.columns:
                         continue
-                    home_games = p_games[p_games["is_home"] == 1]
-                    away_games = p_games[p_games["is_home"] == 0]
-                    row[f"pre_{col}_home_avg"] = float(home_games[col].mean()) if len(home_games) >= 3 and not home_games[col].isna().all() else np.nan
-                    row[f"pre_{col}_away_avg"] = float(away_games[col].mean()) if len(away_games) >= 3 and not away_games[col].isna().all() else np.nan
+                    home_series = p_games.loc[p_games["is_home"] == 1, col]
+                    away_series = p_games.loc[p_games["is_home"] == 0, col]
+                    # Match training-time definition: shifted expanding mean, then take latest value.
+                    home_hist = home_series.shift(1).expanding(min_periods=3).mean().dropna()
+                    away_hist = away_series.shift(1).expanding(min_periods=3).mean().dropna()
+                    row[f"pre_{col}_home_avg"] = float(home_hist.iloc[-1]) if not home_hist.empty else np.nan
+                    row[f"pre_{col}_away_avg"] = float(away_hist.iloc[-1]) if not away_hist.empty else np.nan
                     h = row.get(f"pre_{col}_home_avg")
                     a = row.get(f"pre_{col}_away_avg")
                     row[f"pre_{col}_venue_diff"] = (h - a) if pd.notna(h) and pd.notna(a) else np.nan
@@ -5363,8 +7357,7 @@ def build_player_predictions(
                 # Player days rest
                 last_game_time = latest.get("game_time_utc")
                 if pd.notna(last_game_time):
-                    now = pd.Timestamp.now(tz="UTC")
-                    row["player_days_rest"] = (now - last_game_time).total_seconds() / 86400.0
+                    row["player_days_rest"] = (asof_utc - last_game_time).total_seconds() / 86400.0
                 else:
                     row["player_days_rest"] = np.nan
 
@@ -5375,7 +7368,7 @@ def build_player_predictions(
                 if len(p_games) >= 2:
                     prev2_time = p_games.iloc[-2].get("game_time_utc")
                     if pd.notna(prev2_time):
-                        days_for_3 = (pd.Timestamp.now(tz="UTC") - prev2_time).total_seconds() / 86400.0
+                        days_for_3 = (asof_utc - prev2_time).total_seconds() / 86400.0
                         row["is_3_in_4"] = float(days_for_3 <= 4.0)
                     else:
                         row["is_3_in_4"] = 0.0
@@ -5383,6 +7376,27 @@ def build_player_predictions(
                     row["is_3_in_4"] = 0.0
                 row["b2b_x_minutes"] = row["is_b2b"] * _nan_or(row.get("pre_minutes_avg5"), 0)
                 row["b2b_x_starter"] = row["is_b2b"] * _nan_or(row.get("pre_starter_rate"), 0)
+
+                # Step 3: Season load features (scoped to team+season to match training groupby)
+                if "season" in p_games.columns and "team" in p_games.columns:
+                    current_season_games = p_games[
+                        (p_games["season"] == p_games["season"].iloc[-1])
+                        & (p_games["team"] == team)
+                    ]
+                elif "season" in p_games.columns:
+                    current_season_games = p_games[p_games["season"] == p_games["season"].iloc[-1]]
+                elif "team" in p_games.columns:
+                    current_season_games = p_games[p_games["team"] == team]
+                else:
+                    current_season_games = p_games
+                row["season_games_played"] = float(len(current_season_games))
+                if "minutes" in current_season_games.columns and not current_season_games["minutes"].dropna().empty:
+                    row["season_total_minutes"] = float(current_season_games["minutes"].sum())
+                else:
+                    row["season_total_minutes"] = 0.0
+                row["high_load_flag"] = float(row["season_total_minutes"] > 1800)
+                row["load_x_b2b"] = row["high_load_flag"] * row["is_b2b"]
+                # load_x_age deferred until player_career_games is set below
 
                 # Team context
                 team_tg = team_games[team_games["team"] == team]
@@ -5429,23 +7443,45 @@ def build_player_predictions(
                 else:
                     row["pace_diff_vs_recent"] = 0.0
 
+                # Forward-looking injury pressure (prediction time) + backward proxy for audit.
+                fwd_ctx = forward_injury_pressure.get(team, {})
+                opp_fwd_ctx = forward_injury_pressure.get(opp, {})
+                bwd_missing_pts = _nan_or(row.get("team_injury_proxy_missing_points5", 0), 0)
+                fwd_missing_pts = _nan_or(fwd_ctx.get("fwd_missing_points"), bwd_missing_pts)
+                row["team_injury_pressure_fwd"] = fwd_missing_pts
+                row["team_injury_pressure_bwd"] = bwd_missing_pts
+                row["injury_pressure_delta"] = fwd_missing_pts - bwd_missing_pts
+                row["team_injury_pressure"] = fwd_missing_pts
+                row["fwd_missing_minutes"] = _nan_or(fwd_ctx.get("fwd_missing_minutes"), 0.0)
+                row["fwd_star_absent_flag"] = int(_nan_or(fwd_ctx.get("fwd_star_absent_flag"), 0))
+                row["fwd_top1_missing_points"] = _nan_or(fwd_ctx.get("fwd_top1_missing_points"), 0.0)
+                row["fwd_top2_missing_points"] = _nan_or(fwd_ctx.get("fwd_top2_missing_points"), 0.0)
+                row["opp_fwd_injury_missing_points"] = _nan_or(opp_fwd_ctx.get("fwd_missing_points"), np.nan)
+                row["opp_fwd_injury_missing_minutes"] = _nan_or(opp_fwd_ctx.get("fwd_missing_minutes"), np.nan)
+
+                cov_team = injury_coverage.get("teams", {}).get(team, {})
+                row["injury_feed_global_stale"] = int(injury_coverage.get("global_stale", 0))
+                row["injury_feed_team_stale"] = int(cov_team.get("stale", 0))
+                row["injury_feed_team_zero_out_doubtful"] = int(cov_team.get("zero_out_doubtful", 0))
+
                 # Usage boost
-                missing_pts = _nan_or(row.get("team_injury_proxy_missing_points5", 0), 0)
                 usage = _nan_or(row.get("pre_usage_proxy", 0), 0)
-                row["team_injury_pressure"] = missing_pts
-                row["usage_boost_proxy"] = missing_pts * usage
-                row["minutes_x_injury_pressure"] = _nan_or(row.get("pre_minutes_avg5"), 0) * missing_pts
+                row["usage_boost_proxy"] = fwd_missing_pts * usage
+                row["minutes_x_injury_pressure"] = _nan_or(row.get("pre_minutes_avg5"), 0) * fwd_missing_pts
 
                 # Blowout risk
                 t_net = _nan_or(row.get("team_pre_net_rating_avg5", 0), 0)
                 o_net = _nan_or(row.get("opp_pre_net_rating_avg5", 0), 0)
                 row["net_rating_diff"] = t_net - o_net
                 row["blowout_risk"] = abs(t_net - o_net)
-                row["pace_x_injury_pressure"] = row["matchup_pace_avg"] * missing_pts
+                row["pace_x_injury_pressure"] = row["matchup_pace_avg"] * fwd_missing_pts
 
                 # Vegas game total / spread context (from upcoming schedule odds)
                 row["implied_total"] = game.get("implied_total", np.nan)
-                row["implied_spread"] = game.get("implied_spread", np.nan)
+                raw_spread = game.get("implied_spread", np.nan)
+                # Keep sign convention aligned with training features:
+                # team-perspective spread (positive=favored, negative=underdog).
+                row["implied_spread"] = raw_spread if is_home else (-raw_spread if pd.notna(raw_spread) else np.nan)
                 total = row["implied_total"]
                 spread = row["implied_spread"]
                 if pd.notna(total) and pd.notna(spread):
@@ -5538,6 +7574,20 @@ def build_player_predictions(
                     row["opp_reb_allowed_to_pos_avg10"] = np.nan
                     row["opp_ast_allowed_to_pos_avg10"] = np.nan
 
+                # Phase 8: player-vs-opponent matchup deltas
+                row["player_vs_opp_pts_delta"] = (
+                    _nan_or(row.get("pre_points_avg10"), 0.0)
+                    - _nan_or(row.get("opp_pts_allowed_to_pos_avg10"), 0.0)
+                )
+                row["player_vs_opp_reb_delta"] = (
+                    _nan_or(row.get("pre_rebounds_avg10"), 0.0)
+                    - _nan_or(row.get("opp_reb_allowed_to_pos_avg10"), 0.0)
+                )
+                row["player_vs_opp_ast_delta"] = (
+                    _nan_or(row.get("pre_assists_avg10"), 0.0)
+                    - _nan_or(row.get("opp_ast_allowed_to_pos_avg10"), 0.0)
+                )
+
                 # Player career / age-rest interactions
                 total_career_games = len(pg[pg["player_id"] == pid])
                 row["player_career_games"] = total_career_games
@@ -5549,6 +7599,9 @@ def build_player_predictions(
                 else:
                     row["veteran_rest_effect"] = np.nan
                     row["career_x_rest"] = np.nan
+
+                # Step 3: load_x_age now that player_career_games exists
+                row["load_x_age"] = row["season_total_minutes"] * total_career_games
 
                 # Referee crew features (NaN for upcoming games — refs not known pre-game)
                 row["ref_crew_avg_total"] = np.nan
@@ -5602,6 +7655,9 @@ def build_player_predictions(
         if pred_col not in pred_df.columns:
             pred_df[pred_col] = predict_prop(imp, model, used_feats, pred_df)
 
+    # Apply star-out heuristic floor boost for extreme injury-pressure scenarios
+    pred_df = apply_star_out_floor_boost(pred_df)
+
     return pred_df
 
 
@@ -5624,6 +7680,10 @@ def format_predictions(pred_df: pd.DataFrame) -> pd.DataFrame:
         "pre_minutes_avg5", "pre_points_avg5", "pre_rebounds_avg5",
         "pre_assists_avg5", "pre_fg3m_avg5", "pre_starter_rate",
         "player_game_num",
+        "player_vs_opp_pts_delta", "player_vs_opp_reb_delta", "player_vs_opp_ast_delta",
+        "team_injury_pressure_fwd", "team_injury_pressure_bwd", "injury_pressure_delta",
+        "opp_fwd_injury_missing_points", "opp_fwd_injury_missing_minutes",
+        "injury_feed_global_stale", "injury_feed_team_stale", "injury_feed_team_zero_out_doubtful",
     ]
     for c in context_cols:
         if c in pred_df.columns:
@@ -5850,12 +7910,41 @@ def generate_daily_report(
     report: dict[str, Any] = {"date": target_date, "per_stat": {}}
 
     # 1. Feature missingness
+    # Use a fixed monitoring scope so --daily-report mode (formatted CSV) and full
+    # pipeline mode (wide in-memory frame) report consistently.
+    monitored_cols = [
+        "pred_points",
+        "pred_rebounds",
+        "pred_assists",
+        "pred_minutes",
+        "pred_fg3m",
+        "pre_points_avg5",
+        "pre_rebounds_avg5",
+        "pre_assists_avg5",
+        "pre_minutes_avg5",
+        "pre_fg3m_avg5",
+        "pre_starter_rate",
+        "player_days_rest",
+        "injury_unavailability_prob",
+        "lineup_confirmed",
+        "confirmed_starter",
+    ]
+    missing_source = predictions if not predictions.empty else prop_edges
+    present_monitored = [c for c in monitored_cols if c in missing_source.columns]
+
     feature_missing: dict[str, float] = {}
-    if not predictions.empty:
-        for col in predictions.columns:
-            pct = float(predictions[col].isna().mean() * 100)
+    if not missing_source.empty and present_monitored:
+        for col in present_monitored:
+            pct = float(missing_source[col].isna().mean() * 100)
             if pct > 0:
                 feature_missing[col] = round(pct, 1)
+
+    # If no lineups are confirmed today, starter flags being NaN is expected.
+    if "confirmed_starter" in feature_missing and "lineup_confirmed" in missing_source.columns:
+        lineup_confirmed_rate = float(pd.to_numeric(missing_source["lineup_confirmed"], errors="coerce").fillna(0).mean())
+        if lineup_confirmed_rate <= 0.0:
+            feature_missing.pop("confirmed_starter", None)
+
     max_missing_pct = max(feature_missing.values()) if feature_missing else 0.0
     high_missing = {k: v for k, v in feature_missing.items() if v > 50}
     report["feature_missing_pct_max"] = round(max_missing_pct, 1)
@@ -5906,7 +7995,7 @@ def generate_daily_report(
     print(f"{'=' * 60}", flush=True)
 
     if high_missing:
-        print(f"  [ALERT] Features with >50% NaN:", flush=True)
+        print(f"  [ALERT] Monitored fields with >50% NaN:", flush=True)
         for feat, pct in sorted(high_missing.items(), key=lambda x: -x[1])[:10]:
             print(f"    {feat}: {pct:.1f}% missing", flush=True)
     else:
@@ -6008,6 +8097,7 @@ def check_deploy_gates(target_date: str) -> dict[str, Any]:
             history = pd.read_csv(PROP_RESULTS_HISTORY_FILE)
         except Exception:
             pass
+    history = _canonical_latest_view(history)
 
     graded = history[history["actual_value"].notna()].copy() if not history.empty else pd.DataFrame()
 
@@ -6021,8 +8111,8 @@ def check_deploy_gates(target_date: str) -> dict[str, Any]:
             gate1["affected_stats"].add(stat)
     results["gates"]["min_graded_per_stat"] = gate1
 
-    # Gate 2: Positive trailing CLV (last 30 days)
-    gate2: dict[str, Any] = {"passed": True, "details": {}}
+    # Gate 2: Positive trailing CLV (last 30 days) with minimum sample
+    gate2: dict[str, Any] = {"passed": True, "details": {}, "status": "PASS"}
     if not graded.empty and "game_date_est" in graded.columns:
         cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
         recent = graded[
@@ -6030,29 +8120,61 @@ def check_deploy_gates(target_date: str) -> dict[str, Any]:
             & (graded["signal"] != "NO BET")
         ]
         if not recent.empty and "line_move" in recent.columns:
-            with_move = recent[recent["line_move"].notna()].copy()
-            if not with_move.empty:
-                line_move = pd.to_numeric(with_move["line_move"], errors="coerce")
+            with_line_snapshot = recent.copy()
+            with_line_snapshot["line_move"] = pd.to_numeric(with_line_snapshot["line_move"], errors="coerce")
+            with_line_snapshot = with_line_snapshot[with_line_snapshot["line_move"].notna()].copy()
+
+            # CLV sample should only include rows with actual movement.
+            with_move = with_line_snapshot[with_line_snapshot["line_move"].abs() > 1e-9].copy()
+            n_with_move = len(with_move)
+            gate2["details"]["n_signals_30d"] = int(len(recent))
+            gate2["details"]["n_with_line_snapshot_30d"] = int(len(with_line_snapshot))
+            gate2["details"]["n_with_line_move_30d"] = n_with_move
+            gate2["details"]["min_sample_required"] = DEPLOY_CLV_MIN_SAMPLE
+
+            if n_with_move >= DEPLOY_CLV_MIN_SAMPLE:
                 clv_dir = np.where(
                     with_move["signal"] == "OVER",
-                    line_move,
-                    -line_move,
+                    with_move["line_move"].to_numpy(dtype=float),
+                    -with_move["line_move"].to_numpy(dtype=float),
                 )
                 mean_clv = float(np.nanmean(clv_dir))
                 gate2["details"]["avg_clv_line_pts_30d"] = round(mean_clv, 3)
-                gate2["details"]["n_signals_30d"] = int(len(recent))
-                gate2["details"]["n_with_line_move_30d"] = int(len(with_move))
+
+                # Separate odds-based CLV if closing odds available
+                if "closing_odds_over" in with_move.columns and "closing_odds_under" in with_move.columns:
+                    odds_clv_vals = []
+                    for _, r in with_move.iterrows():
+                        open_over = pd.to_numeric(r.get("over_odds"), errors="coerce")
+                        close_over = pd.to_numeric(r.get("closing_odds_over"), errors="coerce")
+                        if pd.notna(open_over) and pd.notna(close_over):
+                            # CLV = implied prob improvement in signal direction
+                            open_ip = _american_odds_to_implied_prob(open_over)
+                            close_ip = _american_odds_to_implied_prob(close_over)
+                            if pd.notna(open_ip) and pd.notna(close_ip):
+                                clv_odds = (close_ip - open_ip) if r.get("signal") == "OVER" else (open_ip - close_ip)
+                                odds_clv_vals.append(clv_odds)
+                    if odds_clv_vals:
+                        gate2["details"]["avg_clv_odds_30d"] = round(float(np.mean(odds_clv_vals)), 4)
+                        gate2["details"]["n_with_odds_clv_30d"] = len(odds_clv_vals)
+
                 if mean_clv < DEPLOY_GATE_MIN_CLV:
                     gate2["passed"] = False
+                    gate2["status"] = "FAIL"
             else:
-                gate2["details"]["n_signals_30d"] = int(len(recent))
-                gate2["details"]["n_with_line_move_30d"] = 0
+                # Insufficient sample — treat as not deployment-ready.
                 gate2["passed"] = False
+                gate2["status"] = "INSUFFICIENT_DATA"
+                gate2["details"]["reason"] = f"insufficient_sample ({n_with_move} < {DEPLOY_CLV_MIN_SAMPLE})"
         else:
-            gate2["details"]["n_signals_30d"] = 0
             gate2["passed"] = False
+            gate2["status"] = "INSUFFICIENT_DATA"
+            gate2["details"]["n_signals_30d"] = 0 if recent.empty else int(len(recent))
+            gate2["details"]["n_with_line_move_30d"] = 0
+            gate2["details"]["reason"] = "no_line_move_data"
     else:
         gate2["passed"] = False
+        gate2["status"] = "INSUFFICIENT_DATA"
         gate2["details"]["reason"] = "no graded history"
     results["gates"]["positive_trailing_clv"] = gate2
 
@@ -6112,7 +8234,7 @@ def _print_deploy_gate_status(gate_results: dict[str, Any]) -> None:
     print(f"{'=' * 60}", flush=True)
 
     for gate_name, gate_info in gate_results.get("gates", {}).items():
-        status = "PASS" if gate_info.get("passed", False) else "FAIL"
+        status = str(gate_info.get("status", "PASS" if gate_info.get("passed", False) else "FAIL"))
         marker = "  " if gate_info.get("passed", False) else "  [!]"
         print(f"{marker} {gate_name}: {status}", flush=True)
         details = gate_info.get("details", {})
@@ -6189,15 +8311,14 @@ def track_prop_clv(target_date: str) -> None:
             continue
 
         # Find actual result
-        mask = actual_games["player_name"].str.lower().str.contains(
-            player_name.lower(), na=False
+        team = str(edge_row.get("team", ""))
+        matched = _match_actual_player_rows(
+            actual_games,
+            player_name=str(player_name),
+            team=team,
+            player_id=edge_row.get("player_id", np.nan),
         )
-        team = edge_row.get("team", "")
-        if team:
-            mask = mask & (actual_games["team"] == team)
-
-        matched = actual_games[mask]
-        if matched.empty:
+        if matched.empty or len(matched) != 1:
             continue
 
         actual_row = matched.iloc[0]
@@ -6319,6 +8440,7 @@ def compute_calibration_report(
         return {"error": "no history file"}
 
     history = pd.read_csv(PROP_RESULTS_HISTORY_FILE)
+    history = _canonical_latest_view(history)
     if history.empty or "actual_value" not in history.columns:
         return {"error": "empty history"}
 
@@ -6422,6 +8544,35 @@ def compute_calibration_report(
             report["clv_mean"] = round(float(np.mean(clv_dir)), 3)
             report["clv_n"] = len(with_move)
 
+    # --- Star-out nights subset (forward pressure > p90 threshold) ---
+    star_out_threshold = 30.0  # ~p90 of training team_injury_pressure
+    fwd_col = "team_injury_pressure_fwd"
+    base_df = signal_graded if not signal_graded.empty else graded
+    if fwd_col in base_df.columns:
+        fwd_pressure = pd.to_numeric(base_df[fwd_col], errors="coerce").fillna(0)
+        star_out_mask = fwd_pressure > star_out_threshold
+        normal_mask = ~star_out_mask
+        star_out_rows = base_df[star_out_mask]
+        normal_rows = base_df[normal_mask]
+
+        star_out_metrics: list[dict[str, Any]] = []
+        for label, subset in [("star_out", star_out_rows), ("normal", normal_rows)]:
+            if len(subset) < 10:
+                continue
+            hit = subset["hit"].astype(float)
+            p_hit = subset["p_hit"].astype(float)
+            pnl = np.where(hit == 1, VIG_FACTOR, -1.0)
+            star_out_metrics.append({
+                "group": label,
+                "n": len(subset),
+                "hit_rate": round(float(hit.mean()), 4),
+                "mean_p_hit": round(float(p_hit.mean()), 4),
+                "gap": round(float(abs(hit.mean() - p_hit.mean())), 4),
+                "roi_pct": round(float(pnl.mean()) * 100, 2),
+            })
+        if star_out_metrics:
+            report["by_star_out"] = star_out_metrics
+
     report["alerts"] = alerts
     return report
 
@@ -6466,6 +8617,16 @@ def print_calibration_report(report: dict[str, Any]) -> None:
                 flush=True,
             )
 
+    if report.get("by_star_out"):
+        print(f"\n  --- Star-Out Nights (fwd_pressure > 30) ---", flush=True)
+        for e in report["by_star_out"]:
+            print(
+                f"    {str(e['group']):10s}: n={e['n']:>4d}  "
+                f"HitRate={e['hit_rate']:.1%}  Pred={e['mean_p_hit']:.1%}  "
+                f"Gap={e['gap']:.3f}  ROI={e['roi_pct']:+.1f}%",
+                flush=True,
+            )
+
     if "clv_mean" in report:
         print(f"\n  CLV (signal direction): mean={report['clv_mean']:+.3f} pts  (n={report['clv_n']})", flush=True)
 
@@ -6497,6 +8658,7 @@ def get_calibration_degraded_stats(
         history = pd.read_csv(PROP_RESULTS_HISTORY_FILE)
     except Exception:
         return set()
+    history = _canonical_latest_view(history)
 
     graded = history[history["actual_value"].notna()].copy()
     if graded.empty:
@@ -6538,11 +8700,18 @@ def save_canonical_results(
     prop_edges: pd.DataFrame,
     target_date: str,
     policy_mode: str,
+    run_id: str = "",
+    asof_utc: pd.Timestamp | None = None,
 ) -> Path:
     """Save ALL prop edge rows (signals + NO BET) to canonical results history.
 
     Predictions are stored with actual_value=NaN. Actuals are filled later by
-    ``grade_canonical_results()``. Idempotent: replaces rows for the same date.
+    ``grade_canonical_results()``.
+
+    Snapshot behavior:
+    - Appends immutable run snapshots (no date overwrite).
+    - Marks latest snapshot rows per date with ``is_latest=1``.
+    - Prior runs are retained with ``is_latest=0``.
 
     Returns the path to the history file.
     """
@@ -6551,24 +8720,38 @@ def save_canonical_results(
     if prop_edges.empty:
         return PROP_RESULTS_HISTORY_FILE
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    asof_utc = asof_utc if asof_utc is not None else pd.Timestamp.now(tz="UTC")
+    now_str = asof_utc.strftime("%Y-%m-%d %H:%M:%S")
+    run_id = str(run_id or f"run_{asof_utc.strftime('%Y%m%dT%H%M%SZ')}_{uuid4().hex[:8]}")
     rows: list[dict[str, Any]] = []
     for _, r in prop_edges.iterrows():
         name_norm = normalize_player_name(r.get("player_name", ""))
         stat_type = str(r.get("stat_type", ""))
-        pid = generate_prediction_id(target_date, name_norm, stat_type)
+        pid = generate_prediction_id(
+            target_date,
+            name_norm,
+            stat_type,
+            team=str(r.get("team", "")),
+            player_id=r.get("player_id", np.nan),
+            home_team=str(r.get("home_team", "")),
+            away_team=str(r.get("away_team", "")),
+        )
         rows.append({
             "prediction_id": pid,
             "game_date_est": target_date,
             "player_name": r.get("player_name", ""),
             "player_name_norm": name_norm,
+            "player_id": r.get("player_id", np.nan),
             "team": r.get("team", ""),
             "opp": r.get("opp", ""),
+            "home_team": r.get("home_team", ""),
+            "away_team": r.get("away_team", ""),
             "stat_type": stat_type,
             # Decision-time features
             "pred_value": r.get("pred_value", np.nan),
             "pred_value_base": r.get("pred_value_base", np.nan),
             "market_resid_adj": r.get("market_resid_adj", np.nan),
+            "bias_adj": r.get("bias_adj", np.nan),
             "pre_avg5": r.get("pre_avg5", np.nan),
             "pre_avg10": r.get("pre_avg10", np.nan),
             "pre_season": r.get("pre_season", np.nan),
@@ -6586,6 +8769,8 @@ def save_canonical_results(
             "under_odds": r.get("under_odds", np.nan),
             "open_over_odds": r.get("open_over_odds", np.nan),
             "open_under_odds": r.get("open_under_odds", np.nan),
+            "closing_odds_over": r.get("closing_odds_over", np.nan),
+            "closing_odds_under": r.get("closing_odds_under", np.nan),
             "line_move": r.get("line_move", np.nan),
             "line_move_pct": r.get("line_move_pct", np.nan),
             "source": r.get("source", ""),
@@ -6608,17 +8793,30 @@ def save_canonical_results(
             "push": np.nan,
             "graded_at": "",
             # Metadata
+            "run_id": run_id,
+            "asof_utc": asof_utc.isoformat(),
+            "is_latest": 1,
             "prediction_created_at": now_str,
             "model_version": MODEL_VERSION,
         })
 
     new_df = pd.DataFrame(rows)
 
-    # Load existing history, remove rows for this date, append new
+    # Load existing history, mark prior date snapshots non-latest, append new.
     if PROP_RESULTS_HISTORY_FILE.exists():
         try:
             existing = pd.read_csv(PROP_RESULTS_HISTORY_FILE)
-            existing = existing[existing["game_date_est"].astype(str) != str(target_date)]
+            if "is_latest" not in existing.columns:
+                existing["is_latest"] = 1
+            if "run_id" not in existing.columns:
+                existing["run_id"] = ""
+            if "asof_utc" not in existing.columns:
+                existing["asof_utc"] = ""
+            date_mask = existing["game_date_est"].astype(str) == str(target_date)
+            existing.loc[date_mask, "is_latest"] = 0
+            # Idempotent if same run_id/date is saved again.
+            same_run = date_mask & (existing["run_id"].astype(str) == run_id)
+            existing = existing[~same_run]
             combined = pd.concat([existing, new_df], ignore_index=True)
         except Exception:
             combined = new_df
@@ -6626,7 +8824,11 @@ def save_canonical_results(
         combined = new_df
 
     combined.to_csv(PROP_RESULTS_HISTORY_FILE, index=False)
-    print(f"  Canonical results saved: {len(new_df)} rows for {target_date} -> {PROP_RESULTS_HISTORY_FILE}", flush=True)
+    print(
+        f"  Canonical results saved: {len(new_df)} rows for {target_date} "
+        f"(run_id={run_id}) -> {PROP_RESULTS_HISTORY_FILE}",
+        flush=True,
+    )
     return PROP_RESULTS_HISTORY_FILE
 
 
@@ -6644,6 +8846,8 @@ def grade_canonical_results(target_date: str) -> pd.DataFrame:
 
     history = pd.read_csv(PROP_RESULTS_HISTORY_FILE)
     date_mask = history["game_date_est"].astype(str) == str(target_date)
+    if "is_latest" in history.columns:
+        date_mask = date_mask & history["is_latest"].fillna(0).astype(int).eq(1)
     target_rows = history[date_mask].copy()
 
     if target_rows.empty:
@@ -6663,8 +8867,17 @@ def grade_canonical_results(target_date: str) -> pd.DataFrame:
     if not ext.empty:
         player_games = player_games.merge(ext, on=["game_id", "team", "player_id"], how="left")
 
+    # Derive game_date_est from game_time_utc if missing (Eastern time, YYYYMMDD format)
+    if "game_date_est" not in player_games.columns and "game_time_utc" in player_games.columns:
+        utc_ts = pd.to_datetime(player_games["game_time_utc"], utc=True, errors="coerce")
+        eastern = utc_ts.dt.tz_convert("US/Eastern")
+        player_games["game_date_est"] = eastern.dt.strftime("%Y%m%d")
+
     if "game_date_est" in player_games.columns:
-        actual_games = player_games[player_games["game_date_est"] == target_date].copy()
+        # Normalise both sides to string for comparison
+        pg_dates = player_games["game_date_est"].astype(str)
+        target_str = str(target_date).replace("-", "")
+        actual_games = player_games[pg_dates == target_str].copy()
     else:
         actual_games = pd.DataFrame()
 
@@ -6683,17 +8896,14 @@ def grade_canonical_results(target_date: str) -> pd.DataFrame:
         stat_type = str(row.get("stat_type", ""))
         team = str(row.get("team", ""))
 
-        # Match by normalized name + team
-        actual_norm = actual_games["player_name"].map(normalize_player_name)
-        pred_norm = normalize_player_name(player_name)
-        mask = actual_norm.eq(pred_norm)
-        if not mask.any() and pred_norm:
-            mask = actual_norm.str.contains(re.escape(pred_norm), na=False)
-        if team:
-            mask = mask & (actual_games["team"] == team)
-
-        matched = actual_games[mask]
-        if matched.empty:
+        # Match by player_id first, then strict normalized name + team.
+        matched = _match_actual_player_rows(
+            actual_games,
+            player_name=player_name,
+            team=team,
+            player_id=row.get("player_id", np.nan),
+        )
+        if matched.empty or len(matched) != 1:
             continue
 
         actual_row = matched.iloc[0]
@@ -6757,6 +8967,16 @@ def grade_canonical_results(target_date: str) -> pd.DataFrame:
             print(f"    {st:10s}: {st_bets} bets, {st_hr:.1%} hit rate, ${st_pnl:+.0f} P/L", flush=True)
 
     print(f"\n  Results saved to {PROP_RESULTS_HISTORY_FILE}", flush=True)
+
+    # Recompute rolling points bias after grading
+    if USE_POINTS_BIAS_CORRECTION:
+        bias_info = compute_points_bias(history)
+        save_points_bias(bias_info)
+        status = "ACTIVE" if bias_info["active"] else "INACTIVE"
+        print(f"  Points bias: {status} — raw={bias_info['raw_bias']:+.3f}, "
+              f"shrunk={bias_info['shrunk_bias']:+.3f}, n={bias_info['n']} "
+              f"({bias_info['reason']})", flush=True)
+
     return graded_rows
 
 
@@ -6773,24 +8993,29 @@ def migrate_tracking_to_canonical() -> None:
         return
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    migrate_run_id = f"migrate_{datetime.now().strftime('%Y%m%dT%H%M%S')}"
     rows: list[dict[str, Any]] = []
     for _, r in tracking.iterrows():
         date = str(r.get("date", ""))
         name = str(r.get("player_name", ""))
         name_norm = normalize_player_name(name)
         stat_type = str(r.get("stat_type", ""))
-        pid = generate_prediction_id(date, name_norm, stat_type)
+        pid = generate_prediction_id(date, name_norm, stat_type, team=str(r.get("team", "")))
         rows.append({
             "prediction_id": pid,
             "game_date_est": date,
             "player_name": name,
             "player_name_norm": name_norm,
+            "player_id": np.nan,
             "team": r.get("team", ""),
             "opp": "",
+            "home_team": "",
+            "away_team": "",
             "stat_type": stat_type,
             "pred_value": r.get("pred_value", np.nan),
             "pred_value_base": np.nan,
             "market_resid_adj": np.nan,
+            "bias_adj": np.nan,
             "pre_avg5": np.nan,
             "pre_avg10": np.nan,
             "pre_season": np.nan,
@@ -6807,6 +9032,8 @@ def migrate_tracking_to_canonical() -> None:
             "under_odds": np.nan,
             "open_over_odds": np.nan,
             "open_under_odds": np.nan,
+            "closing_odds_over": np.nan,
+            "closing_odds_under": np.nan,
             "line_move": np.nan,
             "line_move_pct": np.nan,
             "source": "",
@@ -6827,6 +9054,9 @@ def migrate_tracking_to_canonical() -> None:
             "push": np.nan,
             "graded_at": now_str if pd.notna(r.get("actual_value")) else "",
             "prediction_created_at": "",
+            "run_id": migrate_run_id,
+            "asof_utc": "",
+            "is_latest": 1,
             "model_version": "migrated",
         })
 
@@ -6835,6 +9065,12 @@ def migrate_tracking_to_canonical() -> None:
     # Merge with existing history (deduplicate by prediction_id)
     if PROP_RESULTS_HISTORY_FILE.exists():
         existing = pd.read_csv(PROP_RESULTS_HISTORY_FILE)
+        if "is_latest" not in existing.columns:
+            existing["is_latest"] = 1
+        if "run_id" not in existing.columns:
+            existing["run_id"] = ""
+        if "asof_utc" not in existing.columns:
+            existing["asof_utc"] = ""
         existing_ids = set(existing["prediction_id"].astype(str))
         new_rows = migrated[~migrated["prediction_id"].isin(existing_ids)]
         combined = pd.concat([existing, new_rows], ignore_index=True)
@@ -6937,6 +9173,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Predict NBA player props")
     p.add_argument("--date", type=str, default=None,
                    help="Target date YYYYMMDD (default: today)")
+    p.add_argument("--asof-utc", type=str, default=None,
+                   help="Freeze run context time in UTC (ISO string, e.g. 2026-03-03T20:00:00Z)")
     p.add_argument("--days", type=int, default=1,
                    help="Number of days to predict (default: 1)")
     p.add_argument("--backtest", action="store_true",
@@ -6979,6 +9217,9 @@ def parse_args() -> argparse.Namespace:
                    help="Fetch missing BoxScoreAdvancedV3 raw payloads while building player features")
     p.add_argument("--box-adv-max-fetch", type=int, default=0,
                    help="Max missing BoxScoreAdvancedV3 games to fetch this run (0=all missing)")
+    # Step 4: Player target encoding (experimental)
+    p.add_argument("--enable-player-encoding", action="store_true",
+                   help="Enable experimental per-player target encoding features")
     # Phase 1: Canonical results
     p.add_argument("--grade-results", action="store_true",
                    help="Grade canonical results for a completed date (fill actuals from boxscores)")
@@ -7007,6 +9248,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    run_asof_utc = parse_asof_utc(getattr(args, "asof_utc", None))
+    run_id = f"run_{run_asof_utc.strftime('%Y%m%dT%H%M%SZ')}_{uuid4().hex[:8]}"
+
+    # Wire CLI flags to module-level globals
+    global USE_PLAYER_TARGET_ENCODING
+    if getattr(args, "enable_player_encoding", False):
+        USE_PLAYER_TARGET_ENCODING = True
 
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -7016,7 +9264,7 @@ def main() -> None:
 
     # --- Grade results mode (Phase 1) ---
     if args.grade_results:
-        target_date = args.date or (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        target_date = args.date or (run_asof_utc - timedelta(days=1)).strftime("%Y%m%d")
         print(f"Grading canonical results for {target_date}...", flush=True)
         grade_canonical_results(target_date)
         return
@@ -7029,7 +9277,7 @@ def main() -> None:
 
     # --- CLV tracking mode (legacy, delegates to grade_canonical_results when possible) ---
     if args.track_clv:
-        target_date = args.date or (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        target_date = args.date or (run_asof_utc - timedelta(days=1)).strftime("%Y%m%d")
         if PROP_RESULTS_HISTORY_FILE.exists():
             print(f"Grading canonical results for {target_date} (via --track-clv)...", flush=True)
             grade_canonical_results(target_date)
@@ -7043,7 +9291,7 @@ def main() -> None:
         print("\nGenerating calibration report from canonical results...", flush=True)
         report = compute_calibration_report()
         print_calibration_report(report)
-        report_path = PROP_LOG_DIR / f"calibration_report_{datetime.now().strftime('%Y%m%d')}.json"
+        report_path = PROP_LOG_DIR / f"calibration_report_{run_asof_utc.strftime('%Y%m%d')}.json"
         with open(report_path, "w") as f:
             json.dump(report, f, indent=2, default=str)
         print(f"\n  Report saved to {report_path}", flush=True)
@@ -7051,7 +9299,7 @@ def main() -> None:
 
     # --- Daily report mode (history/prediction-file only) ---
     if args.daily_report:
-        target_date = args.date or datetime.now().strftime("%Y%m%d")
+        target_date = args.date or run_asof_utc.strftime("%Y%m%d")
         print(f"\nGenerating daily health report for {target_date}...", flush=True)
         pred_file = PREDICTIONS_DIR / f"player_props_{target_date}.csv"
         edge_file = PREDICTIONS_DIR / f"player_prop_edges_{target_date}.csv"
@@ -7062,7 +9310,7 @@ def main() -> None:
 
     # --- Deploy status mode (history-only) ---
     if args.deploy_status:
-        target_date = args.date or datetime.now().strftime("%Y%m%d")
+        target_date = args.date or run_asof_utc.strftime("%Y%m%d")
         print(f"\nDeploy gate status for {target_date}...", flush=True)
         gate_results = check_deploy_gates(target_date)
         _print_deploy_gate_status(gate_results)
@@ -7199,7 +9447,7 @@ def main() -> None:
         return
 
     # --- Prediction mode ---
-    target_date = args.date or datetime.now().strftime("%Y%m%d")
+    target_date = args.date or run_asof_utc.strftime("%Y%m%d")
     print(f"\nFetching upcoming games for {target_date}...", flush=True)
     upcoming = fetch_upcoming_schedule(target_date, args.days)
     if upcoming.empty:
@@ -7211,7 +9459,7 @@ def main() -> None:
         print(f"    {g['away_team']} @ {g['home_team']} ({g.get('status', '')})", flush=True)
 
     print("\nChecking injury report...", flush=True)
-    injury_map = fetch_injury_status_map(target_date)
+    injury_map = fetch_injury_status_map(target_date, asof_utc=run_asof_utc)
     if injury_map:
         by_status = pd.Series([v.get("status", "") for v in injury_map.values()]).value_counts()
         print(f"  Loaded injury statuses for {len(injury_map)} players", flush=True)
@@ -7224,6 +9472,7 @@ def main() -> None:
         upcoming,
         lock_minutes=args.lineup_lock_minutes,
         force=args.force_starter_refresh,
+        now_utc=run_asof_utc,
     )
     n_games_with_starters = len(confirmed_starters)
     print(f"  Confirmed starter games: {n_games_with_starters}/{len(upcoming)}", flush=True)
@@ -7249,6 +9498,8 @@ def main() -> None:
         confirmed_starters=confirmed_starters,
         two_stage_models=two_stage_models,
         single_models=single_models,
+        asof_utc=run_asof_utc,
+        run_id=run_id,
     )
 
     if pred_df.empty:
@@ -7324,7 +9575,9 @@ def main() -> None:
         print("Computing residual standard deviations...", flush=True)
         residual_stds = compute_prop_residual_stds(
             player_df,
-            leakage_safe=True,
+            two_stage_models=two_stage_models,
+            single_models=single_models,
+            leakage_safe=False,
         )
         for stat, std in residual_stds.items():
             print(f"  {stat}: residual_std = {std:.2f}", flush=True)
@@ -7336,6 +9589,12 @@ def main() -> None:
 
         # Phase 4: Extract uncertainty models from two_stage_models
         unc_models = two_stage_models.get("_uncertainty", None) if two_stage_models else None
+        q_unc_models = two_stage_models.get("_uncertainty_quantile", None) if two_stage_models else None
+
+        # Log active bias correction
+        pts_bias = get_active_points_bias()
+        if pts_bias != 0.0:
+            print(f"  Points bias correction active: {pts_bias:+.3f}", flush=True)
 
         print("Computing prop edges...", flush=True)
         prop_edges = compute_prop_edges(
@@ -7346,6 +9605,7 @@ def main() -> None:
             prob_calibrators=prob_calibrators,
             calibration_degraded_stats=degraded_stats,
             uncertainty_models=unc_models,
+            quantile_uncertainty_models=q_unc_models,
         )
         if not prop_edges.empty:
             pre_signals = int((prop_edges["signal"] != "NO BET").sum())
@@ -7404,7 +9664,13 @@ def main() -> None:
             print(f"  Prop edges saved to {edge_out_path}", flush=True)
 
             # Save canonical results (Phase 1): all predictions (signals + NO BET)
-            save_canonical_results(prop_edges, target_date, ACTIVE_SIGNAL_POLICY_MODE)
+            save_canonical_results(
+                prop_edges,
+                target_date,
+                ACTIVE_SIGNAL_POLICY_MODE,
+                run_id=run_id,
+                asof_utc=run_asof_utc,
+            )
 
     # Format and save predictions
     output = format_predictions(pred_df)
