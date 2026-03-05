@@ -106,7 +106,7 @@ _BOX_ADV_CACHE: pd.DataFrame | None = None
 _ESPN_ATHLETE_DISK_CACHE_LOADED = False
 PLAYER_FEATURE_CACHE_FILE = MODEL_DIR / "player_features_cache.pkl"
 PLAYER_FEATURE_CACHE_META = MODEL_DIR / "player_features_cache_meta.json"
-PLAYER_FEATURE_CACHE_VERSION = "v9"  # v9: opp 3pt defense, tracking stats, implied pace/minutes
+PLAYER_FEATURE_CACHE_VERSION = "v10"  # v10: BDL hustle stats (deflections, box_outs, reb_chances, screen_assists, pts_paint)
 NO_LINES_RETRY_SECS_SAME_DAY = 45 * 60
 BOX_ADV_REQUEST_SLEEP_SECS = 1.0
 BOX_ADV_DEFAULT_RETRIES = 5
@@ -122,8 +122,8 @@ DEFAULT_MIN_GAMES = 20
 VIG_FACTOR = 0.9524        # net payout per $1 at ~-105 juice
 BREAKEVEN_PROB = 1.0 / (1.0 + VIG_FACTOR)  # ~0.5122
 # Post-calibration clipping to avoid saturated 0/1 probabilities in outputs.
-PROB_CLIP_FLOOR = 0.005
-PROB_CLIP_CEILING = 0.995
+PROB_CLIP_FLOOR = 0.02
+PROB_CLIP_CEILING = 0.98
 
 # Signal thresholds
 MIN_EDGE_PCT = 15.0        # minimum edge% to signal (e.g., pred 23 vs line 20 = 15%)
@@ -1092,8 +1092,28 @@ def _parse_tracking_payload(payload: dict[str, Any], game_id: str) -> list[dict[
             speed_i = idx("AVG_SPEED", "SPEED")
             cont_shots_i = idx("CONTESTED_SHOTS", "CONT_SHOTS")
             uncontested_fga_i = idx("UNCONTESTED_FGA")
+            # Hustle stats (from BDL advanced)
+            deflections_i = idx("DEFLECTIONS")
+            box_outs_i = idx("BOX_OUTS")
+            off_box_outs_i = idx("OFFENSIVE_BOX_OUTS")
+            def_box_outs_i = idx("DEFENSIVE_BOX_OUTS")
+            loose_balls_i = idx("LOOSE_BALLS")
+            screen_ast_i = idx("SCREEN_ASSISTS")
+            secondary_ast_i = idx("SECONDARY_ASSISTS")
+            # Rebound chances
+            reb_chances_i = idx("REB_CHANCES_TOTAL")
+            reb_chances_off_i = idx("REB_CHANCES_OFF")
+            reb_chances_def_i = idx("REB_CHANCES_DEF")
+            # Scoring breakdown
+            pts_paint_i = idx("PTS_PAINT")
+            pts_fb_i = idx("PTS_FAST_BREAK")
+            pts_off_to_i = idx("PTS_OFF_TO")
             if pid_i < 0 or team_i < 0:
                 continue
+
+            def _safe(r: list | tuple, i: int) -> Any:
+                return _to_float(r[i]) if 0 <= i < len(r) else np.nan
+
             for r in rowset:
                 if not isinstance(r, (list, tuple)):
                     continue
@@ -1101,25 +1121,42 @@ def _parse_tracking_payload(payload: dict[str, Any], game_id: str) -> list[dict[
                 team = str(r[team_i]).upper().strip() if team_i < len(r) else ""
                 if pid is None or not team:
                     continue
-                rows.append({
+                row_dict: dict[str, Any] = {
                     "game_id": str(game_id),
                     "team": team,
                     "player_id": int(pid),
-                    "trk_touches": _to_float(r[touches_i]) if touches_i >= 0 and touches_i < len(r) else np.nan,
-                    "trk_drives": _to_float(r[drives_i]) if drives_i >= 0 and drives_i < len(r) else np.nan,
-                    "trk_passes": _to_float(r[passes_i]) if passes_i >= 0 and passes_i < len(r) else np.nan,
-                    "trk_catch_shoot_fga": _to_float(r[c_and_s_fga_i]) if c_and_s_fga_i >= 0 and c_and_s_fga_i < len(r) else np.nan,
-                    "trk_catch_shoot_fgm": _to_float(r[c_and_s_fgm_i]) if c_and_s_fgm_i >= 0 and c_and_s_fgm_i < len(r) else np.nan,
-                    "trk_catch_shoot_fg3a": _to_float(r[c_and_s_fg3a_i]) if c_and_s_fg3a_i >= 0 and c_and_s_fg3a_i < len(r) else np.nan,
-                    "trk_catch_shoot_fg3m": _to_float(r[c_and_s_fg3m_i]) if c_and_s_fg3m_i >= 0 and c_and_s_fg3m_i < len(r) else np.nan,
-                    "trk_pull_up_fga": _to_float(r[pull_up_fga_i]) if pull_up_fga_i >= 0 and pull_up_fga_i < len(r) else np.nan,
-                    "trk_pull_up_fgm": _to_float(r[pull_up_fgm_i]) if pull_up_fgm_i >= 0 and pull_up_fgm_i < len(r) else np.nan,
-                    "trk_pull_up_fg3a": _to_float(r[pull_up_fg3a_i]) if pull_up_fg3a_i >= 0 and pull_up_fg3a_i < len(r) else np.nan,
-                    "trk_dist_miles": _to_float(r[dist_i]) if dist_i >= 0 and dist_i < len(r) else np.nan,
-                    "trk_avg_speed": _to_float(r[speed_i]) if speed_i >= 0 and speed_i < len(r) else np.nan,
-                    "trk_contested_shots": _to_float(r[cont_shots_i]) if cont_shots_i >= 0 and cont_shots_i < len(r) else np.nan,
-                    "trk_uncontested_fga": _to_float(r[uncontested_fga_i]) if uncontested_fga_i >= 0 and uncontested_fga_i < len(r) else np.nan,
-                })
+                    "trk_touches": _safe(r, touches_i),
+                    "trk_drives": _safe(r, drives_i),
+                    "trk_passes": _safe(r, passes_i),
+                    "trk_catch_shoot_fga": _safe(r, c_and_s_fga_i),
+                    "trk_catch_shoot_fgm": _safe(r, c_and_s_fgm_i),
+                    "trk_catch_shoot_fg3a": _safe(r, c_and_s_fg3a_i),
+                    "trk_catch_shoot_fg3m": _safe(r, c_and_s_fg3m_i),
+                    "trk_pull_up_fga": _safe(r, pull_up_fga_i),
+                    "trk_pull_up_fgm": _safe(r, pull_up_fgm_i),
+                    "trk_pull_up_fg3a": _safe(r, pull_up_fg3a_i),
+                    "trk_dist_miles": _safe(r, dist_i),
+                    "trk_avg_speed": _safe(r, speed_i),
+                    "trk_contested_shots": _safe(r, cont_shots_i),
+                    "trk_uncontested_fga": _safe(r, uncontested_fga_i),
+                    # Hustle stats
+                    "trk_deflections": _safe(r, deflections_i),
+                    "trk_box_outs": _safe(r, box_outs_i),
+                    "trk_off_box_outs": _safe(r, off_box_outs_i),
+                    "trk_def_box_outs": _safe(r, def_box_outs_i),
+                    "trk_loose_balls": _safe(r, loose_balls_i),
+                    "trk_screen_assists": _safe(r, screen_ast_i),
+                    "trk_secondary_assists": _safe(r, secondary_ast_i),
+                    # Rebound chances
+                    "trk_reb_chances": _safe(r, reb_chances_i),
+                    "trk_reb_chances_off": _safe(r, reb_chances_off_i),
+                    "trk_reb_chances_def": _safe(r, reb_chances_def_i),
+                    # Scoring breakdown
+                    "trk_pts_paint": _safe(r, pts_paint_i),
+                    "trk_pts_fast_break": _safe(r, pts_fb_i),
+                    "trk_pts_off_to": _safe(r, pts_off_to_i),
+                }
+                rows.append(row_dict)
         if rows:
             return rows
 
@@ -1159,6 +1196,20 @@ def _parse_tracking_payload(payload: dict[str, Any], game_id: str) -> list[dict[
                 "trk_avg_speed": _to_float(stats.get("averageSpeed") or stats.get("AVG_SPEED") or stats.get("speed")),
                 "trk_contested_shots": _to_float(stats.get("contestedShots") or stats.get("CONTESTED_SHOTS")),
                 "trk_uncontested_fga": _to_float(stats.get("uncontestedFga") or stats.get("UNCONTESTED_FGA")),
+                # Hustle stats (populated by BDL via Shape A; CDN keys here as fallback)
+                "trk_deflections": _to_float(stats.get("deflections") or stats.get("DEFLECTIONS")),
+                "trk_box_outs": _to_float(stats.get("boxOuts") or stats.get("BOX_OUTS")),
+                "trk_off_box_outs": _to_float(stats.get("offensiveBoxOuts") or stats.get("OFFENSIVE_BOX_OUTS")),
+                "trk_def_box_outs": _to_float(stats.get("defensiveBoxOuts") or stats.get("DEFENSIVE_BOX_OUTS")),
+                "trk_loose_balls": _to_float(stats.get("looseBallsRecoveredTotal") or stats.get("LOOSE_BALLS")),
+                "trk_screen_assists": _to_float(stats.get("screenAssists") or stats.get("SCREEN_ASSISTS")),
+                "trk_secondary_assists": _to_float(stats.get("secondaryAssists") or stats.get("SECONDARY_ASSISTS")),
+                "trk_reb_chances": _to_float(stats.get("reboundChancesTotal") or stats.get("REB_CHANCES_TOTAL")),
+                "trk_reb_chances_off": _to_float(stats.get("reboundChancesOff") or stats.get("REB_CHANCES_OFF")),
+                "trk_reb_chances_def": _to_float(stats.get("reboundChancesDef") or stats.get("REB_CHANCES_DEF")),
+                "trk_pts_paint": _to_float(stats.get("pointsPaint") or stats.get("PTS_PAINT")),
+                "trk_pts_fast_break": _to_float(stats.get("pointsFastBreak") or stats.get("PTS_FAST_BREAK")),
+                "trk_pts_off_to": _to_float(stats.get("pointsOffTurnovers") or stats.get("PTS_OFF_TO")),
             })
     return rows
 
@@ -2406,6 +2457,13 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
         "trk_pull_up_fga", "trk_pull_up_fgm", "trk_pull_up_fg3a",
         "trk_dist_miles", "trk_avg_speed",
         "trk_contested_shots", "trk_uncontested_fga",
+        # Hustle stats (from BDL advanced)
+        "trk_deflections", "trk_box_outs", "trk_off_box_outs", "trk_def_box_outs",
+        "trk_loose_balls", "trk_screen_assists", "trk_secondary_assists",
+        # Rebound chances
+        "trk_reb_chances", "trk_reb_chances_off", "trk_reb_chances_def",
+        # Scoring breakdown
+        "trk_pts_paint", "trk_pts_fast_break", "trk_pts_off_to",
     ]
     if USE_TRACKING_FEATURES:
         trk = load_player_tracking_stats(
@@ -2440,7 +2498,13 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
                        "trk_catch_shoot_fga", "trk_catch_shoot_fgm",
                        "trk_catch_shoot_fg3a", "trk_catch_shoot_fg3m",
                        "trk_pull_up_fga", "trk_pull_up_fgm", "trk_pull_up_fg3a",
-                       "trk_contested_shots", "trk_uncontested_fga"]
+                       "trk_contested_shots", "trk_uncontested_fga",
+                       # Hustle counting stats (OT-adjusted)
+                       "trk_deflections", "trk_box_outs", "trk_off_box_outs",
+                       "trk_def_box_outs", "trk_loose_balls", "trk_screen_assists",
+                       "trk_secondary_assists", "trk_reb_chances", "trk_reb_chances_off",
+                       "trk_reb_chances_def", "trk_pts_paint", "trk_pts_fast_break",
+                       "trk_pts_off_to"]
     for col in _counting_stats:
         if col in pg.columns:
             pg[f"{col}_reg"] = pg[col] * reg_factor
@@ -2462,6 +2526,17 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
         pg["trk_drives_per_min"] = pg["trk_drives"].fillna(0) / safe_mins
     if "trk_catch_shoot_fg3a" in pg.columns:
         pg["trk_catch_shoot_fg3a_per_min"] = pg["trk_catch_shoot_fg3a"].fillna(0) / safe_mins
+    # Hustle per-minute rates
+    if "trk_deflections" in pg.columns:
+        pg["trk_deflections_per_min"] = pg["trk_deflections"].fillna(0) / safe_mins
+    if "trk_box_outs" in pg.columns:
+        pg["trk_box_outs_per_min"] = pg["trk_box_outs"].fillna(0) / safe_mins
+    if "trk_loose_balls" in pg.columns:
+        pg["trk_loose_balls_per_min"] = pg["trk_loose_balls"].fillna(0) / safe_mins
+    if "trk_reb_chances" in pg.columns:
+        pg["trk_reb_chances_per_min"] = pg["trk_reb_chances"].fillna(0) / safe_mins
+    if "trk_screen_assists" in pg.columns:
+        pg["trk_screen_assists_per_min"] = pg["trk_screen_assists"].fillna(0) / safe_mins
 
     # --- Player rolling features ---
     player_group = ["team", "player_id", "season"] if "season" in pg.columns else ["team", "player_id"]
@@ -2492,13 +2567,26 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
                     "trk_contested_shots_reg", "trk_uncontested_fga_reg",
                     # Tracking per-minute rates
                     "trk_touches_per_min", "trk_drives_per_min",
-                    "trk_catch_shoot_fg3a_per_min"]
+                    "trk_catch_shoot_fg3a_per_min",
+                    # Hustle stats (from BDL)
+                    "trk_deflections_reg", "trk_box_outs_reg",
+                    "trk_off_box_outs_reg", "trk_def_box_outs_reg",
+                    "trk_loose_balls_reg", "trk_screen_assists_reg",
+                    "trk_secondary_assists_reg",
+                    "trk_reb_chances_reg", "trk_reb_chances_off_reg", "trk_reb_chances_def_reg",
+                    "trk_pts_paint_reg", "trk_pts_fast_break_reg", "trk_pts_off_to_reg",
+                    # Hustle per-minute rates
+                    "trk_deflections_per_min", "trk_box_outs_per_min",
+                    "trk_loose_balls_per_min", "trk_reb_chances_per_min",
+                    "trk_screen_assists_per_min"]
     # Last-3-game hot streak features (faster than avg5 for capturing streaks)
     avg3_cols = ["points_reg", "rebounds_reg", "assists_reg", "minutes", "fg3m_reg",
                  "fg3a_reg", "fouls_drawn_reg", "adv_usage_pct",
                  "pts_per_min", "reb_per_min", "ast_per_min", "fg3m_per_min",
                  # Tracking: touches and drives are strong usage signals
-                 "trk_touches_reg", "trk_drives_reg"]
+                 "trk_touches_reg", "trk_drives_reg",
+                 # Hustle: box_outs for rebounds, reb_chances
+                 "trk_box_outs_reg", "trk_reb_chances_reg"]
     for col in rolling_cols:
         if col not in pg.columns:
             continue
@@ -2520,7 +2608,10 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
                 "fga_per_min", "fg3a_per_min", "fta_per_min", "fouls_drawn_per_min",
                 # Tracking EWM (touches and drives most important)
                 "trk_touches_reg", "trk_drives_reg",
-                "trk_catch_shoot_fg3a_reg", "trk_pull_up_fg3a_reg"]
+                "trk_catch_shoot_fg3a_reg", "trk_pull_up_fg3a_reg",
+                # Hustle EWM
+                "trk_deflections_reg", "trk_box_outs_reg",
+                "trk_reb_chances_reg", "trk_screen_assists_reg"]
     for col in ewm_cols:
         if col not in pg.columns:
             continue
@@ -3515,6 +3606,23 @@ FEATURE_GROUPS_FOR_ABLATION: dict[str, list[str]] = {
         "opp_fg3m_allowed_to_pos_avg10", "opp_fg3a_allowed_to_pos_avg10",
         "opp_fg3_pct_allowed_to_pos_avg10", "player_vs_opp_fg3m_delta",
     ],
+    "hustle": [
+        "pre_trk_deflections_avg5", "pre_trk_deflections_avg10",
+        "pre_trk_deflections_per_min_avg5",
+        "pre_trk_loose_balls_avg5",
+        "pre_trk_box_outs_avg3", "pre_trk_box_outs_avg5", "pre_trk_box_outs_avg10",
+        "pre_trk_box_outs_ewm5", "pre_trk_box_outs_per_min_avg5",
+        "pre_trk_off_box_outs_avg5", "pre_trk_def_box_outs_avg5",
+        "pre_trk_reb_chances_avg3", "pre_trk_reb_chances_avg5",
+        "pre_trk_reb_chances_avg10", "pre_trk_reb_chances_ewm5",
+        "pre_trk_reb_chances_per_min_avg5",
+        "pre_trk_reb_chances_off_avg5", "pre_trk_reb_chances_def_avg5",
+        "pre_trk_screen_assists_avg5", "pre_trk_screen_assists_avg10",
+        "pre_trk_screen_assists_per_min_avg5",
+        "pre_trk_secondary_assists_avg5", "pre_trk_secondary_assists_avg10",
+        "pre_trk_pts_paint_avg5", "pre_trk_pts_paint_avg10",
+        "pre_trk_pts_fast_break_avg5", "pre_trk_pts_off_to_avg5",
+    ],
 }
 
 
@@ -3739,6 +3847,10 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             # Per-minute tracking rates
             "pre_trk_touches_per_min_avg5",
             "pre_trk_drives_per_min_avg5",
+            # Hustle stats (from BDL advanced)
+            "pre_trk_deflections_avg5", "pre_trk_deflections_avg10",
+            "pre_trk_deflections_per_min_avg5",
+            "pre_trk_loose_balls_avg5",
         ]
     if USE_BOXSCORE_ADV_FEATURES:
         common += [
@@ -3802,6 +3914,10 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
                 # Drives → paint scoring, pull-up volume → perimeter scoring
                 "pre_trk_pull_up_fga_avg5",
                 "pre_trk_uncontested_fga_avg5",
+                # Scoring breakdown: paint + fast break points
+                "pre_trk_pts_paint_avg5", "pre_trk_pts_paint_avg10",
+                "pre_trk_pts_fast_break_avg5",
+                "pre_trk_pts_off_to_avg5",
             ]
         if two_stage:
             specific.append("pred_minutes")
@@ -3841,6 +3957,19 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
                 "pre_adv_reb_pct_avg5", "pre_adv_reb_pct_avg10",
                 "pre_adv_possessions_avg10",
             ]
+        if USE_TRACKING_FEATURES:
+            specific += [
+                # Box-outs directly predict rebound opportunity creation
+                "pre_trk_box_outs_avg3", "pre_trk_box_outs_avg5", "pre_trk_box_outs_avg10",
+                "pre_trk_box_outs_ewm5",
+                "pre_trk_box_outs_per_min_avg5",
+                "pre_trk_off_box_outs_avg5", "pre_trk_def_box_outs_avg5",
+                # Rebound chances: how many loose boards the player contests
+                "pre_trk_reb_chances_avg3", "pre_trk_reb_chances_avg5",
+                "pre_trk_reb_chances_avg10", "pre_trk_reb_chances_ewm5",
+                "pre_trk_reb_chances_per_min_avg5",
+                "pre_trk_reb_chances_off_avg5", "pre_trk_reb_chances_def_avg5",
+            ]
         if two_stage:
             specific.append("pred_minutes")
     elif target == "assists":
@@ -3866,6 +3995,10 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             specific += [
                 # Passes are the strongest leading indicator for assists
                 "pre_trk_passes_avg5", "pre_trk_passes_avg10",
+                # Screen assists + secondary assists capture playmaking style
+                "pre_trk_screen_assists_avg5", "pre_trk_screen_assists_avg10",
+                "pre_trk_screen_assists_per_min_avg5",
+                "pre_trk_secondary_assists_avg5", "pre_trk_secondary_assists_avg10",
             ]
         if two_stage:
             specific.append("pred_minutes")
@@ -5332,7 +5465,8 @@ def train_market_residual_models(
         resid_std = float(np.std(st_df["actual_value"].to_numpy(dtype=float) - st_df["pred_value"].to_numpy(dtype=float)))
         resid_std = max(resid_std, 0.01)
         z = (st_df["line"].to_numpy(dtype=float) - st_df["pred_value"].to_numpy(dtype=float)) / resid_std
-        p_over_raw = 1.0 - sp_stats.norm.cdf(z)
+        # Use t(df=7) to match inference-time distribution (heavier tails for counting stats)
+        p_over_raw = 1.0 - sp_stats.t.cdf(z, df=7)
         p_under_raw = 1.0 - p_over_raw
         non_push = np.abs(st_df["actual_value"].to_numpy(dtype=float) - st_df["line"].to_numpy(dtype=float)) > 1e-9
         labels_over = (st_df["actual_value"].to_numpy(dtype=float) > st_df["line"].to_numpy(dtype=float)).astype(int)
@@ -5389,7 +5523,8 @@ def train_synthetic_probability_calibrators(
         actual = tv[stat].to_numpy(dtype=float)
         line = tv[line_col].to_numpy(dtype=float)
         resid_std = max(float(np.std(actual - pred)), 0.01)
-        p_over_raw = 1.0 - sp_stats.norm.cdf((line - pred) / resid_std)
+        # Use t(df=7) to match inference-time distribution (heavier tails for counting stats)
+        p_over_raw = 1.0 - sp_stats.t.cdf((line - pred) / resid_std, df=7)
         p_under_raw = 1.0 - p_over_raw
         non_push = np.abs(actual - line) > 1e-9
         labels_over = (actual > line).astype(int)
@@ -5453,7 +5588,9 @@ def _predict_market_residual_adjustment(
     resid = float(model.predict(X_imp)[0])
     if not np.isfinite(resid):
         return 0.0
-    return resid
+    # Clip market residual to ±20% of base prediction (matches OOF residual clip)
+    max_adj = abs(pred_val) * 0.20
+    return float(np.clip(resid, -max_adj, max_adj))
 
 
 # ---------------------------------------------------------------------------
@@ -6400,7 +6537,7 @@ def backtest_prop_edges(
 
         edges = preds_v - lines_v
         z_scores = (lines_v - preds_v) / max(residual_std, 0.01)
-        p_overs = 1.0 - sp_stats.norm.cdf(z_scores)
+        p_overs = 1.0 - sp_stats.t.cdf(z_scores, df=7)
 
         over_mask = p_overs > (BREAKEVEN_PROB + 0.03)
         under_mask = p_overs < (1.0 - BREAKEVEN_PROB - 0.03)
@@ -6642,7 +6779,7 @@ def run_walk_forward_backtest(
             lines_v = synthetic_lines[valid_mask]
 
             z_scores = (lines_v - preds_v) / max(residual_std, 0.01)
-            p_overs = 1.0 - sp_stats.norm.cdf(z_scores)
+            p_overs = 1.0 - sp_stats.t.cdf(z_scores, df=7)
 
             over_mask = p_overs > (BREAKEVEN_PROB + 0.03)
             under_mask = p_overs < (1.0 - BREAKEVEN_PROB - 0.03)
