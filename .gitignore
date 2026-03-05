@@ -9,4 +9,5 @@ analysis/output/models/
 analysis/output/odds_snapshots/
 .odds_api_key
 analysis/output/prop_lines/
+analysis/output/prop_cache/
 scripts/__pycache__/
