@@ -3994,7 +3994,7 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
         if USE_TRACKING_FEATURES:
             specific += [
                 # Passes are the strongest leading indicator for assists
-                "pre_trk_passes_avg5", "pre_trk_passes_avg10",
+                "pre_trk_passes_avg10",
                 # Screen assists + secondary assists capture playmaking style
                 "pre_trk_screen_assists_avg5", "pre_trk_screen_assists_avg10",
                 "pre_trk_screen_assists_per_min_avg5",
@@ -4049,7 +4049,8 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             f"line_available_{target}",
         ]
 
-    return common + specific + market_feats
+    # Deduplicate while preserving order to prevent train/predict feature-name mismatches.
+    return list(dict.fromkeys(common + specific + market_feats))
 
 
 def filter_features(features: list[str], df: pd.DataFrame) -> list[str]:
