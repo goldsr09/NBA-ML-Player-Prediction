@@ -1265,7 +1265,7 @@ def load_player_tracking_stats(
         if not rows:
             _TRACKING_CACHE = pd.DataFrame()
         else:
-            df = pd.DataFrame(rows).drop_duplicates(subset=["game_id", "team", "player_id"], keep="last")
+            df = pd.DataFrame(rows).drop_duplicates(subset=["game_id", "team", "player_id"], keep="first")
             _TRACKING_CACHE = df.reset_index(drop=True)
 
     if _TRACKING_CACHE is None or _TRACKING_CACHE.empty:
