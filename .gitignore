@@ -4,3 +4,9 @@ __pycache__/
 
 # Regenerable API fetch cache (large)
 analysis/output/nba_2025_26_advanced_cache/
+analysis/output/historical_cache/
+analysis/output/models/
+analysis/output/odds_snapshots/
+.odds_api_key
+analysis/output/prop_lines/
+scripts/__pycache__/

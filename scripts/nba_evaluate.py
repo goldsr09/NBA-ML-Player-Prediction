@@ -285,16 +285,21 @@ def evaluate_win_model_comprehensive(
     }
 
     if market_prob is not None:
-        market_pred = (market_prob >= 0.5).astype(int)
-        result["market_comparison"] = market_comparison_table(
-            result,
-            {
-                "accuracy": accuracy_score(y_true, market_pred),
-                "auc": roc_auc_score(y_true, market_prob),
-                "log_loss": log_loss(y_true, np.clip(market_prob, 1e-6, 1 - 1e-6)),
-            },
-        )
-        result["profit_loss"] = profit_loss_simulation(y_true, y_prob, market_prob)
+        valid_market = np.isfinite(market_prob) & np.isfinite(y_true.astype(float))
+        if valid_market.sum() > 0:
+            y_true_m = y_true[valid_market]
+            y_prob_m = y_prob[valid_market]
+            market_prob_m = market_prob[valid_market]
+            market_pred = (market_prob_m >= 0.5).astype(int)
+            result["market_comparison"] = market_comparison_table(
+                result,
+                {
+                    "accuracy": accuracy_score(y_true_m, market_pred),
+                    "auc": roc_auc_score(y_true_m, market_prob_m),
+                    "log_loss": log_loss(y_true_m, np.clip(market_prob_m, 1e-6, 1 - 1e-6)),
+                },
+            )
+            result["profit_loss"] = profit_loss_simulation(y_true_m, y_prob_m, market_prob_m)
 
     if spread is not None and pred_margin is not None and y_margin is not None:
         result["ats"] = ats_accuracy(y_margin, pred_margin, spread)
@@ -316,15 +321,20 @@ def evaluate_total_model_comprehensive(
     }
 
     if market_total is not None:
-        result["over_under"] = over_under_accuracy(y_true, y_pred, market_total)
-        result["market_comparison"] = market_comparison_table(
-            result,
-            {
-                "mae": mean_absolute_error(y_true, market_total),
-                "rmse": np.sqrt(mean_squared_error(y_true, market_total)),
-                "r2": r2_score(y_true, market_total),
-            },
-        )
+        valid_market = np.isfinite(market_total) & np.isfinite(y_true.astype(float)) & np.isfinite(y_pred.astype(float))
+        if valid_market.sum() > 0:
+            y_true_m = y_true[valid_market]
+            y_pred_m = y_pred[valid_market]
+            market_total_m = market_total[valid_market]
+            result["over_under"] = over_under_accuracy(y_true_m, y_pred_m, market_total_m)
+            result["market_comparison"] = market_comparison_table(
+                result,
+                {
+                    "mae": mean_absolute_error(y_true_m, market_total_m),
+                    "rmse": np.sqrt(mean_squared_error(y_true_m, market_total_m)),
+                    "r2": r2_score(y_true_m, market_total_m),
+                },
+            )
 
     return result
 
@@ -467,8 +477,14 @@ def prop_calibration_by_bucket(
         # log loss with clipping
         p_clip = np.clip(p, 1e-6, 1 - 1e-6)
         ll = float(-np.mean(h * np.log(p_clip) + (1 - h) * np.log(1 - p_clip)))
-        total_wagered = len(grp) * 100.0
-        roi = float(grp["pnl"].sum() / total_wagered * 100) if total_wagered > 0 else 0.0
+        if "signal" in grp.columns:
+            wager_mask = grp["signal"] != "NO BET"
+        else:
+            wager_mask = grp["pnl"].notna()
+        n_wagers = int(wager_mask.sum())
+        total_wagered = n_wagers * 100.0
+        pnl_sum = float(grp.loc[wager_mask, "pnl"].sum()) if n_wagers > 0 else 0.0
+        roi = float(pnl_sum / total_wagered * 100) if total_wagered > 0 else 0.0
         results.append({
             "group": group_val,
             "n": int(valid.sum()),

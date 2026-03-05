@@ -98,6 +98,15 @@ python scripts/predict_player_props.py --ablation-market-lines
 # Weekly retrain (fresh models + calibration + market backtest)
 python scripts/predict_player_props.py --weekly-retrain
 
+# Generalized feature group ablation (walk-forward, replaces --ablation-market-lines)
+python scripts/predict_player_props.py --ablation-features
+
+# Daily health report (feature missingness, prediction drift, signal summary)
+python scripts/predict_player_props.py --daily-report [--date YYYYMMDD]
+
+# Deploy gate status (go/no-go checks before publishing signals)
+python scripts/predict_player_props.py --deploy-status [--date YYYYMMDD]
+
 # crontab: every Sunday 3 AM
 # 0 3 * * 0 cd /path/to/NBA && python3 scripts/predict_player_props.py --weekly-retrain
 ```
