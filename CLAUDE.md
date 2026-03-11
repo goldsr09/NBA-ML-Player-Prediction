@@ -98,17 +98,26 @@ python scripts/predict_player_props.py --ablation-market-lines
 # Weekly retrain (fresh models + calibration + market backtest)
 python scripts/predict_player_props.py --weekly-retrain
 
+# Weekly retrain with Optuna tuning + auto feature selection
+python scripts/predict_player_props.py --weekly-retrain --tune --auto-feature-select
+
+# Optuna tuning for daily predictions (uses cached params if available)
+python scripts/predict_player_props.py --tune [--tune-trials 50]
+
 # Generalized feature group ablation (walk-forward, replaces --ablation-market-lines)
 python scripts/predict_player_props.py --ablation-features
+
+# Automated feature group selection (greedy forward selection, walk-forward)
+python scripts/predict_player_props.py --auto-feature-select
 
 # Daily health report (feature missingness, prediction drift, signal summary)
 python scripts/predict_player_props.py --daily-report [--date YYYYMMDD]
 
-# Deploy gate status (go/no-go checks before publishing signals)
+# Deploy gate status (go/no-go checks before publishing signals, shows experiment trend)
 python scripts/predict_player_props.py --deploy-status [--date YYYYMMDD]
 
-# crontab: every Sunday 3 AM
-# 0 3 * * 0 cd /path/to/NBA && python3 scripts/predict_player_props.py --weekly-retrain
+# crontab: every Sunday 3 AM (with tuning + feature selection)
+# 0 3 * * 0 cd /path/to/NBA && python3 scripts/predict_player_props.py --weekly-retrain --tune --auto-feature-select
 ```
 
 ### Key Conventions
@@ -117,6 +126,9 @@ python scripts/predict_player_props.py --deploy-status [--date YYYYMMDD]
 - **Feature naming**: `pre_` prefix = pregame (shifted, no data leakage). `avg5`/`avg10`/`season` = rolling window. `diff_` prefix = home minus away differential.
 - **Chronological splits**: All train/test splits are time-ordered (`chron_split`, `time_series_cv_folds`). Never random splits.
 - **Models are persisted** as joblib files in `analysis/output/models/`.
+- **Optuna tuning**: Tuned hyperparameters cached in `analysis/output/models/prop_tuned_params.json`. Re-tuned during `--weekly-retrain --tune`.
+- **Experiment tracking**: All experiments (ablation, walk-forward, weekly retrain) logged to `analysis/output/prop_logs/experiment_log.csv`.
+- **Feature selection**: Greedy forward-selected feature groups persisted in `analysis/output/models/feature_selection.json`.
 
 ## Dependencies
 

@@ -11,3 +11,21 @@ analysis/output/odds_snapshots/
 analysis/output/prop_lines/
 analysis/output/prop_cache/
 scripts/__pycache__/
+
+# Data files (regenerable)
+analysis/output/*.csv
+analysis/output/*.json
+analysis/output/predictions/
+analysis/output/prop_logs/
+analysis/output/kalshi_logs/
+analysis/output/walk_forward_*.csv
+analysis/output/walk_forward_*.json
+analysis/output/prop_pipeline_audit_*
+
+# Claude Code local config
+.claude/
+scripts/.claude/
+scripts/.*.swp
+
+# Nested scripts data/cache
+scripts/analysis/

@@ -48,6 +48,20 @@ python3 scripts/predict_player_props.py --date YYYYMMDD --enforce-lineup-lock --
 python3 scripts/predict_player_props.py --date YYYYMMDD --asof-utc YYYY-MM-DDTHH:MM:SSZ
 python3 scripts/predict_player_props.py --date YYYYMMDD --force-starter-refresh
 python3 scripts/predict_player_props.py --backtest-market-props --market-backtest-max-dates 60 --record-weekly-market-check --date YYYYMMDD
+python3 scripts/predict_player_props.py --backtest-market-props --market-backtest-fetch-missing --market-backtest-max-dates 60
+python3 scripts/predict_player_props.py --ablation-box-adv --ablation-max-dates 45
+python3 scripts/predict_player_props.py --ablation-market-lines
+python3 scripts/predict_player_props.py --ablation-features
+python3 scripts/predict_player_props.py --date YYYYMMDD --enable-experimental-market-models --market-model-max-dates 120
+python3 scripts/predict_player_props.py --date YYYYMMDD --box-adv-fetch-missing --box-adv-max-fetch 100
+python3 scripts/predict_player_props.py --date YYYYMMDD --keep-doubtful
+python3 scripts/predict_player_props.py --date YYYYMMDD --enable-player-encoding
+python3 scripts/predict_player_props.py --date YYYYMMDD --min-games 25
+python3 scripts/predict_player_props.py --date YYYYMMDD --prop-lines analysis/output/props/lines_YYYYMMDD.csv
+python3 scripts/predict_player_props.py --tune
+python3 scripts/predict_player_props.py --tune --tune-trials 100
+python3 scripts/predict_player_props.py --auto-feature-select
+python3 scripts/predict_player_props.py --migrate-tracking
 ```
 
 ### Kalshi Q4 workflows
@@ -71,6 +85,22 @@ python3 scripts/train_q4_model.py --eval-only
 python3 scripts/fetch_historical_seasons.py
 python3 scripts/fetch_historical_seasons.py --seasons 2023-24 2024-25 --workers 8
 python3 scripts/fetch_historical_seasons.py --seasons 2024-25 --skip-odds
+```
+
+### Supplemental data fetch
+```bash
+python3 scripts/fetch_bdl_tracking.py --seasons 2024 2025
+python3 scripts/fetch_bdl_tracking.py --max-dates 30
+python3 scripts/fetch_bdl_tracking.py --max-dates 30 --dry-run
+python3 scripts/fetch_nba_rotation_matchups.py --max-games 200
+python3 scripts/fetch_nba_defensive_scoring.py
+python3 scripts/fetch_nba_defensive_scoring.py --endpoint defensive --max-games 200
+```
+
+### Player prop model A/B comparison
+```bash
+python3 scripts/ab_compare_prop_models.py
+python3 scripts/ab_compare_prop_models.py --max-dates 45 --bootstrap 2000 --seed 7
 ```
 
 ### Daily props cron pipeline
