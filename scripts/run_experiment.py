@@ -51,50 +51,26 @@ import predict_player_props as props
 EXPERIMENT_CONFIG: dict[str, Any] = {
     # --- XGBoost hyperparameters (applied to all stat targets) ---
     "xgb_params": {
-        "n_estimators": 400,
-        "max_depth": 4,
-        "learning_rate": 0.025,
+        "n_estimators": 500,
+        "max_depth": 5,
+        "learning_rate": 0.02,
         "subsample": 0.7,
         "colsample_bytree": 0.8,
-        "reg_lambda": 10.0,
+        "reg_lambda": 15.0,
         "reg_alpha": 0.1,
         "min_child_weight": 3,
     },
 
-    # --- Override per-target (optional, e.g. "minutes": {...}) ---
+    # --- Override per-target (only target-specific differences) ---
     "xgb_params_by_target": {
-        "minutes": {
-            "n_estimators": 500,
-            "max_depth": 5,
-            "learning_rate": 0.02,
-            "reg_lambda": 15.0,
-        },
         "points": {
-            "n_estimators": 500,
-            "max_depth": 5,
-            "learning_rate": 0.02,
             "reg_lambda": 20.0,
         },
         "fg3m": {
-            "n_estimators": 500,
-            "max_depth": 5,
-            "learning_rate": 0.02,
-            "reg_lambda": 15.0,
-            "min_child_weight": 3,
             "colsample_bytree": 0.7,
         },
         "assists": {
-            "n_estimators": 500,
-            "max_depth": 5,
-            "learning_rate": 0.02,
-            "reg_lambda": 15.0,
             "colsample_bytree": 0.7,
-        },
-        "rebounds": {
-            "n_estimators": 500,
-            "max_depth": 5,
-            "learning_rate": 0.02,
-            "reg_lambda": 15.0,
         },
     },
 
