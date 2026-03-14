@@ -56,7 +56,7 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
         "learning_rate": 0.025,
         "subsample": 0.85,
         "colsample_bytree": 0.8,
-        "reg_lambda": 2.0,
+        "reg_lambda": 5.0,
         "reg_alpha": 0.1,
         "min_child_weight": 3,
     },
