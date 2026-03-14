@@ -65,13 +65,9 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
     "xgb_params_by_target": {
         "minutes": {
             "n_estimators": 500,
-            "max_depth": 4,
-            "learning_rate": 0.03,
-            "subsample": 0.9,
-            "colsample_bytree": 0.85,
-            "reg_lambda": 3.0,
-            "reg_alpha": 0.25,
-            "min_child_weight": 5,
+            "max_depth": 5,
+            "learning_rate": 0.02,
+            "reg_lambda": 15.0,
         },
         "points": {
             "n_estimators": 500,
