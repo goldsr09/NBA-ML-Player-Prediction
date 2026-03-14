@@ -87,6 +87,7 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
             "max_depth": 5,
             "learning_rate": 0.02,
             "reg_lambda": 15.0,
+            "colsample_bytree": 0.7,
         },
         "rebounds": {
             "n_estimators": 500,
