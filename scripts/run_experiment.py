@@ -133,10 +133,6 @@ def custom_features(df: pd.DataFrame) -> pd.DataFrame:
     df["cust_reb_per_min_avg5"] = df["pre_rebounds_avg5"] / mins5
     df["cust_ast_per_min_avg5"] = df["pre_assists_avg5"] / mins5
 
-    # Rest x production interactions
-    df["cust_rest_x_pts"] = df["player_days_rest"] * df["pre_points_avg5"]
-    df["cust_rest_x_min"] = df["player_days_rest"] * df["pre_minutes_avg5"]
-
     # Rebound opportunity: reb chance share x opponent possessions (pace-adjusted)
     df["cust_reb_opportunity"] = df["pre_player_reb_chance_share_avg5"] * df["opp_pre_possessions_avg5"]
 
