@@ -71,6 +71,7 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
         },
         "assists": {
             "colsample_bytree": 0.7,
+            "reg_lambda": 20.0,
         },
         "minutes": {
             "reg_lambda": 20.0,
