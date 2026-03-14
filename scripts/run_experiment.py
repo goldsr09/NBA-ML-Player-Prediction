@@ -88,7 +88,7 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
 
     # --- Additional features to ADD beyond the standard list ---
     # These are column names that must exist in the DataFrame after custom_features()
-    "extra_features": ["cust_pts_per_min_avg5", "cust_reb_per_min_avg5", "cust_ast_per_min_avg5", "cust_reb_opportunity", "cust_blowout_risk"],
+    "extra_features": ["cust_pts_per_min_avg5", "cust_reb_per_min_avg5", "cust_ast_per_min_avg5", "cust_reb_opportunity", "cust_blowout_risk", "cust_pace_adj_pts", "cust_pace_adj_reb"],
 
     # --- Features to REMOVE from the standard list ---
     "remove_features": [],
@@ -137,6 +137,10 @@ def custom_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # Blowout risk: big spread × starter = minutes compression risk
     df["cust_blowout_risk"] = df["abs_spread"] * df["pre_starter_rate"]
+
+    # Pace-adjusted production: per-minute rate × implied game pace
+    df["cust_pace_adj_pts"] = (df["pre_points_avg5"] / mins5) * df["implied_pace"]
+    df["cust_pace_adj_reb"] = (df["pre_rebounds_avg5"] / mins5) * df["implied_pace"]
 
     return df
 
