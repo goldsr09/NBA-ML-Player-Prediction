@@ -73,6 +73,12 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
             "reg_alpha": 0.25,
             "min_child_weight": 5,
         },
+        "points": {
+            "n_estimators": 500,
+            "max_depth": 5,
+            "learning_rate": 0.02,
+            "reg_lambda": 15.0,
+        },
     },
 
     # --- Feature groups to EXCLUDE from the full feature list ---
