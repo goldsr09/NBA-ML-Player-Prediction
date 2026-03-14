@@ -95,7 +95,7 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
 
     # --- Additional features to ADD beyond the standard list ---
     # These are column names that must exist in the DataFrame after custom_features()
-    "extra_features": ["cust_pts_per_min_avg5", "cust_reb_per_min_avg5", "cust_ast_per_min_avg5", "cust_rest_x_pts", "cust_rest_x_min"],
+    "extra_features": ["cust_pts_per_min_avg5", "cust_reb_per_min_avg5", "cust_ast_per_min_avg5"],
 
     # --- Features to REMOVE from the standard list ---
     "remove_features": [],
