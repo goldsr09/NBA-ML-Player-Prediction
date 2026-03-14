@@ -89,7 +89,7 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
 
     # --- Additional features to ADD beyond the standard list ---
     # These are column names that must exist in the DataFrame after custom_features()
-    "extra_features": [],
+    "extra_features": ["cust_pts_per_min_avg5", "cust_reb_per_min_avg5", "cust_ast_per_min_avg5"],
 
     # --- Features to REMOVE from the standard list ---
     "remove_features": [],
@@ -122,6 +122,12 @@ def custom_features(df: pd.DataFrame) -> pd.DataFrame:
         df["my_new_feature"] = df["pre_points_avg5"] * df["pre_minutes_avg5"]
     """
     # --- Add your custom features here ---
+
+    # Per-minute rate features (avg5)
+    mins5 = df["pre_minutes_avg5"].replace(0, np.nan)
+    df["cust_pts_per_min_avg5"] = df["pre_points_avg5"] / mins5
+    df["cust_reb_per_min_avg5"] = df["pre_rebounds_avg5"] / mins5
+    df["cust_ast_per_min_avg5"] = df["pre_assists_avg5"] / mins5
 
     return df
 
