@@ -51,9 +51,9 @@ import predict_player_props as props
 EXPERIMENT_CONFIG: dict[str, Any] = {
     # --- XGBoost hyperparameters (applied to all stat targets) ---
     "xgb_params": {
-        "n_estimators": 500,
+        "n_estimators": 800,
         "max_depth": 5,
-        "learning_rate": 0.02,
+        "learning_rate": 0.015,
         "subsample": 0.7,
         "colsample_bytree": 0.8,
         "reg_lambda": 15.0,
