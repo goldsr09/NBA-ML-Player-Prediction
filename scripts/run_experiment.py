@@ -58,7 +58,7 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
         "colsample_bytree": 0.8,
         "reg_lambda": 15.0,
         "reg_alpha": 0.1,
-        "min_child_weight": 3,
+        "min_child_weight": 5,
     },
 
     # --- Override per-target (only target-specific differences) ---
