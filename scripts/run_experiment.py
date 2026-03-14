@@ -92,6 +92,12 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
             "learning_rate": 0.02,
             "reg_lambda": 15.0,
         },
+        "rebounds": {
+            "n_estimators": 500,
+            "max_depth": 5,
+            "learning_rate": 0.02,
+            "reg_lambda": 15.0,
+        },
     },
 
     # --- Feature groups to EXCLUDE from the full feature list ---
