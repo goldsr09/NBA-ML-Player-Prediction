@@ -79,6 +79,13 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
             "learning_rate": 0.02,
             "reg_lambda": 15.0,
         },
+        "fg3m": {
+            "n_estimators": 500,
+            "max_depth": 3,
+            "learning_rate": 0.02,
+            "reg_lambda": 15.0,
+            "min_child_weight": 5,
+        },
     },
 
     # --- Feature groups to EXCLUDE from the full feature list ---
