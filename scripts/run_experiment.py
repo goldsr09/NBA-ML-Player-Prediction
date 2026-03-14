@@ -84,7 +84,7 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
             "max_depth": 5,
             "learning_rate": 0.02,
             "reg_lambda": 15.0,
-            "min_child_weight": 5,
+            "min_child_weight": 3,
         },
     },
 
