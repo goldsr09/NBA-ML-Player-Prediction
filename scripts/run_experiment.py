@@ -85,7 +85,7 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
     #   vegas_context, recency, distribution, shrinkage, tracking,
     #   implied_vegas, opp_3pt_defense, hustle, defensive_matchup,
     #   scoring_context, rotation, matchups_v3, bref_advanced
-    "exclude_feature_groups": [],
+    "exclude_feature_groups": ["scoring_context"],
 
     # --- Feature groups to INCLUDE (if set, only these groups' features are added) ---
     # Leave empty to use all groups (minus exclusions above).
