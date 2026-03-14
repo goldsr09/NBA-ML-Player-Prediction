@@ -81,7 +81,7 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
         },
         "fg3m": {
             "n_estimators": 500,
-            "max_depth": 4,
+            "max_depth": 5,
             "learning_rate": 0.02,
             "reg_lambda": 15.0,
             "min_child_weight": 5,
