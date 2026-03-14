@@ -10,7 +10,10 @@ analysis/output/odds_snapshots/
 .odds_api_key
 analysis/output/prop_lines/
 analysis/output/prop_cache/
-analysis/output/bref_cache/
+# BRef cache: ignore raw HTML, keep parsed data and CSVs
+analysis/output/bref_cache/*/boxscores/
+analysis/output/bref_cache/*/schedule/*.html
+analysis/output/bref_cache/*/team_stats/
 scripts/__pycache__/
 
 # Data files (regenerable)
