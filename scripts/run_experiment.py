@@ -52,7 +52,7 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
     # --- XGBoost hyperparameters (applied to all stat targets) ---
     "xgb_params": {
         "n_estimators": 400,
-        "max_depth": 5,
+        "max_depth": 4,
         "learning_rate": 0.025,
         "subsample": 0.85,
         "colsample_bytree": 0.8,
