@@ -125,7 +125,7 @@ _BOX_ADV_CACHE: pd.DataFrame | None = None
 _GAME_ROTATION_CACHE: pd.DataFrame | None = None
 _MATCHUPS_CACHE: pd.DataFrame | None = None
 _ESPN_ATHLETE_DISK_CACHE_LOADED = False
-PLAYER_FEATURE_CACHE_VERSION = "v16"  # v16: conversion-regression features, softer star-out boost, line-vs-distribution outputs
+PLAYER_FEATURE_CACHE_VERSION = "v17"  # v17: conversion-regression + BRef advanced stats + stat-side drift correction
 
 
 def _versioned_model_file(stem: str, suffix: str, version: str | None = None) -> Path:
@@ -1353,6 +1353,281 @@ STATS_NBA_TRACKING_URL = "https://stats.nba.com/stats/boxscoreplayertrackv3"
 TRACKING_CACHE_DIR = PROP_CACHE_DIR / "player_tracking_raw"
 _TRACKING_CACHE: pd.DataFrame | None = None
 USE_TRACKING_FEATURES = True
+
+# ---------------------------------------------------------------------------
+# Basketball Reference Advanced Stats (BRef)
+# ---------------------------------------------------------------------------
+BREF_CACHE_DIR = OUT_DIR / "bref_cache"
+USE_BREF_FEATURES = True
+_BREF_GAME_LOGS_CACHE: pd.DataFrame | None = None
+_BREF_OPP_STATS_CACHE: dict[str, dict[str, Any]] | None = None
+
+BREF_ADV_COLS = [
+    "bref_adv_usg_pct",
+    "bref_adv_off_rtg",
+    "bref_adv_def_rtg",
+    "bref_adv_bpm",
+    "bref_adv_ts_pct",
+    "bref_adv_efg_pct",
+    "bref_adv_ast_pct",
+    "bref_adv_trb_pct",
+    "bref_adv_stl_pct",
+    "bref_adv_blk_pct",
+    "bref_adv_orb_pct",
+    "bref_adv_drb_pct",
+    "bref_adv_tov_pct",
+]
+
+# BRef opponent defensive stats to use as per-game features
+BREF_OPP_COLS = [
+    "bref_opp_pts_per_g",
+    "bref_opp_fg_pct",
+    "bref_opp_fg3_pct",
+    "bref_opp_ft_per_g",
+    "bref_opp_trb_per_g",
+    "bref_opp_ast_per_g",
+    "bref_opp_tov_per_g",
+    "bref_opp_stl_per_g",
+    "bref_opp_blk_per_g",
+    # Opponent shooting profile
+    "bref_opp_avg_dist",
+    "bref_opp_pct_fga_3p",
+    "bref_opp_fg_pct_0_3",
+    "bref_opp_fg_pct_16_3pt",
+]
+
+
+def load_bref_player_game_logs(seasons: list[str] | None = None) -> pd.DataFrame:
+    """Load BRef player game logs with advanced stats. Returns DataFrame.
+
+    Joins on game_date_est (YYYYMMDD) + team + normalized player name.
+    Results are cached in memory for the session.
+    """
+    global _BREF_GAME_LOGS_CACHE
+    if _BREF_GAME_LOGS_CACHE is not None:
+        return _BREF_GAME_LOGS_CACHE
+
+    if seasons is None:
+        seasons = ["2021-22", "2022-23", "2023-24", "2024-25"]
+    frames: list[pd.DataFrame] = []
+    for season in seasons:
+        csv_path = BREF_CACHE_DIR / season / "csv" / "player_game_logs.csv"
+        if not csv_path.exists():
+            continue
+        df = pd.read_csv(csv_path)
+        df["season"] = season
+        frames.append(df)
+    if not frames:
+        _BREF_GAME_LOGS_CACHE = pd.DataFrame()
+        return _BREF_GAME_LOGS_CACHE
+
+    df = pd.concat(frames, ignore_index=True)
+
+    # Normalize join keys
+    df["game_date_est"] = df["game_date"].str.replace("-", "", regex=False)
+    df["player_name_norm"] = df["player_name"].apply(
+        lambda n: normalize_player_name(n) if pd.notna(n) else n
+    )
+
+    # Rename BRef advanced columns to our namespace to avoid collisions
+    rename_map = {
+        "adv_usg_pct": "bref_adv_usg_pct",
+        "adv_off_rtg": "bref_adv_off_rtg",
+        "adv_def_rtg": "bref_adv_def_rtg",
+        "adv_bpm": "bref_adv_bpm",
+        "adv_ts_pct": "bref_adv_ts_pct",
+        "adv_efg_pct": "bref_adv_efg_pct",
+        "adv_ast_pct": "bref_adv_ast_pct",
+        "adv_trb_pct": "bref_adv_trb_pct",
+        "adv_stl_pct": "bref_adv_stl_pct",
+        "adv_blk_pct": "bref_adv_blk_pct",
+        "adv_orb_pct": "bref_adv_orb_pct",
+        "adv_drb_pct": "bref_adv_drb_pct",
+        "adv_tov_pct": "bref_adv_tov_pct",
+    }
+    df = df.rename(columns=rename_map)
+
+    _BREF_GAME_LOGS_CACHE = df
+    return _BREF_GAME_LOGS_CACHE
+
+
+def load_bref_opponent_stats(seasons: list[str] | None = None) -> dict[str, dict[str, Any]]:
+    """Load BRef opponent (defensive) stats per team per season.
+
+    Returns {season: {team: {stat: value}}}.
+    Merges opponent_stats.json + opponent_shooting.json.
+    """
+    global _BREF_OPP_STATS_CACHE
+    if _BREF_OPP_STATS_CACHE is not None:
+        return _BREF_OPP_STATS_CACHE
+
+    if seasons is None:
+        seasons = ["2021-22", "2022-23", "2023-24", "2024-25"]
+    result: dict[str, dict[str, Any]] = {}
+    for season in seasons:
+        path = BREF_CACHE_DIR / season / "opponent_stats.json"
+        if path.exists():
+            result[season] = json.loads(path.read_text())
+        opp_shoot_path = BREF_CACHE_DIR / season / "opponent_shooting.json"
+        if opp_shoot_path.exists():
+            opp_shoot = json.loads(opp_shoot_path.read_text())
+            if season not in result:
+                result[season] = {}
+            for team, stats in opp_shoot.items():
+                if team in result[season]:
+                    result[season][team].update(stats)
+                else:
+                    result[season][team] = dict(stats)
+    _BREF_OPP_STATS_CACHE = result
+    return _BREF_OPP_STATS_CACHE
+
+
+def _merge_bref_advanced_stats(pg: pd.DataFrame) -> pd.DataFrame:
+    """Merge BRef advanced stats onto player-game rows.
+
+    Joins on game_date_est + team + normalized player name.
+    Fills NaN values in existing adv_ columns from BRef equivalents,
+    and adds new BRef-only columns (def_rtg, bpm, efg, stl_pct, blk_pct, etc.).
+    """
+    if not USE_BREF_FEATURES:
+        for c in BREF_ADV_COLS:
+            if c not in pg.columns:
+                pg[c] = np.nan
+        return pg
+
+    bref = load_bref_player_game_logs()
+    if bref.empty:
+        print("  BRef: no game logs found, skipping BRef merge.", flush=True)
+        for c in BREF_ADV_COLS:
+            if c not in pg.columns:
+                pg[c] = np.nan
+        return pg
+
+    # Prepare join key on pg side
+    if "game_date_est" not in pg.columns:
+        print("  BRef: game_date_est not in pg, skipping BRef merge.", flush=True)
+        for c in BREF_ADV_COLS:
+            if c not in pg.columns:
+                pg[c] = np.nan
+        return pg
+
+    pg["_bref_date"] = pg["game_date_est"].astype(str).str.replace("-", "", regex=False).str.slice(0, 8)
+    pg["_bref_name"] = pg["player_name"].map(normalize_player_name)
+
+    # Select BRef columns for merge
+    bref_merge_cols = ["game_date_est", "team", "player_name_norm"] + [
+        c for c in BREF_ADV_COLS if c in bref.columns
+    ]
+    bref_slim = bref[bref_merge_cols].drop_duplicates(
+        subset=["game_date_est", "team", "player_name_norm"]
+    ).copy()
+    bref_slim = bref_slim.rename(columns={
+        "game_date_est": "_bref_date",
+        "player_name_norm": "_bref_name",
+    })
+
+    # Merge
+    pg = pg.merge(bref_slim, on=["_bref_date", "team", "_bref_name"], how="left", suffixes=("", "_bref_dup"))
+
+    # Fill NaN in existing adv_ columns from BRef equivalents
+    _fill_map = {
+        "adv_usage_pct": "bref_adv_usg_pct",
+        "adv_off_rating": "bref_adv_off_rtg",
+        "adv_ts_pct": "bref_adv_ts_pct",
+        "adv_ast_pct": "bref_adv_ast_pct",
+        "adv_reb_pct": "bref_adv_trb_pct",
+    }
+    for existing_col, bref_col in _fill_map.items():
+        if existing_col in pg.columns and bref_col in pg.columns:
+            pg[existing_col] = pg[existing_col].fillna(pg[bref_col])
+
+    # Ensure all BRef columns exist
+    for c in BREF_ADV_COLS:
+        if c not in pg.columns:
+            pg[c] = np.nan
+
+    # Clean up temp columns
+    pg.drop(columns=["_bref_date", "_bref_name"], inplace=True, errors="ignore")
+    # Drop any _bref_dup columns from merge collisions
+    bref_dup_cols = [c for c in pg.columns if c.endswith("_bref_dup")]
+    if bref_dup_cols:
+        pg.drop(columns=bref_dup_cols, inplace=True, errors="ignore")
+
+    _bref_avail = pg[BREF_ADV_COLS].notna().any(axis=1).mean() * 100
+    print(f"  Merged BRef advanced stats: {_bref_avail:.0f}% row coverage", flush=True)
+
+    return pg
+
+
+def _merge_bref_opponent_defense(pg: pd.DataFrame) -> pd.DataFrame:
+    """Merge BRef opponent defensive stats as static per-game features.
+
+    Joins on season + opponent team. These are season-level aggregates
+    (e.g., opponent points per game, opponent FG%), so they are the same
+    for every game in a season against that team.
+    """
+    if not USE_BREF_FEATURES:
+        for c in BREF_OPP_COLS:
+            if c not in pg.columns:
+                pg[c] = np.nan
+        return pg
+
+    opp_stats = load_bref_opponent_stats()
+    if not opp_stats:
+        for c in BREF_OPP_COLS:
+            if c not in pg.columns:
+                pg[c] = np.nan
+        return pg
+
+    if "season" not in pg.columns or "opp" not in pg.columns:
+        for c in BREF_OPP_COLS:
+            if c not in pg.columns:
+                pg[c] = np.nan
+        return pg
+
+    # Build a flat DataFrame from the nested dict: season x team -> stats
+    opp_rows: list[dict[str, Any]] = []
+    # Map from BRef stat names to our feature names
+    _stat_rename = {
+        "opp_pts_per_g": "bref_opp_pts_per_g",
+        "opp_fg_pct": "bref_opp_fg_pct",
+        "opp_fg3_pct": "bref_opp_fg3_pct",
+        "opp_ft_per_g": "bref_opp_ft_per_g",
+        "opp_trb_per_g": "bref_opp_trb_per_g",
+        "opp_ast_per_g": "bref_opp_ast_per_g",
+        "opp_tov_per_g": "bref_opp_tov_per_g",
+        "opp_stl_per_g": "bref_opp_stl_per_g",
+        "opp_blk_per_g": "bref_opp_blk_per_g",
+        # From opponent_shooting.json
+        "opp_avg_dist": "bref_opp_avg_dist",
+        "opp_pct_fga_3p": "bref_opp_pct_fga_3p",
+        "opp_fg_pct_0_3": "bref_opp_fg_pct_0_3",
+        "opp_fg_pct_16_3pt": "bref_opp_fg_pct_16_3pt",
+    }
+    for season, teams in opp_stats.items():
+        for team, stats in teams.items():
+            row: dict[str, Any] = {"season": season, "opp": team}
+            for bref_key, feat_name in _stat_rename.items():
+                row[feat_name] = stats.get(bref_key, np.nan)
+            opp_rows.append(row)
+
+    if not opp_rows:
+        for c in BREF_OPP_COLS:
+            if c not in pg.columns:
+                pg[c] = np.nan
+        return pg
+
+    opp_df = pd.DataFrame(opp_rows)
+    pg = pg.merge(opp_df, on=["season", "opp"], how="left")
+
+    for c in BREF_OPP_COLS:
+        if c not in pg.columns:
+            pg[c] = np.nan
+
+    _opp_avail = pg[BREF_OPP_COLS].notna().any(axis=1).mean() * 100
+    print(f"  Merged BRef opponent stats: {_opp_avail:.0f}% row coverage", flush=True)
+
+    return pg
 
 
 def _parse_tracking_payload(payload: dict[str, Any], game_id: str) -> list[dict[str, Any]]:
@@ -3515,6 +3790,10 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
         if c not in pg.columns:
             pg[c] = np.nan
 
+    # --- Load and merge Basketball Reference advanced stats (BRef fallback + new cols) ---
+    print("  Loading BRef advanced stats (usage, efficiency, BPM, defensive rating)...", flush=True)
+    pg = _merge_bref_advanced_stats(pg)
+
     # --- Load and merge Player Tracking stats (touches, drives, catch-and-shoot) ---
     trk_cols = [
         "trk_touches", "trk_drives", "trk_passes",
@@ -3783,7 +4062,13 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
                     "scr_pct_unassisted_2pt", "scr_pct_unassisted_3pt",
                     "scr_pct_fga_2pt", "scr_pct_fga_3pt",
                     "scr_pct_pts_paint", "scr_pct_pts_midrange",
-                    "scr_pct_pts_fastbreak"]
+                    "scr_pct_pts_fastbreak",
+                    # BRef advanced stats — only NEW columns not already covered
+                    # by adv_usage_pct/adv_off_rating/adv_ts_pct/adv_ast_pct/adv_reb_pct
+                    "bref_adv_def_rtg", "bref_adv_bpm", "bref_adv_efg_pct",
+                    "bref_adv_stl_pct", "bref_adv_blk_pct",
+                    "bref_adv_orb_pct", "bref_adv_drb_pct",
+                    "bref_adv_tov_pct"]
     # Last-3-game hot streak features (faster than avg5 for capturing streaks)
     avg3_cols = ["points_reg", "rebounds_reg", "assists_reg", "minutes", "fg3m_reg",
                  "fg3a_reg", "fouls_drawn_reg", "adv_usage_pct",
@@ -3796,7 +4081,9 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
                  "rot_avg_stint_min", "rot_max_stint_min",
                  "mtch_partial_poss_reg", "mtch_fg_pct",
                  # Defensive matchup: recent matchup load
-                 "def_matchup_fga_reg", "def_matchup_fg_pct"]
+                 "def_matchup_fga_reg", "def_matchup_fg_pct",
+                 # BRef: BPM and defensive rating for hot streak detection
+                 "bref_adv_bpm", "bref_adv_def_rtg"]
     for col in rolling_cols:
         if col not in pg.columns:
             continue
@@ -3832,7 +4119,9 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
                 "mtch_partial_poss_reg", "mtch_fg_pct", "mtch_3pt_pct",
                 # Scoring context EWM
                 "scr_pct_assisted_2pt", "scr_pct_unassisted_2pt",
-                "scr_pct_pts_paint", "scr_pct_pts_midrange"]
+                "scr_pct_pts_paint", "scr_pct_pts_midrange",
+                # BRef advanced EWM (only new columns, not redundant with adv_*)
+                "bref_adv_bpm", "bref_adv_def_rtg", "bref_adv_efg_pct"]
     for col in ewm_cols:
         if col not in pg.columns:
             continue
@@ -4493,6 +4782,10 @@ def build_player_features(player_games: pd.DataFrame, team_games: pd.DataFrame,
         pg["opp_ast_allowed_to_pos_avg10_tough_flag"] = np.nan
         pg["opp_fg3m_allowed_to_pos_avg10_tough_flag"] = np.nan
 
+    # --- BRef opponent defensive stats (season-level, joined on season + opp) ---
+    print("  Loading BRef opponent defensive stats...", flush=True)
+    pg = _merge_bref_opponent_defense(pg)
+
     # --- Phase 8: Matchup delta features ---
     # Player's recent average minus what the opponent allows to that position
     if "pre_points_avg10" in pg.columns and "opp_pts_allowed_to_pos_avg10" in pg.columns:
@@ -5027,6 +5320,24 @@ FEATURE_GROUPS_FOR_ABLATION: dict[str, list[str]] = {
         "opp_pts_allowed_to_pos_avg10_tough_flag", "opp_reb_allowed_to_pos_avg10_tough_flag",
         "opp_ast_allowed_to_pos_avg10_tough_flag", "opp_fg3m_allowed_to_pos_avg10_tough_flag",
     ],
+    "bref_advanced": [
+        # BRef player advanced stats — only NEW columns not redundant with adv_*
+        "pre_bref_adv_bpm_avg5", "pre_bref_adv_bpm_avg10", "pre_bref_adv_bpm_ewm5",
+        "pre_bref_adv_bpm_avg3",
+        "pre_bref_adv_def_rtg_avg5", "pre_bref_adv_def_rtg_avg10", "pre_bref_adv_def_rtg_ewm5",
+        "pre_bref_adv_def_rtg_avg3",
+        "pre_bref_adv_efg_pct_avg5", "pre_bref_adv_efg_pct_avg10", "pre_bref_adv_efg_pct_ewm5",
+        "pre_bref_adv_stl_pct_avg5", "pre_bref_adv_stl_pct_avg10",
+        "pre_bref_adv_blk_pct_avg5", "pre_bref_adv_blk_pct_avg10",
+        "pre_bref_adv_orb_pct_avg5", "pre_bref_adv_orb_pct_avg10",
+        "pre_bref_adv_drb_pct_avg5", "pre_bref_adv_drb_pct_avg10",
+        "pre_bref_adv_tov_pct_avg5", "pre_bref_adv_tov_pct_avg10",
+        # BRef opponent defense (season-level)
+        "bref_opp_pts_per_g", "bref_opp_fg_pct", "bref_opp_fg3_pct",
+        "bref_opp_trb_per_g", "bref_opp_ast_per_g", "bref_opp_tov_per_g",
+        "bref_opp_avg_dist", "bref_opp_pct_fga_3p",
+        "bref_opp_fg_pct_0_3", "bref_opp_fg_pct_16_3pt",
+    ],
 }
 
 
@@ -5306,6 +5617,16 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             "pre_adv_pace_avg5", "pre_adv_possessions_avg5",
             "pre_adv_off_rating_avg5", "pre_adv_ts_pct_avg5",
         ]
+    if USE_BREF_FEATURES:
+        common += [
+            # BRef advanced (fills gaps where stats.nba.com data is sparse)
+            "pre_bref_adv_bpm_avg5", "pre_bref_adv_bpm_avg10", "pre_bref_adv_bpm_ewm5",
+            "pre_bref_adv_def_rtg_avg5", "pre_bref_adv_def_rtg_avg10",
+            "pre_bref_adv_efg_pct_avg5",
+            # BRef opponent defense (season-level context)
+            "bref_opp_pts_per_g", "bref_opp_fg_pct", "bref_opp_fg3_pct",
+            "bref_opp_trb_per_g", "bref_opp_ast_per_g",
+        ]
 
     # Target-specific features
     # NOTE: season averages + venue splits (expanding averages) excluded to prevent
@@ -5365,6 +5686,14 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
                 "pre_adv_usage_pct_avg3",
                 "pre_adv_off_rating_avg10",
                 "pre_adv_ts_pct_avg10",
+            ]
+        if USE_BREF_FEATURES:
+            specific += [
+                # BRef: BPM (strong points predictor, not redundant with adv_off_rating)
+                "pre_bref_adv_bpm_avg3",
+                "pre_bref_adv_tov_pct_avg5",  # turnovers reduce scoring
+                # Opponent paint/perimeter defense quality
+                "bref_opp_fg_pct_0_3", "bref_opp_fg_pct_16_3pt",
             ]
         if USE_TRACKING_FEATURES:
             specific += [
@@ -5427,6 +5756,14 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
                 "pre_adv_reb_pct_avg5", "pre_adv_reb_pct_avg10",
                 "pre_adv_possessions_avg10",
             ]
+        if USE_BREF_FEATURES:
+            specific += [
+                # BRef: rebound % breakdown (off/def separate — not redundant with adv_reb_pct total)
+                "pre_bref_adv_orb_pct_avg5", "pre_bref_adv_orb_pct_avg10",
+                "pre_bref_adv_drb_pct_avg5", "pre_bref_adv_drb_pct_avg10",
+                # Opponent rebound context
+                "bref_opp_trb_per_g",
+            ]
         if USE_TRACKING_FEATURES:
             specific += [
                 # Box-outs directly predict rebound opportunity creation
@@ -5471,6 +5808,13 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
                 "pre_adv_ast_pct_avg5", "pre_adv_ast_pct_avg10",
                 "pre_adv_usage_pct_avg3",
             ]
+        if USE_BREF_FEATURES:
+            specific += [
+                # BRef: turnover % (playmaking efficiency — ast_pct redundant with adv_ast_pct)
+                "pre_bref_adv_tov_pct_avg5",
+                # Opponent turnover forcing (more turnovers = fewer assist opportunities for opponent)
+                "bref_opp_tov_per_g",
+            ]
         if USE_TRACKING_FEATURES:
             specific += [
                 # Passes are the strongest leading indicator for assists
@@ -5513,6 +5857,13 @@ def get_feature_list(target: str, two_stage: bool = False, use_market_features: 
             specific += [
                 "pre_adv_usage_pct_avg3",
                 "pre_adv_pace_avg10",
+            ]
+        if USE_BREF_FEATURES:
+            specific += [
+                # BRef: eFG% captures 3pt efficiency better than TS% for this target
+                "pre_bref_adv_efg_pct_avg5", "pre_bref_adv_efg_pct_avg10",
+                # Opponent 3pt defense quality
+                "bref_opp_fg3_pct", "bref_opp_pct_fga_3p",
             ]
         if USE_TRACKING_FEATURES:
             specific += [
@@ -9908,6 +10259,14 @@ def build_player_predictions(
         if c not in pg.columns:
             pg[c] = np.nan
 
+    # Merge BRef advanced stats (same as training path)
+    print("  Loading BRef advanced stats for prediction features...", flush=True)
+    pg = _merge_bref_advanced_stats(pg)
+
+    # Merge BRef opponent defense stats (same as training path)
+    print("  Loading BRef opponent defense for prediction features...", flush=True)
+    pg = _merge_bref_opponent_defense(pg)
+
     # Merge player tracking / scoring / rotation / matchup caches so serve-time features
     # match the training feature space for role and matchup context.
     trk_cols = [
@@ -10269,6 +10628,11 @@ def build_player_predictions(
                     "trk_secondary_assists",
                     "rot_stints", "rot_total_stint_min", "rot_avg_stint_min", "rot_max_stint_min",
                     "mtch_partial_poss", "mtch_fga", "mtch_fg_pct", "mtch_3pa", "mtch_3pt_pct", "mtch_ast", "mtch_pts",
+                    # BRef advanced stats — only NEW (not redundant with adv_*)
+                    "bref_adv_def_rtg", "bref_adv_bpm", "bref_adv_efg_pct",
+                    "bref_adv_stl_pct", "bref_adv_blk_pct",
+                    "bref_adv_orb_pct", "bref_adv_drb_pct",
+                    "bref_adv_tov_pct",
                 ]
                 for col in extra_roll_cols:
                     if col not in p_games.columns:
@@ -10717,6 +11081,33 @@ def build_player_predictions(
 
                 # Step 3: load_x_age now that player_career_games exists
                 row["load_x_age"] = row["season_total_minutes"] * total_career_games
+
+                # BRef opponent defensive stats for the upcoming opponent
+                _bref_opp_data = load_bref_opponent_stats()
+                # Use the latest available season for the opponent
+                _bref_opp_seasons = sorted(_bref_opp_data.keys(), reverse=True) if _bref_opp_data else []
+                _bref_opp_team_stats: dict[str, Any] = {}
+                for _bs in _bref_opp_seasons:
+                    if opp in _bref_opp_data.get(_bs, {}):
+                        _bref_opp_team_stats = _bref_opp_data[_bs][opp]
+                        break
+                _bref_opp_rename = {
+                    "opp_pts_per_g": "bref_opp_pts_per_g",
+                    "opp_fg_pct": "bref_opp_fg_pct",
+                    "opp_fg3_pct": "bref_opp_fg3_pct",
+                    "opp_ft_per_g": "bref_opp_ft_per_g",
+                    "opp_trb_per_g": "bref_opp_trb_per_g",
+                    "opp_ast_per_g": "bref_opp_ast_per_g",
+                    "opp_tov_per_g": "bref_opp_tov_per_g",
+                    "opp_stl_per_g": "bref_opp_stl_per_g",
+                    "opp_blk_per_g": "bref_opp_blk_per_g",
+                    "opp_avg_dist": "bref_opp_avg_dist",
+                    "opp_pct_fga_3p": "bref_opp_pct_fga_3p",
+                    "opp_fg_pct_0_3": "bref_opp_fg_pct_0_3",
+                    "opp_fg_pct_16_3pt": "bref_opp_fg_pct_16_3pt",
+                }
+                for _bref_key, _feat_name in _bref_opp_rename.items():
+                    row[_feat_name] = _bref_opp_team_stats.get(_bref_key, np.nan)
 
                 # Referee crew features (NaN for upcoming games — refs not known pre-game)
                 row["ref_crew_avg_total"] = np.nan

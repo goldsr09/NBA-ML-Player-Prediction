@@ -50,6 +50,22 @@ echo "============================================================"
 echo ""
 
 # ---------------------------------------------------------------------------
+# Step 0: Fetch yesterday's BRef box scores (starters, advanced stats)
+# ---------------------------------------------------------------------------
+YESTERDAY=$(date -v-1d +%Y%m%d 2>/dev/null || date -d "yesterday" +%Y%m%d 2>/dev/null || echo "")
+if [ -n "${YESTERDAY}" ]; then
+    echo "--- Step 0: Fetching BRef box scores for ${YESTERDAY} ---"
+    cd "${SCRIPTS_DIR}"
+    ${PYTHON} fetch_bref_data.py --date "${YESTERDAY}" || {
+        echo "WARNING: BRef fetch for ${YESTERDAY} failed (non-fatal, continuing)"
+    }
+    echo ""
+else
+    echo "--- Step 0: Skipped (could not compute yesterday's date) ---"
+    echo ""
+fi
+
+# ---------------------------------------------------------------------------
 # Step 1: Fetch and cache ESPN prop lines for today
 # ---------------------------------------------------------------------------
 echo "--- Step 1: Fetching prop lines for ${TARGET_DATE} ---"
