@@ -72,6 +72,9 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
         "assists": {
             "colsample_bytree": 0.7,
         },
+        "minutes": {
+            "reg_lambda": 20.0,
+        },
     },
 
     # --- Feature groups to EXCLUDE from the full feature list ---
