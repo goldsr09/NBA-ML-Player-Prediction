@@ -68,6 +68,7 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
         },
         "fg3m": {
             "colsample_bytree": 0.7,
+            "reg_lambda": 20.0,
         },
         "assists": {
             "colsample_bytree": 0.7,
