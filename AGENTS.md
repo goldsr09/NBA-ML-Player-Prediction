@@ -31,6 +31,12 @@ python3 scripts/predict_upcoming_nba.py --date YYYYMMDD --output analysis/output
 python3 scripts/predict_upcoming_nba.py --backtest
 ```
 
+### Full-season analysis pipelines
+```bash
+python3 scripts/analyze_nba_2025_26.py
+python3 scripts/analyze_nba_2025_26_advanced.py
+```
+
 ### Player props workflows
 ```bash
 python3 scripts/predict_player_props.py --date YYYYMMDD --days 1
@@ -64,20 +70,16 @@ python3 scripts/predict_player_props.py --auto-feature-select
 python3 scripts/predict_player_props.py --migrate-tracking
 ```
 
-### Kalshi Q4 workflows
-```bash
-python3 scripts/kalshi_q4_edge.py
-python3 scripts/kalshi_q4_edge.py --watch 60 --log
-python3 scripts/kalshi_q4_edge.py --retrain
-python3 scripts/grade_kalshi_snapshots.py --date YYYYMMDD --save
-python3 scripts/grade_kalshi_snapshots.py --summary
-```
-
 ### Q4 model training
 ```bash
 python3 scripts/train_q4_model.py
 python3 scripts/train_q4_model.py --tune
 python3 scripts/train_q4_model.py --eval-only
+```
+
+### Quarter scoring analysis
+```bash
+python3 scripts/quarter_scoring_analysis.py
 ```
 
 ### Historical season data fetch
@@ -95,12 +97,14 @@ python3 scripts/fetch_bdl_tracking.py --max-dates 30 --dry-run
 python3 scripts/fetch_nba_rotation_matchups.py --max-games 200
 python3 scripts/fetch_nba_defensive_scoring.py
 python3 scripts/fetch_nba_defensive_scoring.py --endpoint defensive --max-games 200
+python3 scripts/fetch_nba_defensive_scoring.py --endpoint scoring --max-games 200
 ```
 
 ### Player prop model A/B comparison
 ```bash
 python3 scripts/ab_compare_prop_models.py
 python3 scripts/ab_compare_prop_models.py --max-dates 45 --bootstrap 2000 --seed 7
+python3 scripts/ab_compare_prop_models.py --max-dates 60 --test-frac 0.3 --bet-size 100
 ```
 
 ### Daily props cron pipeline
@@ -111,3 +115,5 @@ bash scripts/daily_props_cron.sh YYYYMMDD
 
 ## TODO
 - Confirm whether cron-based snapshot scheduling should be documented here or kept only in script output text.
+- Reconfirm Kalshi Q4 workflow docs if `scripts/kalshi_q4_edge.py` and `scripts/grade_kalshi_snapshots.py` are reintroduced.
+- Decide whether `scripts/backtest_feb27_props.py` should be documented as a standard workflow or kept as a one-date archival utility.

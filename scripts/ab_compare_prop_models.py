@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Fixed-window A/B evaluation for player prop model configs.
 
-Compares:
-  - baseline: full feature set, no tuned params
-  - candidate: cached tuned params + cached selected feature groups (if valid)
+By default this compares:
+  - baseline: current feature-cache version, full feature set, no tuned params
+  - candidate: current feature-cache version, tuned params + selected groups (if valid)
 
-The comparison freezes one historical market-line window so both configs are
-evaluated on the same matched rows, with the same signal rules and line data.
+It can also compare two explicit feature-cache versions (for example v15 vs v16)
+on the same historical date window, which is the right way to isolate feature
+engineering changes from tuning changes.
 """
 from __future__ import annotations
 
@@ -25,6 +26,32 @@ import predict_player_props as props
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = PROJECT_ROOT / "analysis" / "output"
 PREDICTIONS_DIR = OUT_DIR / "predictions"
+MODEL_DIR = OUT_DIR / "models"
+
+
+def _versioned_model_file(stem: str, suffix: str, version: str) -> Path:
+    return MODEL_DIR / f"{stem}_{version}{suffix}"
+
+
+def _load_feature_cache_for_version(version: str) -> pd.DataFrame:
+    cache_file = _versioned_model_file("player_features_cache", ".pkl", version)
+    meta_file = _versioned_model_file("player_features_cache_meta", ".json", version)
+    if not cache_file.exists():
+        raise FileNotFoundError(f"Missing feature cache for version {version}: {cache_file}")
+    df = pd.read_pickle(cache_file)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise ValueError(f"Feature cache for version {version} is empty or invalid: {cache_file}")
+    if meta_file.exists():
+        try:
+            meta = json.loads(meta_file.read_text())
+            cache_version = str(meta.get("version", ""))
+            if cache_version and cache_version != version:
+                raise ValueError(
+                    f"Feature cache metadata mismatch for {version}: meta says {cache_version}"
+                )
+        except Exception as exc:
+            raise ValueError(f"Could not validate feature cache metadata for {version}: {exc}") from exc
+    return df
 
 
 def _resolve_targets(df: pd.DataFrame) -> list[str]:
@@ -370,6 +397,38 @@ def _train_bundle(
     }
 
 
+def _date_based_split(
+    player_df: pd.DataFrame,
+    test_frac: float,
+    max_dates: int,
+    fixed_test_dates: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    df = player_df.sort_values("game_time_utc").reset_index(drop=True).copy()
+    date_series = _date_key(df).astype(str)
+    all_dates = sorted(d for d in date_series.dropna().unique() if d)
+    if not all_dates:
+        raise ValueError("No game dates available in feature cache.")
+
+    if fixed_test_dates is None:
+        n_test_dates = max(1, int(round(len(all_dates) * test_frac)))
+        test_dates = all_dates[-n_test_dates:]
+    else:
+        test_dates = [d for d in fixed_test_dates if d in set(all_dates)]
+        if not test_dates:
+            raise ValueError("None of the requested fixed test dates exist in this feature cache.")
+
+    test_dates = sorted(test_dates)
+    if max_dates > 0 and len(test_dates) > max_dates:
+        test_dates = test_dates[-max_dates:]
+
+    first_test_date = test_dates[0]
+    train = df[date_series < first_test_date].copy()
+    test = df[date_series.isin(test_dates)].copy()
+    if train.empty or test.empty:
+        raise ValueError("Date-based split produced empty train or test set.")
+    return train, test, test_dates
+
+
 def _score_bundle(
     name: str,
     bundle: dict[str, Any],
@@ -405,46 +464,77 @@ def run_ab_evaluation(
     bet_size: float,
     n_bootstrap: int,
     seed: int,
+    baseline_feature_version: str | None = None,
+    candidate_feature_version: str | None = None,
+    baseline_use_tuned: bool = False,
+    candidate_use_tuned: bool = False,
+    baseline_use_selected_groups: bool = False,
+    candidate_use_selected_groups: bool = False,
 ) -> dict[str, Any]:
-    schedule_df, team_games, player_games = props.build_team_games_and_players(include_historical=True)
-    game_odds = props.load_game_odds_lookup(schedule_df)
-    ref_features = props.build_referee_game_features(team_games)
-    player_df = props.load_or_build_player_features(
-        player_games,
-        team_games,
-        game_odds,
-        min_games=props.DEFAULT_MIN_GAMES,
-        ref_features=ref_features,
-    )
-    player_df = player_df.sort_values("game_time_utc").reset_index(drop=True)
-    cut = int(len(player_df) * (1.0 - test_frac))
-    train = player_df.iloc[:cut].copy()
-    test = player_df.iloc[cut:].copy()
+    explicit_versions = baseline_feature_version or candidate_feature_version
 
-    test_dates = sorted(_date_key(test).dropna().astype(str).unique())
-    if max_dates > 0 and len(test_dates) > max_dates:
-        test_dates = test_dates[-max_dates:]
-    test = test[_date_key(test).isin(test_dates)].copy()
+    if explicit_versions:
+        baseline_version = baseline_feature_version or props.PLAYER_FEATURE_CACHE_VERSION
+        candidate_version = candidate_feature_version or props.PLAYER_FEATURE_CACHE_VERSION
+        baseline_player_df = _load_feature_cache_for_version(baseline_version)
+        candidate_player_df = _load_feature_cache_for_version(candidate_version)
+        train, test, test_dates = _date_based_split(
+            baseline_player_df,
+            test_frac=test_frac,
+            max_dates=max_dates,
+        )
+        candidate_train, candidate_test, _ = _date_based_split(
+            candidate_player_df,
+            test_frac=test_frac,
+            max_dates=max_dates,
+            fixed_test_dates=test_dates,
+        )
+        baseline_label = f"baseline_{baseline_version}"
+        candidate_label = f"candidate_{candidate_version}"
+    else:
+        schedule_df, team_games, player_games = props.build_team_games_and_players(include_historical=True)
+        game_odds = props.load_game_odds_lookup(schedule_df)
+        ref_features = props.build_referee_game_features(team_games)
+        player_df = props.load_or_build_player_features(
+            player_games,
+            team_games,
+            game_odds,
+            min_games=props.DEFAULT_MIN_GAMES,
+            ref_features=ref_features,
+        )
+        player_df = player_df.sort_values("game_time_utc").reset_index(drop=True)
+        train, test, test_dates = _date_based_split(
+            player_df,
+            test_frac=test_frac,
+            max_dates=max_dates,
+        )
+        baseline_player_df = player_df
+        candidate_player_df = player_df
+        candidate_train = train.copy()
+        candidate_test = test.copy()
+        baseline_label = "baseline"
+        candidate_label = "candidate"
+
     prop_lines = props.load_prop_lines_for_dates(test_dates, fetch_missing=False)
     prop_lines = props._normalize_and_dedupe_prop_lines(prop_lines)
 
     baseline_bundle = _train_bundle(
         train,
-        player_df,
+        baseline_player_df,
         max_dates=max_dates,
-        use_tuned=False,
-        use_selected_groups=False,
+        use_tuned=baseline_use_tuned,
+        use_selected_groups=baseline_use_selected_groups,
     )
     candidate_bundle = _train_bundle(
-        train,
-        player_df,
+        candidate_train,
+        candidate_player_df,
         max_dates=max_dates,
-        use_tuned=True,
-        use_selected_groups=True,
+        use_tuned=candidate_use_tuned,
+        use_selected_groups=candidate_use_selected_groups,
     )
 
-    baseline_df, baseline_summary = _score_bundle("baseline", baseline_bundle, test, prop_lines, bet_size)
-    candidate_df, candidate_summary = _score_bundle("candidate", candidate_bundle, test, prop_lines, bet_size)
+    baseline_df, baseline_summary = _score_bundle(baseline_label, baseline_bundle, test, prop_lines, bet_size)
+    candidate_df, candidate_summary = _score_bundle(candidate_label, candidate_bundle, candidate_test, prop_lines, bet_size)
 
     key_cols = ["game_date_est", "team", "player_name", "stat_type", "prop_line"]
     baseline_core = baseline_df[key_cols + ["signal", "result", "hit", "pnl", "clv_line_pts", "pred_value", "ev_over", "ev_under", "confidence"]].copy()
@@ -498,6 +588,12 @@ def run_ab_evaluation(
             "n_eval_dates": len(test_dates),
             "start_date": test_dates[0] if test_dates else None,
             "end_date": test_dates[-1] if test_dates else None,
+            "baseline_feature_version": baseline_feature_version,
+            "candidate_feature_version": candidate_feature_version,
+            "baseline_use_tuned": baseline_use_tuned,
+            "candidate_use_tuned": candidate_use_tuned,
+            "baseline_use_selected_groups": baseline_use_selected_groups,
+            "candidate_use_selected_groups": candidate_use_selected_groups,
         },
         "baseline": baseline_summary,
         "candidate": candidate_summary,
@@ -526,6 +622,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bet-size", type=float, default=100.0, help="Flat stake per settled signal.")
     p.add_argument("--bootstrap", type=int, default=500, help="Bootstrap iterations for paired deltas.")
     p.add_argument("--seed", type=int, default=42, help="Bootstrap RNG seed.")
+    p.add_argument("--baseline-feature-version", type=str, default=None, help="Explicit baseline feature-cache version (e.g. v15).")
+    p.add_argument("--candidate-feature-version", type=str, default=None, help="Explicit candidate feature-cache version (e.g. v16).")
+    p.add_argument("--baseline-use-tuned", action="store_true", help="Use tuned params for the baseline config.")
+    p.add_argument("--candidate-use-tuned", action="store_true", help="Use tuned params for the candidate config.")
+    p.add_argument("--baseline-use-selected-groups", action="store_true", help="Use selected feature groups for the baseline config.")
+    p.add_argument("--candidate-use-selected-groups", action="store_true", help="Use selected feature groups for the candidate config.")
     return p.parse_args()
 
 
@@ -537,6 +639,12 @@ def main() -> None:
         bet_size=args.bet_size,
         n_bootstrap=args.bootstrap,
         seed=args.seed,
+        baseline_feature_version=args.baseline_feature_version,
+        candidate_feature_version=args.candidate_feature_version,
+        baseline_use_tuned=args.baseline_use_tuned,
+        candidate_use_tuned=args.candidate_use_tuned,
+        baseline_use_selected_groups=args.baseline_use_selected_groups,
+        candidate_use_selected_groups=args.candidate_use_selected_groups,
     )
     print(json.dumps(summary, indent=2, default=str), flush=True)
 
