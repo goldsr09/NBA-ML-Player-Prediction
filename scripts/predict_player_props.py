@@ -12633,6 +12633,7 @@ def run_weekly_retrain(
     game_odds: pd.DataFrame,
     ref_features: pd.DataFrame | None,
     args: argparse.Namespace,
+    player_games: pd.DataFrame | None = None,
 ) -> None:
     """Run weekly retrain: fresh models, calibration report, market-line backtest.
 
@@ -12665,6 +12666,9 @@ def run_weekly_retrain(
     # Weekly retrain loads player_df before entering this branch, so without an explicit rebuild it
     # would train on the in-memory frame and leave no on-disk cache behind for subsequent runs.
     if invalidated_cache or not PLAYER_FEATURE_CACHE_FILE.exists() or not PLAYER_FEATURE_CACHE_META.exists():
+        if player_games is None:
+            print("  Rebuilding player_games for cache rebuild...", flush=True)
+            _, _tg, player_games = build_team_games_and_players(include_historical=True)
         print("  Rebuilding player feature cache...", flush=True)
         player_df = load_or_build_player_features(
             player_games,
@@ -13061,7 +13065,7 @@ def main() -> None:
     # --- Weekly retrain mode ---
     if args.weekly_retrain:
         print("\nRunning weekly retrain...", flush=True)
-        run_weekly_retrain(player_df, schedule_df, team_games, game_odds, ref_features, args)
+        run_weekly_retrain(player_df, schedule_df, team_games, game_odds, ref_features, args, player_games=player_games)
         return
 
     # --- Prediction mode ---
