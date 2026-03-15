@@ -93,7 +93,18 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
 
     # --- Additional features to ADD beyond the standard list ---
     # These are column names that must exist in the DataFrame after custom_features()
-    "extra_features": ["cust_pts_per_min_avg5", "cust_reb_per_min_avg5", "cust_ast_per_min_avg5", "cust_reb_opportunity", "cust_blowout_risk", "cust_pace_adj_pts", "cust_pace_adj_reb", "cust_pace_adj_ast"],
+    "extra_features": [
+        "cust_pts_per_min_avg5", "cust_reb_per_min_avg5", "cust_ast_per_min_avg5",
+        "cust_reb_opportunity", "cust_blowout_risk",
+        "cust_pace_adj_pts", "cust_pace_adj_reb", "cust_pace_adj_ast",
+        # Basketball behavioral decomposition
+        "cust_three_pt_shot_share",   # 3PA/FGA: shot profile volatility
+        "cust_ft_rate",               # FTA/FGA: aggressiveness (scoring floor)
+        "cust_fg_efficiency",         # FGM/FGA: shooting efficiency
+        "cust_role_stability",        # 1 - CV(minutes): role predictability
+        "cust_scoring_ft_share",      # FT points / total points: FT dependency
+        "cust_orb_share",             # ORB/TRB: offensive hustle ratio
+    ],
 
     # --- Features to REMOVE from the standard list ---
     "remove_features": [],
@@ -143,6 +154,46 @@ def custom_features(df: pd.DataFrame) -> pd.DataFrame:
     df["cust_pace_adj_pts"] = (df["pre_points_avg5"] / mins5) * df["implied_pace"]
     df["cust_pace_adj_reb"] = (df["pre_rebounds_avg5"] / mins5) * df["implied_pace"]
     df["cust_pace_adj_ast"] = (df["pre_assists_avg5"] / mins5) * df["implied_pace"]
+
+    # =========================================================================
+    # BASKETBALL BEHAVIORAL DECOMPOSITION
+    # These capture HOW a player generates stats, not just what they averaged.
+    # Trees can't learn ratios natively — they need axis-aligned splits.
+    # =========================================================================
+
+    fga5 = df["pre_fga_avg5"].replace(0, np.nan)
+    reb5 = df["pre_rebounds_avg5"].replace(0, np.nan)
+
+    # Shot profile: what fraction of shots are 3-pointers?
+    # High 3PT share = more volatile scorer (3s are lower percentage, higher variance)
+    # Low 3PT share = paint/midrange scorer (more consistent, FT-dependent)
+    df["cust_three_pt_shot_share"] = df["pre_fg3a_avg5"] / fga5
+
+    # Free throw rate: FTA per FGA — measures aggressiveness/foul-drawing ability
+    # High FT rate = guaranteed scoring floor (FTs are ~78% league avg)
+    # A player who draws 5 FTAs has ~4 "free" points regardless of shooting
+    df["cust_ft_rate"] = df["pre_fta_avg5"] / fga5
+
+    # Field goal efficiency: FGM/FGA — raw shooting percentage
+    # Trees see FGM and FGA separately but can't easily compute their ratio
+    df["cust_fg_efficiency"] = df["pre_fgm_avg5"] / fga5
+
+    # Role stability: how predictable is this player's minutes allocation?
+    # 1 - CV(minutes) where CV = std/mean. High stability = consistent role.
+    # Players with stable roles have more predictable stat lines.
+    mins_avg10 = df["pre_minutes_avg10"].replace(0, np.nan)
+    df["cust_role_stability"] = 1.0 - (df["pre_minutes_std10"] / mins_avg10).clip(0, 2)
+
+    # FT scoring share: what fraction of this player's points come from free throws?
+    # Approximated as (FTA * 0.78) / points. Players with high FT share
+    # have a scoring floor that's insensitive to shooting variance.
+    pts5 = df["pre_points_avg5"].replace(0, np.nan)
+    df["cust_scoring_ft_share"] = (df["pre_fta_avg5"] * 0.78) / pts5
+
+    # Offensive rebound share: ORB / total rebounds
+    # High ORB share = hustle rebounder / center who crashes boards
+    # These players have more volatile rebound totals (ORBs are rarer, higher variance)
+    df["cust_orb_share"] = df["pre_orb_avg5"] / reb5
 
     return df
 
