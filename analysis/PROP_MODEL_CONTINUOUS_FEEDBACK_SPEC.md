@@ -1,7 +1,7 @@
 # Player Prop Model: Continuous Feedback + Deployment Spec
 
 ## Goal
-Ship a production-safe feedback loop for player prop predictions using:
+Ship a production-safe feedback loop for player performance predictions using:
 - immutable decision-time logging,
 - leakage-safe retraining,
 - calibrated probabilities,
@@ -190,7 +190,7 @@ Make model health and data quality observable every day.
 
 ### Implementation
 - Daily monitoring report includes:
-  - hit rate/ROI/CLV by stat and side,
+  - hit rate/Accuracy/MES by stat and side,
   - calibration drift,
   - feature missingness by column,
   - coverage vs thresholds.
@@ -214,7 +214,7 @@ Define pass/fail criteria for paper -> production promotion.
 - Add deploy-status checker with explicit gates:
   - min matched market rows total/per-stat,
   - min settled actionable bets,
-  - positive CLV,
+  - positive market efficiency score,
   - calibration drift below threshold,
   - no severe missingness.
 - Persist status:
@@ -280,5 +280,5 @@ Example cadence:
 ## Definition of Done
 - All 10 phase verification checks pass.
 - 500+ matched market rows total and >=200 per major stat bucket.
-- Multi-week actionable walk-forward shows stable calibration and positive CLV.
+- Multi-week actionable walk-forward shows stable calibration and positive market efficiency score.
 - Deploy status returns pass without manual overrides.

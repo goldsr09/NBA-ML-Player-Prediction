@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Early-line value scanner and CLV (closing line value) tracker.
+"""Early-line value scanner and market efficiency score (market efficiency metric) tracker.
 
-Compares the model's predictions against opening lines to flag value bets,
-then tracks where lines close to measure closing line value -- the single
+Compares the model's predictions against opening lines to flag value predictions,
+then tracks where lines close to measure market efficiency metric -- the single
 best indicator of whether the model has genuine edge.
 
 Usage:
@@ -12,7 +12,7 @@ Usage:
     # Evening: track where lines closed
     python3 scripts/early_line_scanner.py --date 20260227 --track
 
-    # Weekly: check CLV performance
+    # Weekly: check Market efficiency performance
     python3 scripts/early_line_scanner.py --report
 
 Cron setup (add to crontab -e):
@@ -47,7 +47,7 @@ OUT_DIR = PROJECT_ROOT / "analysis" / "output"
 PREDICTIONS_DIR = OUT_DIR / "predictions"
 MODEL_DIR = OUT_DIR / "models"
 SIGNALS_DIR = PREDICTIONS_DIR  # early signals go here
-CLV_TRACKING_PATH = PREDICTIONS_DIR / "clv_tracking.csv"
+MES_TRACKING_PATH = PREDICTIONS_DIR / "efficiency_tracking.csv"
 
 # Ensure scripts dir is on path for imports
 if str(SCRIPTS_DIR) not in sys.path:
@@ -401,7 +401,7 @@ def compute_edges(
         merged.loc[mask_spread, "model_spread"] - merged.loc[mask_spread, "market_spread_open"]
     )
     # A negative spread_edge means model thinks home is MORE favored than market
-    # For betting: we want |edge| > threshold
+    # For prediction: we want |edge| > threshold
 
     # Total edge: model_total vs market_total_open
     merged["total_edge"] = np.nan
@@ -433,7 +433,7 @@ def flag_value_bets(
     df = edges_df.copy()
 
     # Spread signal
-    df["spread_signal"] = "NO BET"
+    df["spread_signal"] = "LOW CONFIDENCE"
     # If model spread is more negative than market (model sees home stronger),
     # bet HOME ATS. If model spread is more positive, bet AWAY ATS.
     spread_edge_abs = df["spread_edge"].abs()
@@ -443,14 +443,14 @@ def flag_value_bets(
     df.loc[mask_away_ats, "spread_signal"] = "AWAY ATS"
 
     # Total signal
-    df["total_signal"] = "NO BET"
+    df["total_signal"] = "LOW CONFIDENCE"
     mask_over = (df["total_edge"] > total_threshold)
     mask_under = (df["total_edge"] < -total_threshold)
     df.loc[mask_over, "total_signal"] = "OVER"
     df.loc[mask_under, "total_signal"] = "UNDER"
 
     # ML signal
-    df["ml_signal"] = "NO BET"
+    df["ml_signal"] = "LOW CONFIDENCE"
     mask_home_ml = (df["ml_edge"] > ml_threshold)
     mask_away_ml = (df["ml_edge"] < -ml_threshold)
     df.loc[mask_home_ml, "ml_signal"] = "HOME ML"
@@ -458,23 +458,23 @@ def flag_value_bets(
 
     # Overall: has at least one signal
     df["has_signal"] = (
-        (df["spread_signal"] != "NO BET")
-        | (df["total_signal"] != "NO BET")
-        | (df["ml_signal"] != "NO BET")
+        (df["spread_signal"] != "LOW CONFIDENCE")
+        | (df["total_signal"] != "LOW CONFIDENCE")
+        | (df["ml_signal"] != "LOW CONFIDENCE")
     )
 
     return df
 
 
 # ---------------------------------------------------------------------------
-# CLV tracking
+# Market efficiency tracking
 # ---------------------------------------------------------------------------
 
-def track_clv(date_str: str) -> pd.DataFrame:
-    """Track closing line value for a date's signals.
+def track_efficiency(date_str: str) -> pd.DataFrame:
+    """Track market efficiency metric for a date's signals.
 
     Loads the morning signals file, fetches closing lines, and computes
-    whether lines moved in the model's direction (CLV).
+    whether lines moved in the model's direction (market efficiency score).
     """
     signals_path = SIGNALS_DIR / f"early_signals_{date_str}.csv"
     if not signals_path.exists():
@@ -524,11 +524,11 @@ def track_clv(date_str: str) -> pd.DataFrame:
             "espn_event_id": str(row.get("espn_event_id", "")),
         }
 
-        # Spread CLV: did the closing line move toward model's position?
+        # Spread market efficiency score: did the closing line move toward model's position?
         spread_open = row.get("market_spread_open")
         spread_close = row.get("market_spread_close")
         model_spread = row.get("model_spread")
-        spread_signal = row.get("spread_signal", "NO BET")
+        spread_signal = row.get("spread_signal", "LOW CONFIDENCE")
 
         r["spread_signal"] = spread_signal
         r["model_spread"] = model_spread
@@ -541,21 +541,21 @@ def track_clv(date_str: str) -> pd.DataFrame:
             # then line moving down (spread_close < spread_open) = moved our way
             model_direction = model_spread - spread_open
             r["spread_line_move"] = spread_move
-            r["spread_clv_moved_our_way"] = int(
+            r["spread_mes_moved_our_way"] = int(
                 (model_direction < 0 and spread_move < 0)
                 or (model_direction > 0 and spread_move > 0)
             ) if abs(model_direction) > 0.5 else np.nan
-            r["spread_clv_points"] = abs(spread_move) if r.get("spread_clv_moved_our_way") == 1 else -abs(spread_move)
+            r["spread_mes_points"] = abs(spread_move) if r.get("spread_mes_moved_our_way") == 1 else -abs(spread_move)
         else:
             r["spread_line_move"] = np.nan
-            r["spread_clv_moved_our_way"] = np.nan
-            r["spread_clv_points"] = np.nan
+            r["spread_mes_moved_our_way"] = np.nan
+            r["spread_mes_points"] = np.nan
 
-        # Total CLV
+        # Total market efficiency score
         total_open = row.get("market_total_open")
         total_close = row.get("market_total_close")
         model_total = row.get("pred_total")
-        total_signal = row.get("total_signal", "NO BET")
+        total_signal = row.get("total_signal", "LOW CONFIDENCE")
 
         r["total_signal"] = total_signal
         r["model_total"] = model_total
@@ -566,21 +566,21 @@ def track_clv(date_str: str) -> pd.DataFrame:
             total_move = total_close - total_open
             model_direction_total = model_total - total_open
             r["total_line_move"] = total_move
-            r["total_clv_moved_our_way"] = int(
+            r["total_mes_moved_our_way"] = int(
                 (model_direction_total > 0 and total_move > 0)
                 or (model_direction_total < 0 and total_move < 0)
             ) if abs(model_direction_total) > 0.5 else np.nan
-            r["total_clv_points"] = abs(total_move) if r.get("total_clv_moved_our_way") == 1 else -abs(total_move)
+            r["total_mes_points"] = abs(total_move) if r.get("total_mes_moved_our_way") == 1 else -abs(total_move)
         else:
             r["total_line_move"] = np.nan
-            r["total_clv_moved_our_way"] = np.nan
-            r["total_clv_points"] = np.nan
+            r["total_mes_moved_our_way"] = np.nan
+            r["total_mes_points"] = np.nan
 
-        # ML CLV
+        # ML market efficiency score
         ml_open = row.get("market_home_prob_open")
         ml_close = row.get("market_home_prob_close")
         model_ml = row.get("model_ml_prob")
-        ml_signal = row.get("ml_signal", "NO BET")
+        ml_signal = row.get("ml_signal", "LOW CONFIDENCE")
 
         r["ml_signal"] = ml_signal
         r["model_ml_prob"] = model_ml
@@ -591,153 +591,153 @@ def track_clv(date_str: str) -> pd.DataFrame:
             ml_move = ml_close - ml_open
             model_direction_ml = model_ml - ml_open
             r["ml_line_move"] = ml_move
-            r["ml_clv_moved_our_way"] = int(
+            r["ml_mes_moved_our_way"] = int(
                 (model_direction_ml > 0 and ml_move > 0)
                 or (model_direction_ml < 0 and ml_move < 0)
             ) if abs(model_direction_ml) > 0.02 else np.nan
         else:
             r["ml_line_move"] = np.nan
-            r["ml_clv_moved_our_way"] = np.nan
+            r["ml_mes_moved_our_way"] = np.nan
 
         results.append(r)
 
     tracking_df = pd.DataFrame(results)
 
-    # Append to cumulative CLV tracking file
-    if CLV_TRACKING_PATH.exists():
-        existing = pd.read_csv(CLV_TRACKING_PATH)
+    # Append to cumulative Market efficiency tracking file
+    if MES_TRACKING_PATH.exists():
+        existing = pd.read_csv(MES_TRACKING_PATH)
         # Remove any existing rows for this date to avoid duplicates
         existing = existing[existing["date"] != date_str]
         tracking_df = pd.concat([existing, tracking_df], ignore_index=True)
 
-    tracking_df.to_csv(CLV_TRACKING_PATH, index=False)
-    print(f"CLV tracking data saved to {CLV_TRACKING_PATH}", flush=True)
+    tracking_df.to_csv(MES_TRACKING_PATH, index=False)
+    print(f"Market efficiency tracking data saved to {MES_TRACKING_PATH}", flush=True)
 
     return tracking_df[tracking_df["date"] == date_str]
 
 
 # ---------------------------------------------------------------------------
-# CLV report
+# Market efficiency report
 # ---------------------------------------------------------------------------
 
-def generate_clv_report() -> None:
-    """Generate a CLV summary report from all historical tracking data."""
-    if not CLV_TRACKING_PATH.exists():
-        print("No CLV tracking data found. Run --track first.", flush=True)
+def generate_efficiency_report() -> None:
+    """Generate a Market efficiency summary report from all historical tracking data."""
+    if not MES_TRACKING_PATH.exists():
+        print("No Market efficiency tracking data found. Run --track first.", flush=True)
         return
 
-    df = pd.read_csv(CLV_TRACKING_PATH)
+    df = pd.read_csv(MES_TRACKING_PATH)
     if df.empty:
-        print("CLV tracking file is empty.", flush=True)
+        print("Market efficiency tracking file is empty.", flush=True)
         return
 
     print("\n" + "=" * 72)
-    print("  CLOSING LINE VALUE (CLV) REPORT")
+    print("  MARKET EFFICIENCY METRIC (market efficiency score) REPORT")
     print("=" * 72)
     print(f"\n  Data covers: {df['date'].min()} to {df['date'].max()}")
     print(f"  Total games tracked: {len(df)}")
     n_dates = df["date"].nunique()
     print(f"  Unique dates: {n_dates}")
 
-    # --- Spread CLV ---
-    spread_games = df[df["spread_signal"] != "NO BET"].copy()
-    spread_with_clv = spread_games.dropna(subset=["spread_clv_moved_our_way"])
-    print(f"\n  --- Spread CLV ---")
+    # --- Spread market efficiency score ---
+    spread_games = df[df["spread_signal"] != "LOW CONFIDENCE"].copy()
+    spread_with_mes = spread_games.dropna(subset=["spread_mes_moved_our_way"])
+    print(f"\n  --- Spread market efficiency score ---")
     print(f"  Games with spread signals: {len(spread_games)}")
-    if not spread_with_clv.empty:
-        n_moved = int(spread_with_clv["spread_clv_moved_our_way"].sum())
-        n_total = len(spread_with_clv)
-        clv_rate = n_moved / n_total * 100
-        avg_clv_pts = spread_with_clv["spread_clv_points"].mean()
-        print(f"  CLV rate (spread): {n_moved}/{n_total} = {clv_rate:.1f}%")
-        print(f"  Average CLV (points): {avg_clv_pts:+.2f}")
-        if clv_rate > 55:
-            print(f"  Assessment: POSITIVE -- beating CLV on spreads")
-        elif clv_rate > 50:
-            print(f"  Assessment: MARGINAL -- near breakeven on CLV")
+    if not spread_with_mes.empty:
+        n_moved = int(spread_with_mes["spread_mes_moved_our_way"].sum())
+        n_total = len(spread_with_mes)
+        mes_rate = n_moved / n_total * 100
+        avg_mes_pts = spread_with_mes["spread_mes_points"].mean()
+        print(f"  Market efficiency rate (spread): {n_moved}/{n_total} = {mes_rate:.1f}%")
+        print(f"  Average market efficiency score (points): {avg_mes_pts:+.2f}")
+        if mes_rate > 55:
+            print(f"  Assessment: POSITIVE -- beating market efficiency score on spreads")
+        elif mes_rate > 50:
+            print(f"  Assessment: MARGINAL -- near breakeven on market efficiency")
         else:
-            print(f"  Assessment: NEGATIVE -- not beating CLV on spreads")
+            print(f"  Assessment: NEGATIVE -- not beating market efficiency score on spreads")
     else:
-        print("  No spread CLV data available.")
+        print("  No spread market efficiency score data available.")
 
-    # --- Total CLV ---
-    total_games = df[df["total_signal"] != "NO BET"].copy()
-    total_with_clv = total_games.dropna(subset=["total_clv_moved_our_way"])
-    print(f"\n  --- Total CLV ---")
+    # --- Total market efficiency score ---
+    total_games = df[df["total_signal"] != "LOW CONFIDENCE"].copy()
+    total_with_mes = total_games.dropna(subset=["total_mes_moved_our_way"])
+    print(f"\n  --- Total market efficiency score ---")
     print(f"  Games with total signals: {len(total_games)}")
-    if not total_with_clv.empty:
-        n_moved = int(total_with_clv["total_clv_moved_our_way"].sum())
-        n_total = len(total_with_clv)
-        clv_rate = n_moved / n_total * 100
-        avg_clv_pts = total_with_clv["total_clv_points"].mean()
-        print(f"  CLV rate (total): {n_moved}/{n_total} = {clv_rate:.1f}%")
-        print(f"  Average CLV (points): {avg_clv_pts:+.2f}")
-        if clv_rate > 55:
-            print(f"  Assessment: POSITIVE -- beating CLV on totals")
-        elif clv_rate > 50:
-            print(f"  Assessment: MARGINAL -- near breakeven on CLV")
+    if not total_with_mes.empty:
+        n_moved = int(total_with_mes["total_mes_moved_our_way"].sum())
+        n_total = len(total_with_mes)
+        mes_rate = n_moved / n_total * 100
+        avg_mes_pts = total_with_mes["total_mes_points"].mean()
+        print(f"  Market efficiency rate (total): {n_moved}/{n_total} = {mes_rate:.1f}%")
+        print(f"  Average market efficiency score (points): {avg_mes_pts:+.2f}")
+        if mes_rate > 55:
+            print(f"  Assessment: POSITIVE -- beating market efficiency score on totals")
+        elif mes_rate > 50:
+            print(f"  Assessment: MARGINAL -- near breakeven on market efficiency")
         else:
-            print(f"  Assessment: NEGATIVE -- not beating CLV on totals")
+            print(f"  Assessment: NEGATIVE -- not beating market efficiency score on totals")
     else:
-        print("  No total CLV data available.")
+        print("  No total market efficiency score data available.")
 
-    # --- ML CLV ---
-    ml_games = df[df["ml_signal"] != "NO BET"].copy()
-    ml_with_clv = ml_games.dropna(subset=["ml_clv_moved_our_way"])
-    print(f"\n  --- Moneyline CLV ---")
+    # --- ML market efficiency score ---
+    ml_games = df[df["ml_signal"] != "LOW CONFIDENCE"].copy()
+    ml_with_mes = ml_games.dropna(subset=["ml_mes_moved_our_way"])
+    print(f"\n  --- Moneyline market efficiency score ---")
     print(f"  Games with ML signals: {len(ml_games)}")
-    if not ml_with_clv.empty:
-        n_moved = int(ml_with_clv["ml_clv_moved_our_way"].sum())
-        n_total = len(ml_with_clv)
-        clv_rate = n_moved / n_total * 100
-        print(f"  CLV rate (ML): {n_moved}/{n_total} = {clv_rate:.1f}%")
-        if clv_rate > 55:
-            print(f"  Assessment: POSITIVE -- beating CLV on moneyline")
-        elif clv_rate > 50:
-            print(f"  Assessment: MARGINAL -- near breakeven on CLV")
+    if not ml_with_mes.empty:
+        n_moved = int(ml_with_mes["ml_mes_moved_our_way"].sum())
+        n_total = len(ml_with_mes)
+        mes_rate = n_moved / n_total * 100
+        print(f"  Market efficiency rate (ML): {n_moved}/{n_total} = {mes_rate:.1f}%")
+        if mes_rate > 55:
+            print(f"  Assessment: POSITIVE -- beating market efficiency score on moneyline")
+        elif mes_rate > 50:
+            print(f"  Assessment: MARGINAL -- near breakeven on market efficiency")
         else:
-            print(f"  Assessment: NEGATIVE -- not beating CLV on moneyline")
+            print(f"  Assessment: NEGATIVE -- not beating market efficiency score on moneyline")
     else:
-        print("  No ML CLV data available.")
+        print("  No ML market efficiency score data available.")
 
-    # --- Overall CLV ---
-    all_clv_cols = ["spread_clv_moved_our_way", "total_clv_moved_our_way", "ml_clv_moved_our_way"]
-    all_clv = []
-    for col in all_clv_cols:
+    # --- Overall market efficiency score ---
+    all_mes_cols = ["spread_mes_moved_our_way", "total_mes_moved_our_way", "ml_mes_moved_our_way"]
+    all_mes = []
+    for col in all_mes_cols:
         if col in df.columns:
             vals = df[col].dropna()
-            all_clv.extend(vals.tolist())
+            all_mes.extend(vals.tolist())
 
-    if all_clv:
-        overall_clv_rate = sum(all_clv) / len(all_clv) * 100
-        print(f"\n  --- Overall CLV (all bet types combined) ---")
-        print(f"  Total signals tracked: {len(all_clv)}")
-        print(f"  Overall CLV rate: {overall_clv_rate:.1f}%")
-        if overall_clv_rate > 55:
-            print(f"\n  >>> GO-LIVE SIGNAL: Model is consistently beating CLV <<<")
-        elif overall_clv_rate > 50:
-            print(f"\n  >>> MARGINAL: Model is near-breakeven on CLV. More data needed. <<<")
+    if all_mes:
+        overall_mes_rate = sum(all_mes) / len(all_mes) * 100
+        print(f"\n  --- Overall market efficiency score (all bet types combined) ---")
+        print(f"  Total signals tracked: {len(all_mes)}")
+        print(f"  Overall Market efficiency rate: {overall_mes_rate:.1f}%")
+        if overall_mes_rate > 55:
+            print(f"\n  >>> GO-LIVE SIGNAL: Model is consistently beating market efficiency score <<<")
+        elif overall_mes_rate > 50:
+            print(f"\n  >>> MARGINAL: Model is near-breakeven on market efficiency score. More data needed. <<<")
         else:
-            print(f"\n  >>> CAUTION: Model is not beating CLV. Reassess before live betting. <<<")
+            print(f"\n  >>> CAUTION: Model is not beating market efficiency score. Reassess model calibration. <<<")
 
     # --- Per-date breakdown ---
     print(f"\n  --- Per-Date Summary ---")
     for date, grp in df.groupby("date"):
         signals = grp[
-            (grp["spread_signal"] != "NO BET")
-            | (grp["total_signal"] != "NO BET")
-            | (grp["ml_signal"] != "NO BET")
+            (grp["spread_signal"] != "LOW CONFIDENCE")
+            | (grp["total_signal"] != "LOW CONFIDENCE")
+            | (grp["ml_signal"] != "LOW CONFIDENCE")
         ]
         n_sig = len(signals)
-        clv_vals = []
-        for col in all_clv_cols:
+        mes_vals = []
+        for col in all_mes_cols:
             if col in grp.columns:
-                clv_vals.extend(grp[col].dropna().tolist())
-        if clv_vals:
-            rate = sum(clv_vals) / len(clv_vals) * 100
-            print(f"    {date}: {n_sig} signals, CLV rate = {rate:.0f}% ({int(sum(clv_vals))}/{len(clv_vals)})")
+                mes_vals.extend(grp[col].dropna().tolist())
+        if mes_vals:
+            rate = sum(mes_vals) / len(mes_vals) * 100
+            print(f"    {date}: {n_sig} signals, Market efficiency rate = {rate:.0f}% ({int(sum(mes_vals))}/{len(mes_vals)})")
         else:
-            print(f"    {date}: {n_sig} signals, no CLV data")
+            print(f"    {date}: {n_sig} signals, no market efficiency score data")
 
     print("=" * 72 + "\n")
 
@@ -748,14 +748,14 @@ def generate_clv_report() -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Early line scanner: compare model predictions to opening lines and track CLV"
+        description="Early line scanner: compare model predictions to opening lines and track market efficiency"
     )
     p.add_argument("--date", type=str, default=None,
                    help="Target date YYYYMMDD (default: today)")
     p.add_argument("--track", action="store_true",
-                   help="Track closing lines and compute CLV for the date's signals")
+                   help="Track closing lines and compute market efficiency score for the date's signals")
     p.add_argument("--report", action="store_true",
-                   help="Generate CLV summary report from all historical tracking data")
+                   help="Generate Market efficiency summary report from all historical tracking data")
     p.add_argument("--spread-threshold", type=float, default=DEFAULT_SPREAD_EDGE_THRESHOLD,
                    help=f"Min spread edge (points) to flag (default: {DEFAULT_SPREAD_EDGE_THRESHOLD})")
     p.add_argument("--total-threshold", type=float, default=DEFAULT_TOTAL_EDGE_THRESHOLD,
@@ -774,13 +774,13 @@ def main() -> None:
 
     # --- Report mode ---
     if args.report:
-        generate_clv_report()
+        generate_efficiency_report()
         return
 
     # --- Track mode ---
     if args.track:
-        print(f"Tracking CLV for {target_date}...", flush=True)
-        tracking = track_clv(target_date)
+        print(f"Tracking market efficiency score for {target_date}...", flush=True)
+        tracking = track_efficiency(target_date)
         if tracking.empty:
             print("No tracking results generated.", flush=True)
             return
@@ -789,20 +789,20 @@ def main() -> None:
         n_games = len(tracking)
         for bet_type in ["spread", "total", "ml"]:
             sig_col = f"{bet_type}_signal"
-            clv_col = f"{bet_type}_clv_moved_our_way"
-            if sig_col not in tracking.columns or clv_col not in tracking.columns:
+            mes_col = f"{bet_type}_mes_moved_our_way"
+            if sig_col not in tracking.columns or mes_col not in tracking.columns:
                 continue
-            signaled = tracking[tracking[sig_col] != "NO BET"]
+            signaled = tracking[tracking[sig_col] != "LOW CONFIDENCE"]
             if signaled.empty:
                 continue
-            with_clv = signaled.dropna(subset=[clv_col])
-            if with_clv.empty:
+            with_mes = signaled.dropna(subset=[mes_col])
+            if with_mes.empty:
                 continue
-            n_moved = int(with_clv[clv_col].sum())
-            n = len(with_clv)
-            print(f"\n  {bet_type.upper()} CLV: {n_moved}/{n} signals saw line move our way ({n_moved/n*100:.0f}%)")
+            n_moved = int(with_mes[mes_col].sum())
+            n = len(with_mes)
+            print(f"\n  {bet_type.upper()} market efficiency score: {n_moved}/{n} signals saw line move our way ({n_moved/n*100:.0f}%)")
 
-        print(f"\nTracking complete. Results in {CLV_TRACKING_PATH}")
+        print(f"\nTracking complete. Results in {MES_TRACKING_PATH}")
         return
 
     # --- Scan mode (default) ---
@@ -841,7 +841,7 @@ def main() -> None:
         print("No edges computed (no game matches). Exiting.", flush=True)
         return
 
-    # Step 5: Flag value bets
+    # Step 5: Flag value predictions
     flagged = flag_value_bets(
         edges,
         spread_threshold=args.spread_threshold,
@@ -877,7 +877,7 @@ def main() -> None:
         spread_open = row.get("market_spread_open")
         model_spread = row.get("model_spread")
         spread_edge = row.get("spread_edge")
-        spread_sig = row.get("spread_signal", "NO BET")
+        spread_sig = row.get("spread_signal", "LOW CONFIDENCE")
         if pd.notna(spread_open) and pd.notna(model_spread):
             print(f"    Spread:  Market={spread_open:+.1f}  Model={model_spread:+.1f}  Edge={spread_edge:+.1f}  -> {spread_sig}")
         else:
@@ -887,7 +887,7 @@ def main() -> None:
         total_open = row.get("market_total_open")
         model_total = row.get("pred_total")
         total_edge = row.get("total_edge")
-        total_sig = row.get("total_signal", "NO BET")
+        total_sig = row.get("total_signal", "LOW CONFIDENCE")
         if pd.notna(total_open) and pd.notna(model_total):
             print(f"    Total:   Market={total_open:.1f}  Model={model_total:.1f}  Edge={total_edge:+.1f}  -> {total_sig}")
         else:
@@ -897,7 +897,7 @@ def main() -> None:
         ml_open = row.get("market_home_prob_open")
         model_ml = row.get("model_ml_prob")
         ml_edge = row.get("ml_edge")
-        ml_sig = row.get("ml_signal", "NO BET")
+        ml_sig = row.get("ml_signal", "LOW CONFIDENCE")
         if pd.notna(ml_open) and pd.notna(model_ml):
             print(f"    ML:      Market={ml_open*100:.1f}%  Model={model_ml*100:.1f}%  Edge={ml_edge*100:+.1f}%  -> {ml_sig}")
         else:
@@ -905,18 +905,18 @@ def main() -> None:
 
     if n_with_signal > 0:
         print(f"\n  {'=' * 40}")
-        print(f"  VALUE BETS ({n_with_signal} games):")
+        print(f"  VALUE PREDICTIONS ({n_with_signal} games):")
         print(f"  {'=' * 40}")
         value_games = flagged[flagged["has_signal"] == True]
         for _, row in value_games.iterrows():
             away = row.get("away_team", "?")
             home = row.get("home_team", "?")
             signals = []
-            if row.get("spread_signal", "NO BET") != "NO BET":
+            if row.get("spread_signal", "LOW CONFIDENCE") != "LOW CONFIDENCE":
                 signals.append(f"{row['spread_signal']} (edge={row['spread_edge']:+.1f}pts)")
-            if row.get("total_signal", "NO BET") != "NO BET":
+            if row.get("total_signal", "LOW CONFIDENCE") != "LOW CONFIDENCE":
                 signals.append(f"{row['total_signal']} (edge={row['total_edge']:+.1f}pts)")
-            if row.get("ml_signal", "NO BET") != "NO BET":
+            if row.get("ml_signal", "LOW CONFIDENCE") != "LOW CONFIDENCE":
                 signals.append(f"{row['ml_signal']} (edge={row['ml_edge']*100:+.1f}%)")
             print(f"    {away} @ {home}: {', '.join(signals)}")
 

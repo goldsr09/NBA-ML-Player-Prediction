@@ -1,6 +1,6 @@
-# autoresearch — NBA Player Props
+# autoresearch — NBA Player Performance Predictions
 
-Autonomous experiment loop for improving NBA player prop prediction models.
+Autonomous experiment loop for improving NBA player performance prediction models.
 
 ## Setup
 
@@ -36,7 +36,7 @@ Once you get confirmation, kick off the experimentation.
 - Install new packages.
 - Modify the evaluation harness in `run_experiment.py` (everything below the "DO NOT EDIT" banner).
 
-**The goal: get the lowest overall_mae.** Secondary goals are higher overall_roi and win_rate, but MAE is the primary metric — it directly measures prediction quality.
+**The goal: get the lowest overall_mae.** Secondary goals are higher overall_accuracy and win_rate, but MAE is the primary metric — it directly measures prediction quality.
 
 **Simplicity criterion**: All else being equal, simpler is better. A tiny MAE improvement that adds ugly complexity is not worth it. Removing something and getting equal or better results is a great outcome. When evaluating whether to keep a change, weigh complexity cost against improvement magnitude. A 0.001 MAE improvement from adding 5 features? Probably keep. A 0.0005 MAE improvement from 30 lines of hacky feature engineering? Probably not.
 
@@ -60,7 +60,7 @@ overall_mae:      4.123456
 overall_r2:       0.234567
 overall_profit:   150.00
 overall_bets:     342
-overall_roi:      4.39
+overall_accuracy:      4.39
 assessment:       GO
 elapsed_seconds:  180.5
 mae_points:       5.678901
@@ -72,7 +72,7 @@ mae_minutes:      6.789012
 
 Extract the key metrics:
 ```
-grep "^overall_mae:\|^overall_roi:\|^assessment:" run.log
+grep "^overall_mae:\|^overall_accuracy:\|^assessment:" run.log
 ```
 
 If grep returns empty, the run crashed. Run `tail -n 50 run.log` to read the error.
@@ -84,19 +84,19 @@ When an experiment is done, log it to `results.tsv` (tab-separated).
 Header and columns:
 
 ```
-commit	overall_mae	overall_roi	status	description
+commit	overall_mae	overall_accuracy	status	description
 ```
 
 1. git commit hash (short, 7 chars)
 2. overall_mae achieved — use 0.000000 for crashes
-3. overall_roi (percentage) — use 0.0 for crashes
+3. overall_accuracy (percentage) — use 0.0 for crashes
 4. status: `keep`, `discard`, or `crash`
 5. short text description of what this experiment tried
 
 Example:
 
 ```
-commit	overall_mae	overall_roi	status	description
+commit	overall_mae	overall_accuracy	status	description
 a1b2c3d	4.123456	4.39	keep	baseline
 b2c3d4e	4.098765	5.12	keep	increase learning_rate to 0.03
 c3d4e5f	4.234567	2.10	discard	exclude injury_context features
@@ -111,7 +111,7 @@ LOOP FOREVER:
 2. Modify `scripts/run_experiment.py` with an experimental idea.
 3. `git commit -am "experiment: <short description>"`
 4. Run the experiment: `python scripts/run_experiment.py > run.log 2>&1`
-5. Read out the results: `grep "^overall_mae:\|^overall_roi:\|^assessment:\|^mae_" run.log`
+5. Read out the results: `grep "^overall_mae:\|^overall_accuracy:\|^assessment:\|^mae_" run.log`
 6. If grep is empty, the run crashed. `tail -n 50 run.log` to debug. Fix if trivial, else skip.
 7. Record the results in `results.tsv` (do NOT commit results.tsv — leave it untracked).
 8. **If overall_mae improved** (lower): keep the commit, this is the new baseline.
@@ -153,7 +153,7 @@ These are ordered roughly by expected impact. Try them in any order, combine ide
 
 ### Signal Tuning
 - Change `signal_buffer` (0.01, 0.02, 0.03, 0.05, 0.07)
-- Note: this affects ROI/win_rate but NOT MAE
+- Note: this affects Accuracy/win_rate but NOT MAE
 
 ### Advanced Ideas
 - Separate configs for each target (e.g., deeper trees for points, shallower for assists)
@@ -169,7 +169,7 @@ These are ordered roughly by expected impact. Try them in any order, combine ide
 - **Build on winners**: After finding something that improves MAE, try variations of that idea.
 - **Don't be afraid to go back to basics**: Sometimes the best move is simplifying.
 - **Check per-target MAE**: An overall improvement might come from just one target. The `mae_*` lines in the output show per-target performance.
-- **Watch for overfitting signals**: If MAE improves dramatically, check that R2 also improves and ROI doesn't tank. Suspicious: MAE drops a lot but ROI goes negative.
+- **Watch for overfitting signals**: If MAE improves dramatically, check that R2 also improves and Accuracy doesn't tank. Suspicious: MAE drops a lot but Accuracy goes negative.
 - **Feature engineering is high-leverage**: The config knobs have diminishing returns. Creative features can unlock bigger improvements.
 
 ## Timeout

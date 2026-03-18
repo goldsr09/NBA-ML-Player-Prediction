@@ -72,7 +72,7 @@ ESPN_SB_CACHE = CACHE_DIR / "espn_scoreboards"
 ESPN_ODDS_CACHE = CACHE_DIR / "espn_odds"
 INJURY_REPORT_CACHE = CACHE_DIR / "injury_reports"
 MODEL_DIR = OUT_DIR / "models"
-MIN_ROI_BETS_PRINT = 20
+MIN_Accuracy_BETS_PRINT = 20
 
 ADV_TEAM_GAMES_CSV = OUT_DIR / "nba_2025_26_advanced_team_games.csv"
 ADV_GAMES_CSV = OUT_DIR / "nba_2025_26_advanced_games.csv"
@@ -1065,7 +1065,7 @@ def fetch_all_espn_odds(events_df: pd.DataFrame, max_workers: int = 16) -> pd.Da
                 print(f"ESPN odds {done}/{len(ids)}" + (f" ({failed} failed)" if failed else ""), flush=True)
             if not payload or not payload.get("items"):
                 continue
-            item = payload["items"][0]  # provider priority 1 typically DraftKings
+            item = payload["items"][0]  # provider priority 1 typically market data provider
             provider = item.get("provider", {})
             close = item.get("close", {}) or {}
             open_ = item.get("open", {}) or {}
@@ -3955,20 +3955,20 @@ def print_results(summary: dict[str, Any], models: dict[str, Any]) -> None:
             if "ats" in w and w["ats"].get("n", 0):
                 print(f"  ATS={w['ats']['accuracy']:.3f} (n={w['ats']['n']})")
             if "profit_loss" in w:
-                pl_rows = [r for r in w["profit_loss"] if r.get("n_bets", 0) >= MIN_ROI_BETS_PRINT]
+                pl_rows = [r for r in w["profit_loss"] if r.get("n_bets", 0) >= MIN_Accuracy_BETS_PRINT]
                 if pl_rows:
-                    best = max(pl_rows, key=lambda r: r.get("roi_pct", -1e9))
+                    best = max(pl_rows, key=lambda r: r.get("accuracy_pct", -1e9))
                     sample_note = ""
                     if best["n_bets"] < 50:
                         sample_note = "  (caution: small sample)"
                     print(
-                        f"  Best simulated ROI threshold={best['edge_threshold']:.0%}: "
-                        f"ROI={best['roi_pct']:+.1f}% on {best['n_bets']} bets{sample_note}"
+                        f"  Best simulated Accuracy threshold={best['edge_threshold']:.0%}: "
+                        f"Accuracy={best['accuracy_pct']:+.1f}% on {best['n_bets']} bets{sample_note}"
                     )
                 else:
                     print(
-                        f"  Best simulated ROI: insufficient sample size "
-                        f"(need >= {MIN_ROI_BETS_PRINT} bets per threshold)"
+                        f"  Best simulated Accuracy: insufficient sample size "
+                        f"(need >= {MIN_Accuracy_BETS_PRINT} bets per threshold)"
                     )
         for key in ["total_market_holdout", "total_market_residual_holdout"]:
             if key in ce:

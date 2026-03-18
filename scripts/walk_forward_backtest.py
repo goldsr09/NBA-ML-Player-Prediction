@@ -420,7 +420,7 @@ def run_single_fold(
                 if pl["n_bets"] > 0:
                     print(f"    Edge>={pl['edge_threshold']:.0%}: "
                           f"{pl['n_bets']} bets, win={pl['win_rate']:.1%}, "
-                          f"P/L=${pl['profit']:+.0f}, ROI={pl['roi_pct']:+.1f}%")
+                          f"P/L=${pl['profit']:+.0f}, Accuracy={pl['accuracy_pct']:+.1f}%")
 
     # Store per-game predictions for further analysis
     result["per_game_predictions"] = {

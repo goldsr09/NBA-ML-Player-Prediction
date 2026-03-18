@@ -9,7 +9,7 @@ Stage 2: Per-stat rate models (points/rebounds/assists/fg3m), each XGB+LGBM stac
           pred_stat ≈ f(features, pred_minutes)
 Stage 3: OOF residual correction (XGB on out-of-fold errors, clipped ±20%)
 Stage 4: Quantile uncertainty (XGB quantile regression at q10/q25/q75/q90)
-Stage 5: Market residual model (adjusts prediction using prop line + odds context)
+Stage 5: Market residual model (adjusts prediction using market line + odds context)
 Stage 6: Probability calibration (isotonic on t-distribution z-scores, per-side)
 ```
 
@@ -73,11 +73,11 @@ Stage 6: Probability calibration (isotonic on t-distribution z-scores, per-side)
 
 ### Tier 3 — New external data sources
 
-**3.1 Prop line movement / steam**
+**3.1 Market line movement / steam**
 - Source: The Odds API (key already exists in `.odds_api_key`)
-- Fetch opening and current lines from DraftKings/FanDuel
+- Fetch opening and current lines from market data provider
 - Features: `line_move_direction` (+1 if line went up, -1 if down), `line_move_magnitude`, `time_since_line_set`
-- Why: Sharp bettors move lines. A line that drops from 24.5 to 22.5 means informed money expects the under. This is the single strongest short-term signal in sports betting. It's essentially a free feature that captures information the model doesn't have (injury intel, lineup decisions, weather, etc.)
+- Why: Informed participants move lines. A line that drops from 24.5 to 22.5 means informed money expects the under. This is the single strongest short-term signal in sports prediction. It's essentially a free feature that captures information the model doesn't have (injury intel, lineup decisions, weather, etc.)
 
 **3.2 DFS consensus projections**
 - Source: FantasyPros, NumberFire, or RotoGrinders (scrape or API)
@@ -163,7 +163,7 @@ Proposed: interpolate between q10/q25/q50/q75/q90 to estimate P(stat > line)
 
 The quantile models already exist and are already trained. They capture the actual conditional distribution shape (including asymmetry, fat tails, zero-inflation) without assuming t-distribution.
 
-Implementation: fit a monotone interpolating spline through the 5 quantile points (q10, q25, q50=median prediction, q75, q90), then evaluate at the prop line value. This gives a nonparametric CDF estimate.
+Implementation: fit a monotone interpolating spline through the 5 quantile points (q10, q25, q50=median prediction, q75, q90), then evaluate at the market line value. This gives a nonparametric CDF estimate.
 
 Benefits:
 - No more CDF mismatch bugs (no parametric assumption at all)
@@ -241,7 +241,7 @@ The quantile IQR (q75 - q25) already gives us this, but an explicit heteroscedas
 4. Evaluate each change independently via walk-forward backtest
 
 ### Phase 4: External data (1-2 sessions)
-1. Fetch prop line movement from The Odds API (opening vs current)
+1. Fetch market line movement from The Odds API (opening vs current)
 2. Derive coach tendency features from historical boxscore data
 3. Wire into feature lists and retrain
 
@@ -249,7 +249,7 @@ The quantile IQR (q75 - q25) already gives us this, but an explicit heteroscedas
 1. Full walk-forward backtest comparing old vs new architecture
 2. Feature ablation on each new feature group
 3. Calibration analysis on new quantile-based probabilities
-4. Profit/loss simulation with historical prop lines
+4. Profit/loss simulation with historical market lines
 
 ---
 
@@ -267,4 +267,4 @@ The quantile IQR (q75 - q25) already gives us this, but an explicit heteroscedas
 | Coach tendencies | +0.5-1% on blowout/rest games | Medium | Medium |
 | BDL season averages (catch-shoot etc.) | +0.5% on fg3m/points | Medium | Low |
 
-The highest-ROI changes: **opponent injuries**, **quantile-based probabilities**, and **line movement**. These address real blind spots in the current system. The architecture changes (direct+two-stage blend, minutes uncertainty) are structural improvements that compound with better data.
+The highest-Accuracy changes: **opponent injuries**, **quantile-based probabilities**, and **line movement**. These address real blind spots in the current system. The architecture changes (direct+two-stage blend, minutes uncertainty) are structural improvements that compound with better data.

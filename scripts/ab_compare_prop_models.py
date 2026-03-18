@@ -166,14 +166,14 @@ def _grade_edges(edges: pd.DataFrame, actual_df: pd.DataFrame, bet_size: float) 
             payout = payout if pd.notna(payout) else props.VIG_FACTOR
             pnl = (payout * bet_size) if result == "WIN" else -bet_size
         else:
-            result = "NO BET"
+            result = "LOW CONFIDENCE"
             hit = np.nan
             pnl = 0.0
 
         open_line = r.get("open_line", np.nan)
-        clv_line = np.nan
+        mes_line = np.nan
         if pd.notna(open_line):
-            clv_line = (line - float(open_line)) if side == "OVER" else (float(open_line) - line)
+            mes_line = (line - float(open_line)) if side == "OVER" else (float(open_line) - line)
 
         rows.append(
             {
@@ -182,7 +182,7 @@ def _grade_edges(edges: pd.DataFrame, actual_df: pd.DataFrame, bet_size: float) 
                 "result": result,
                 "hit": hit,
                 "pnl": round(float(pnl), 2),
-                "clv_line_pts": clv_line,
+                "mes_line_pts": mes_line,
             }
         )
     return pd.DataFrame(rows)
@@ -191,14 +191,14 @@ def _grade_edges(edges: pd.DataFrame, actual_df: pd.DataFrame, bet_size: float) 
 def _summarize_signals(df: pd.DataFrame, bet_size: float) -> dict[str, Any]:
     if df.empty:
         return {"n_matches": 0, "n_signals": 0, "n_settled": 0}
-    sig = df[df["signal"] != "NO BET"].copy()
+    sig = df[df["signal"] != "LOW CONFIDENCE"].copy()
     settled = sig[sig["result"] != "PUSH"].copy()
     n_bets = int(len(settled))
     wins = int(settled["hit"].fillna(0).sum()) if n_bets > 0 else 0
     hit_rate = (wins / n_bets) if n_bets > 0 else np.nan
     pnl = float(settled["pnl"].sum()) if n_bets > 0 else 0.0
-    roi = (100.0 * pnl / (n_bets * bet_size)) if n_bets > 0 else np.nan
-    avg_clv = float(settled["clv_line_pts"].dropna().mean()) if settled["clv_line_pts"].notna().any() else np.nan
+    accuracy = (100.0 * pnl / (n_bets * bet_size)) if n_bets > 0 else np.nan
+    avg_mes = float(settled["mes_line_pts"].dropna().mean()) if settled["mes_line_pts"].notna().any() else np.nan
     per_stat: dict[str, Any] = {}
     for stat, g in settled.groupby("stat_type"):
         stat_bets = len(g)
@@ -208,7 +208,7 @@ def _summarize_signals(df: pd.DataFrame, bet_size: float) -> dict[str, Any]:
             "n_bets": stat_bets,
             "wins": stat_wins,
             "hit_rate": (stat_wins / stat_bets) if stat_bets else np.nan,
-            "roi_pct": (100.0 * stat_pnl / (stat_bets * bet_size)) if stat_bets else np.nan,
+            "accuracy_pct": (100.0 * stat_pnl / (stat_bets * bet_size)) if stat_bets else np.nan,
             "pnl": stat_pnl,
         }
     return {
@@ -217,9 +217,9 @@ def _summarize_signals(df: pd.DataFrame, bet_size: float) -> dict[str, Any]:
         "n_settled": n_bets,
         "wins": wins,
         "hit_rate": hit_rate,
-        "roi_pct": roi,
+        "accuracy_pct": accuracy,
         "pnl": pnl,
-        "avg_clv_line_pts": avg_clv,
+        "avg_mes_line_pts": avg_mes,
         "per_stat": per_stat,
     }
 
@@ -235,15 +235,15 @@ def _summarize_raw_opportunities(df: pd.DataFrame) -> dict[str, Any]:
     )
     best_ev = np.where(best_side == "OVER", df["ev_over"], df["ev_under"])
     best_p = np.where(best_side == "OVER", df["p_over"], df["p_under"])
-    edge_pct = pd.to_numeric(df["edge_pct"], errors="coerce").abs().to_numpy(dtype=float)
+    advantage_pct = pd.to_numeric(df["advantage_pct"], errors="coerce").abs().to_numpy(dtype=float)
     best_ev = pd.to_numeric(pd.Series(best_ev), errors="coerce").to_numpy(dtype=float)
     best_p = pd.to_numeric(pd.Series(best_p), errors="coerce").to_numpy(dtype=float)
     over_mask = (
         (best_side == "OVER")
         & np.isfinite(best_ev)
         & (best_ev > props.MIN_EV_BY_SIDE["OVER"])
-        & np.isfinite(edge_pct)
-        & (edge_pct >= props.MIN_EDGE_PCT_BY_SIDE["OVER"])
+        & np.isfinite(advantage_pct)
+        & (advantage_pct >= props.MIN_ADVANTAGE_PCT_BY_SIDE["OVER"])
         & np.isfinite(best_p)
         & (best_p > props.BREAKEVEN_PROB)
     )
@@ -251,8 +251,8 @@ def _summarize_raw_opportunities(df: pd.DataFrame) -> dict[str, Any]:
         (best_side == "UNDER")
         & np.isfinite(best_ev)
         & (best_ev > props.MIN_EV_BY_SIDE["UNDER"])
-        & np.isfinite(edge_pct)
-        & (edge_pct >= props.MIN_EDGE_PCT_BY_SIDE["UNDER"])
+        & np.isfinite(advantage_pct)
+        & (advantage_pct >= props.MIN_ADVANTAGE_PCT_BY_SIDE["UNDER"])
         & np.isfinite(best_p)
         & (best_p > props.BREAKEVEN_PROB)
     )
@@ -299,9 +299,9 @@ def _bootstrap_deltas(paired: pd.DataFrame, bet_size: float, n_bootstrap: int, s
         return {}
     rng = np.random.default_rng(seed)
     metrics = {
-        "delta_roi_pct": [],
+        "delta_accuracy_pct": [],
         "delta_hit_rate": [],
-        "delta_avg_clv_line_pts": [],
+        "delta_avg_mes_line_pts": [],
         "delta_n_bets": [],
     }
     for _ in range(n_bootstrap):
@@ -311,18 +311,18 @@ def _bootstrap_deltas(paired: pd.DataFrame, bet_size: float, n_bootstrap: int, s
             result_col = f"{side}_result"
             hit_col = f"{side}_hit"
             pnl_col = f"{side}_pnl"
-            clv_col = f"{side}_clv_line_pts"
-            settled = sample[(sample[signal_col] != "NO BET") & (sample[result_col] != "PUSH")].copy()
+            mes_col = f"{side}_mes_line_pts"
+            settled = sample[(sample[signal_col] != "LOW CONFIDENCE") & (sample[result_col] != "PUSH")].copy()
             n_bets = len(settled)
             wins = float(settled[hit_col].fillna(0).sum()) if n_bets else 0.0
             sample[f"_{side}_n_bets"] = n_bets
             sample[f"_{side}_hit_rate"] = (wins / n_bets) if n_bets else np.nan
-            sample[f"_{side}_roi"] = (100.0 * float(settled[pnl_col].sum()) / (n_bets * bet_size)) if n_bets else np.nan
-            sample[f"_{side}_clv"] = float(settled[clv_col].dropna().mean()) if n_bets and settled[clv_col].notna().any() else np.nan
+            sample[f"_{side}_accuracy"] = (100.0 * float(settled[pnl_col].sum()) / (n_bets * bet_size)) if n_bets else np.nan
+            sample[f"_{side}_mes"] = float(settled[mes_col].dropna().mean()) if n_bets and settled[mes_col].notna().any() else np.nan
         metrics["delta_n_bets"].append(float(sample["_candidate_n_bets"].iloc[0] - sample["_baseline_n_bets"].iloc[0]))
         metrics["delta_hit_rate"].append(float(sample["_candidate_hit_rate"].iloc[0] - sample["_baseline_hit_rate"].iloc[0]))
-        metrics["delta_roi_pct"].append(float(sample["_candidate_roi"].iloc[0] - sample["_baseline_roi"].iloc[0]))
-        metrics["delta_avg_clv_line_pts"].append(float(sample["_candidate_clv"].iloc[0] - sample["_baseline_clv"].iloc[0]))
+        metrics["delta_accuracy_pct"].append(float(sample["_candidate_accuracy"].iloc[0] - sample["_baseline_accuracy"].iloc[0]))
+        metrics["delta_avg_mes_line_pts"].append(float(sample["_candidate_mes"].iloc[0] - sample["_baseline_mes"].iloc[0]))
 
     out: dict[str, Any] = {}
     for name, values in metrics.items():
@@ -441,7 +441,7 @@ def _score_bundle(
         predicted[f"pred_{target}"] = props.predict_prop(imp, model, feats, test_df)
 
     pred_df = _build_prediction_frame(test_df, predicted)
-    edges = props.compute_prop_edges(
+    edges = props.compute_prediction_advantages(
         pred_df,
         prop_lines,
         bundle["residual_stds"],
@@ -537,8 +537,8 @@ def run_ab_evaluation(
     candidate_df, candidate_summary = _score_bundle(candidate_label, candidate_bundle, candidate_test, prop_lines, bet_size)
 
     key_cols = ["game_date_est", "team", "player_name", "stat_type", "prop_line"]
-    baseline_core = baseline_df[key_cols + ["signal", "result", "hit", "pnl", "clv_line_pts", "pred_value", "ev_over", "ev_under", "confidence"]].copy()
-    candidate_core = candidate_df[key_cols + ["signal", "result", "hit", "pnl", "clv_line_pts", "pred_value", "ev_over", "ev_under", "confidence"]].copy()
+    baseline_core = baseline_df[key_cols + ["signal", "result", "hit", "pnl", "mes_line_pts", "pred_value", "ev_over", "ev_under", "confidence"]].copy()
+    candidate_core = candidate_df[key_cols + ["signal", "result", "hit", "pnl", "mes_line_pts", "pred_value", "ev_over", "ev_under", "confidence"]].copy()
     paired = baseline_core.merge(
         candidate_core,
         on=key_cols,
@@ -556,8 +556,8 @@ def run_ab_evaluation(
             "hit_candidate": "candidate_hit",
             "pnl_baseline": "baseline_pnl",
             "pnl_candidate": "candidate_pnl",
-            "clv_line_pts_baseline": "baseline_clv_line_pts",
-            "clv_line_pts_candidate": "candidate_clv_line_pts",
+            "mes_line_pts_baseline": "baseline_mes_line_pts",
+            "mes_line_pts_candidate": "candidate_mes_line_pts",
             "pred_value_baseline": "baseline_pred_value",
             "pred_value_candidate": "candidate_pred_value",
             "confidence_baseline": "baseline_confidence",
@@ -600,8 +600,8 @@ def run_ab_evaluation(
         "paired": {
             "n_rows": int(len(paired)),
             "signal_changed": int(paired["signal_changed"].sum()) if not paired.empty else 0,
-            "baseline_signals": int((paired["baseline_signal"] != "NO BET").sum()) if not paired.empty else 0,
-            "candidate_signals": int((paired["candidate_signal"] != "NO BET").sum()) if not paired.empty else 0,
+            "baseline_signals": int((paired["baseline_signal"] != "LOW CONFIDENCE").sum()) if not paired.empty else 0,
+            "candidate_signals": int((paired["candidate_signal"] != "LOW CONFIDENCE").sum()) if not paired.empty else 0,
         },
         "bootstrap_deltas": bootstrap,
         "artifacts": {

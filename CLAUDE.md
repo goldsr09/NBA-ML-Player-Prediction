@@ -44,7 +44,7 @@ This is the core module (~1200 lines). All other modules import from it. It cont
 - **`nba_evaluate.py`** — Standalone evaluation metrics (Brier score, calibration, ATS, O/U, profit/loss simulation, market comparison, prop calibration by bucket). Imported by the advanced script and predict_player_props.
 - **`fetch_historical_seasons.py`** — Standalone historical data fetcher with its own caching. Fetches boxscores + ESPN odds for past seasons into `analysis/output/historical_cache/`.
 - **`predict_upcoming_nba.py`** — Prediction pipeline: loads/retrains models, fetches upcoming schedule, generates daily CSV predictions to `analysis/output/predictions/`.
-- **`predict_player_props.py`** — Player prop prediction pipeline with feedback loop (see below).
+- **`predict_player_props.py`** — Player performance prediction pipeline with feedback loop (see below).
 
 ### Data Flow
 
@@ -68,16 +68,16 @@ predict_player_props.py feedback loop:
   --weekly-retrain → fresh models + calibration check + market backtest
 ```
 
-### Player Props Feedback Loop
+### Player Performance Predictions Feedback Loop
 
-The prop prediction pipeline has a 4-phase feedback loop:
+The player prediction pipeline has a 4-phase feedback loop:
 
-1. **Canonical Results** (`prop_results_history.csv`): Every prediction (signal + NO BET) is saved with decision-time features, line snapshots, and model outputs. Actuals filled post-game via `--grade-results`.
-2. **Calibration Monitoring** (`--calibration-report`): Rolling metrics by stat_type, confidence, edge bucket. Alerts on miscalibration (gap > 8%), degraded Brier (> 0.30), or poor ROI (< -8%). Auto-suppresses signals for degraded stat types.
-3. **Market Line Features**: Opening prop lines used as training features (NaN-safe for XGBoost). `--ablation-market-lines` validates improvement.
+1. **Canonical Results** (`prop_results_history.csv`): Every prediction (signal + LOW CONFIDENCE) is saved with decision-time features, line snapshots, and model outputs. Actuals filled post-game via `--grade-results`.
+2. **Calibration Monitoring** (`--calibration-report`): Rolling metrics by stat_type, confidence, edge bucket. Alerts on miscalibration (gap > 8%), degraded Brier (> 0.30), or poor Accuracy (< -8%). Auto-suppresses signals for degraded stat types.
+3. **Market Line Features**: Opening market lines used as training features (NaN-safe for XGBoost). `--ablation-market-lines` validates improvement.
 4. **OOF Residual Model**: Stage 3 model trained on out-of-fold residuals, corrections clipped to ±20% of base prediction.
 
-#### Player Props CLI Flags
+#### Player Performance Predictions CLI Flags
 
 ```bash
 # Daily predictions (unchanged)

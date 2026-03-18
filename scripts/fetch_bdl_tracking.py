@@ -35,7 +35,7 @@ TRACKING_CACHE_DIR = PROP_CACHE_DIR / "player_tracking_raw"
 HISTORICAL_CACHE = OUT_DIR / "historical_cache"
 CURRENT_SEASON_CACHE = OUT_DIR / "nba_2025_26_advanced_cache" / "boxscores"
 
-BDL_API_KEY = os.environ.get("BDL_API_KEY", "c85c9504-b1a4-43e7-ae71-7ca6be2eb3fb")
+BDL_API_KEY = os.environ.get("BDL_API_KEY", "")
 BDL_BASE = "https://api.balldontlie.io"
 BDL_SLEEP = 0.12  # ~500 req/min to stay safe under 600/min limit
 

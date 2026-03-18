@@ -1,4 +1,4 @@
-# Player Props Pipeline — Improvement Spec
+# Player Performance Predictions Pipeline — Improvement Spec
 
 **Scope**: `predict_player_props.py` (~9235 lines) and its supporting infrastructure.
 **Date**: 2026-03-04
@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-The props pipeline is already highly sophisticated — multi-stage modeling, OOF residual correction, quantile uncertainty, per-side calibration, market residual models, and a 10-phase feedback loop. The improvements below target the remaining gaps that would yield the highest marginal ROI, organized by category.
+The props pipeline is already highly sophisticated — multi-stage modeling, OOF residual correction, quantile uncertainty, per-side calibration, market residual models, and a 10-phase feedback loop. The improvements below target the remaining gaps that would yield the highest marginal Accuracy, organized by category.
 
 ---
 
@@ -24,7 +24,7 @@ The props pipeline is already highly sophisticated — multi-stage modeling, OOF
 - No deduplication across sources — if both ESPN and a manual CSV provide lines for the same player/stat, both are used.
 
 **Recommendations**:
-1. **Add The Odds API as a second source** — it covers all major books (DraftKings, FanDuel, BetMGM) with consistent JSON. Store raw payloads in `prop_cache/odds_api/` keyed by date/book. Merge using `normalize_player_name()` + stat_type as join key. When both sources have the same prop, prefer the one with tighter vig.
+1. **Add The Odds API as a second source** — it covers all major books (market data provider, market data provider, market data provider) with consistent JSON. Store raw payloads in `prop_cache/odds_api/` keyed by date/book. Merge using `normalize_player_name()` + stat_type as join key. When both sources have the same prop, prefer the one with tighter vig.
 2. **Exponential backoff retry on fetch failures** — wrap the ESPN pagination loop in a retry decorator (max 3 attempts, 5/15/45 second delays). Log partial fetches to `prop_logs/fetch_failures.csv` for monitoring.
 3. **Batch pre-warm athlete ID cache** — on first daily run, pre-resolve all expected players for the slate in a single pass rather than one-by-one API fallback. Reduces first-run latency.
 4. **Add combo props (PRA, P+R, P+A)** — these are the highest-volume prop markets. Model PRA as `pred_points + pred_rebounds + pred_assists` with a correlation-adjusted std (see §3.5).
@@ -58,7 +58,7 @@ The props pipeline is already highly sophisticated — multi-stage modeling, OOF
 | **Pace-adjusted per-minute rates** | Current `pts_per_min` doesn't account for team pace; a 0.7 pts/min on a 95-pace team ≠ 0.7 on a 110-pace team | Medium — improves rebounds, assists models |
 | **Opponent 3PA/3P% defense** | Missing from `opp_positional_defense`. Opponents that allow high 3PA inflate fg3m | High for fg3m prop |
 | **Player-vs-team historical matchup** | Rolling average of player performance against specific opponent (last 4 meetings) | Medium — captures stylistic matchups |
-| **DFS ownership/salary as market sentiment** | High correlation with minutes and usage; available from DraftKings/FanDuel | Medium |
+| **DFS ownership/salary as market sentiment** | High correlation with minutes and usage; available from market data provider | Medium |
 | **Game script proxy** | Expected blowout direction × starter status. Currently `blowout_risk` is magnitude-only; direction matters for who plays Q4 | Medium for minutes model |
 | **Second-half scoring share** | Some players are Q3/Q4 scorers; if a blowout is expected, their output drops disproportionately | Medium for points |
 | **Travel distance** | Available in the monolith via `haversine_miles()` + `TEAM_COORDS` but not wired into player features | Low-Medium |
@@ -121,7 +121,7 @@ The props pipeline is already highly sophisticated — multi-stage modeling, OOF
 
 **Recommendations**:
 1. **Use Q10/Q90 directly for tail risk gating** — if `Q10 > prop_line`, that's a strong OVER signal (90% probability). If `Q90 < prop_line`, strong UNDER. This is a non-parametric confidence check that doesn't rely on distributional assumptions.
-2. **Non-parametric P(over) from quantile position** — the function `predict_quantile_std()` already computes `p_over_nonparam` but it's returned as NaN when unavailable. Wire it into `compute_prop_edges()` as a blending input with the t-distribution P(over).
+2. **Non-parametric P(over) from quantile position** — the function `predict_quantile_std()` already computes `p_over_nonparam` but it's returned as NaN when unavailable. Wire it into `compute_prediction_advantages()` as a blending input with the t-distribution P(over).
 3. **Stat-specific tail behavior** — fg3m and rebounds have discrete distributions (0, 1, 2, 3...). Consider ordinal regression or Poisson regression for these targets instead of continuous quantile regression.
 
 ### 3.4 Residual Model (Stage 3) Scope
@@ -152,7 +152,7 @@ Estimate covariance from OOF residuals. This is a high-volume market with relati
 ### 4.1 Probability Model Assumptions
 **Current**: Uses `t(df=7)` distribution for all stats (line 5221).
 **Problem**: df=7 was chosen as a universal compromise. Points (roughly normal) don't need heavy tails. fg3m (discrete, zero-inflated) needs heavier tails or a different distribution entirely. Rebounds and assists are somewhere in between.
-**Recommendation**: **Per-stat degrees of freedom** — fit df from historical OOF residuals per stat type. Likely: points→df=15, rebounds→df=8, assists→df=7, fg3m→df=5. Note: this is lower ROI than fixing probability saturation (§4.5) — saturated calibrated probs are a more urgent source of miscalibration than the t-distribution df choice.
+**Recommendation**: **Per-stat degrees of freedom** — fit df from historical OOF residuals per stat type. Likely: points→df=15, rebounds→df=8, assists→df=7, fg3m→df=5. Note: this is lower Accuracy than fixing probability saturation (§4.5) — saturated calibrated probs are a more urgent source of miscalibration than the t-distribution df choice.
 
 ### 4.2 Signal Threshold Asymmetry
 **Current**: OVER requires 20% edge, UNDER requires 15% (line 173-176). `SUPPRESS_LEAN_OVER = True`.
@@ -160,14 +160,14 @@ Estimate covariance from OOF residuals. This is a high-volume market with relati
 **Recommendation**: **Context-dependent OVER gating** — instead of blanket suppression, create a lightweight classifier that predicts OVER signal reliability from features: `confirmed_starter`, `injury_unavailability_prob`, `opp_def_rating`, `minutes_avg5`. Allow LEAN OVER when the classifier predicts >60% reliability.
 
 ### 4.3 Line Movement Integration
-**Current**: Line movement (open → current) is used to upgrade LEAN → BEST BET if movement confirms model direction by ≥2% (line 5350). Also tracked for CLV computation.
+**Current**: Line movement (open → current) is used to upgrade LEAN → HIGH CONFIDENCE if movement confirms model direction by ≥2% (line 5350). Also tracked for market efficiency score computation.
 **Problem**: Line movement is only used for confidence upgrades, not for edge adjustment. If the line moved toward the model's prediction, the remaining edge is smaller but the signal is more trustworthy. If it moved away, the edge is larger but the market disagrees.
 **Recommendation**: **Bayesian line-movement adjustment** — weight the model's prediction by line movement: `adjusted_pred = pred * 0.85 + closing_line * 0.15` when closing line is available. This incorporates closing-line efficiency without surrendering to it.
 
 ### 4.4 Correlated Signal Handling
 **Current**: `correlated` flag is set when multiple props for the same player have the same direction (line 5421-5430). Portfolio caps limit per-player signals to 2.
 **Problem**: Cross-player correlation isn't addressed. If 3 players on the same team all have OVER signals, there's implicit game-total correlation — if the game is low-scoring, all 3 lose.
-**Recommendation**: **Game-level correlation penalty** — when >2 signals from the same team are all OVER (or all UNDER), apply a Kelly-like correlation discount to the confidence level. Alternatively, enforce a max of 2 same-direction signals per team.
+**Recommendation**: **Game-level correlation penalty** — when >2 signals from the same team are all OVER (or all UNDER), apply a Allocation-like correlation discount to the confidence level. Alternatively, enforce a max of 2 same-direction signals per team.
 
 ### 4.5 Probability Saturation Control
 **Current**: Calibrated probabilities (isotonic/Platt) can hit extremes — `p_under=1.000` or `p_over=1.000` — creating false certainty in edge computation. When calibrated_prob = 1.0, any finite line produces an "infinite" edge, and downstream signal gating treats it as the highest-confidence pick.
@@ -197,13 +197,13 @@ Estimate covariance from OOF residuals. This is a high-volume market with relati
 ### 5.1 Walk-Forward Backtest Limitations
 **Current**: `run_walk_forward_backtest()` uses season-based folds (train on prior seasons, test on next). The market-line backtest uses an 80/20 chronological split with up to 30 test dates.
 **Problems**:
-- Walk-forward only tests model accuracy (MAE/RMSE/R²), not signal profitability. It doesn't compute hit rates, P/L, or CLV.
+- Walk-forward only tests model accuracy (MAE/RMSE/R²), not signal profitability. It doesn't compute hit rates, P/L, or market efficiency score.
 - The 80/20 split for market-line backtest doesn't match the walk-forward structure — models are trained on the full train set, not retrained per fold.
 - No statistical significance testing — a 55% hit rate on 100 bets has a wide confidence interval (44%-66% at 95% CI).
 
 **Recommendations**:
-1. **Unify walk-forward and market-line backtest** — in each walk-forward fold, train models, generate predictions, match to cached prop lines, compute signals, grade against actuals. This gives a realistic end-to-end profitability estimate.
-2. **Bootstrap confidence intervals** — for hit rate, ROI, and CLV, report 95% CIs via bootstrap resampling (1000 iterations). This tells you whether a 53% hit rate is real or noise.
+1. **Unify walk-forward and market-line backtest** — in each walk-forward fold, train models, generate predictions, match to cached market lines, compute signals, grade against actuals. This gives a realistic end-to-end profitability estimate.
+2. **Bootstrap confidence intervals** — for hit rate, Accuracy, and market efficiency score, report 95% CIs via bootstrap resampling (1000 iterations). This tells you whether a 53% hit rate is real or noise.
 3. **Permutation test for signal value** — shuffle signal assignments and compute null P/L distribution. If actual P/L isn't significantly above the null, the model isn't adding value over random.
 
 ### 5.2 Missing Unit Tests
@@ -227,16 +227,16 @@ Estimate covariance from OOF residuals. This is a high-volume market with relati
 ## 6. FEEDBACK LOOP & MONITORING
 
 ### 6.1 Deploy Gates Weakness
-**Current**: 5 gates (min_graded, CLV, calibration, model_freshness, missingness). DEPLOY_GATES_ENFORCE = False (advisory only).
+**Current**: 5 gates (min_graded, market efficiency score, calibration, model_freshness, missingness). DEPLOY_GATES_ENFORCE = False (advisory only).
 **Problems**:
-- CLV gate (Gate 2) requires `DEPLOY_CLV_MIN_SAMPLE = 50` rows with nonzero line movement. Early in the pipeline, this is nearly impossible to satisfy.
-- Gate 2 uses line-point CLV, not odds-based CLV. Line movement of 0.5 points on a 25.5 line is very different from 0.5 on a 2.5 line.
+- Market efficiency gate (Gate 2) requires `DEPLOY_MES_MIN_SAMPLE = 50` rows with nonzero line movement. Early in the pipeline, this is nearly impossible to satisfy.
+- Gate 2 uses line-point market efficiency score, not odds-based market efficiency score. Line movement of 0.5 points on a 25.5 line is very different from 0.5 on a 2.5 line.
 - No per-stat gate enforcement — if points is calibrated but fg3m is miscalibrated, the entire system should still deploy points signals.
 - No "degradation velocity" gate — calibration can drift slowly over weeks without triggering the threshold. A rapid drop (e.g., Brier jumps 0.05 in 3 days) should be an immediate alert.
 
 **Recommendations**:
-1. **Per-stat deploy gates** — allow signals for stats that pass all gates, suppress only the failing stats. This is partially implemented via `calibration_degraded_stats` but not wired to CLV or min_graded gates.
-2. **Odds-based CLV as primary metric** — compute CLV from implied probability difference (closing - opening) in the signal direction. This normalizes across line values.
+1. **Per-stat deploy gates** — allow signals for stats that pass all gates, suppress only the failing stats. This is partially implemented via `calibration_degraded_stats` but not wired to market efficiency score or min_graded gates.
+2. **Odds-based market efficiency score as primary metric** — compute market efficiency score from implied probability difference (closing - opening) in the signal direction. This normalizes across line values.
 3. **Degradation velocity alert** — track daily Brier score. If the 3-day rolling Brier increases by >0.05 from the 14-day rolling Brier, trigger an immediate alert regardless of absolute threshold.
 4. **Graduated enforcement** — instead of binary enforce/advisory, implement: (a) advisory → (b) suppress LEAN signals for failing stats → (c) suppress all signals for failing stats → (d) full system pause.
 
@@ -260,12 +260,12 @@ Estimate covariance from OOF residuals. This is a high-volume market with relati
 - No feature importance comparison vs prior week.
 - No OOS accuracy comparison vs prior week (is the new model better or worse?).
 - No automatic threshold adjustment based on calibration results.
-- Market residual models and probability calibrators are NOT retrained during weekly retrain — they depend on cached prop line history that may not be regenerated.
+- Market residual models and probability calibrators are NOT retrained during weekly retrain — they depend on cached market line history that may not be regenerated.
 
 **Recommendations**:
 1. **Save pre/post retrain metrics** — before training new models, run a quick OOS eval. After training, run the same eval. Log both to `prop_logs/retrain_comparison.csv`.
 2. **Retrain market models during weekly retrain** — call `train_market_residual_models()` as part of the retrain pipeline if sufficient prop history exists.
-3. **Auto-adjust signal thresholds** — if calibration shows OVER signals at 48% hit rate over 90 days, automatically tighten `MIN_EDGE_PCT_BY_SIDE["OVER"]` by 2 points.
+3. **Auto-adjust signal thresholds** — if calibration shows OVER signals at 48% hit rate over 90 days, automatically tighten `MIN_ADVANTAGE_PCT_BY_SIDE["OVER"]` by 2 points.
 
 ---
 
@@ -296,7 +296,7 @@ Estimate covariance from OOF residuals. This is a high-volume market with relati
 ### Tier 1 — Highest Expected Value (implement in this order)
 | # | Item | Section | Est. Complexity | Expected Impact |
 |---|------|---------|-----------------|-----------------|
-| 1 | Team-aware prop line keying & source dedup | §1.1.5 | Low-Medium | High — eliminates duplicate/mismatched lines that corrupt edge computation |
+| 1 | Team-aware market line keying & source dedup | §1.1.5 | Low-Medium | High — eliminates duplicate/mismatched lines that corrupt edge computation |
 | 2 | Forward-injury + starter reconstruction in training | §2.3.1, §2.4 | Medium | High — unlocks `injury_pressure_delta` and `confirmed_starter` as real features |
 | 3 | Calibration saturation fix + per-stat probability diagnostics | §4.5 | Low | High — eliminates p=1.000 artifacts, adds visibility into calibrator health |
 | 4 | Unified walk-forward market backtest with bootstrap CIs | §5.1.1, §5.1.2 | Medium | High — gives realistic profitability estimate with statistical significance |
@@ -304,7 +304,7 @@ Estimate covariance from OOF residuals. This is a high-volume market with relati
 
 This sequence gives the best reliability gain per unit of work.
 
-### Tier 2 — Strong ROI
+### Tier 2 — Strong Accuracy
 | # | Item | Section | Est. Complexity | Expected Impact |
 |---|------|---------|-----------------|-----------------|
 | 6 | Hard real-time lineup fallback | §4.6 | Medium | Medium-High — prevents stale lineup cascades |
@@ -322,7 +322,7 @@ This sequence gives the best reliability gain per unit of work.
 | 14 | Context-dependent OVER gating | §4.2 | Medium | Medium |
 | 15 | Quantile-based tail risk gating | §3.3.1 | Low | Low-Medium |
 | 16 | Auto-version feature cache | §7.2 | Low | Low (quality of life) |
-| 17 | Vectorized rolling computation | §7.3 | Medium | Low (performance, not a betting-edge lever while feature cache works) |
+| 17 | Vectorized rolling computation | §7.3 | Medium | Low (performance, not a prediction-edge lever while feature cache works) |
 | 18 | Add meta-learner context features | §3.2.1 | Low | Low-Medium |
 | 19 | Degradation velocity alert | §6.1.3 | Low | Low-Medium |
 

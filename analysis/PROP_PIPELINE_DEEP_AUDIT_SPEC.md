@@ -1,13 +1,13 @@
-# Player Props Pipeline Deep Audit Spec
+# Player Performance Predictions Pipeline Deep Audit Spec
 
 ## Objective
 
-Perform an exhaustive audit of the entire player props prediction pipeline (`predict_player_props.py` + dependencies) to identify:
+Perform an exhaustive audit of the entire player performance predictions prediction pipeline (`predict_player_props.py` + dependencies) to identify:
 
 1. **Data pipeline holes** — missing data, silent failures, stale caches, join losses
 2. **Feature engineering bugs** — leakage, math errors, missing signals, stale anchoring
 3. **Model logic gaps** — training/inference asymmetry, miscalibration, missing targets
-4. **Signal generation flaws** — threshold logic errors, missing gates, P&L leaks
+4. **Signal generation flaws** — threshold logic errors, missing gates, Performance leaks
 5. **Missing signals** — high-value features not yet exploited
 
 ---
@@ -29,12 +29,12 @@ Perform an exhaustive audit of the entire player props prediction pipeline (`pre
 - NBA CDN (`cdn.nba.com/static/json/staticData/scheduleLeagueV2_1.json`) — schedule
 - ESPN Scoreboard API — game metadata, event IDs
 - ESPN Odds API — game-level spread/total/moneyline
-- ESPN PropBets API — player prop lines (over/under)
+- ESPN PropBets API — player market lines (over/under)
 - ESPN Injuries API — injury report
 - ESPN Summary API — confirmed starters
 - stats.nba.com BoxScoreAdvancedV3 — player advanced metrics (usage, pace, TS%)
-- The Odds API (optional, free tier) — alternative prop lines
-- Manual CSV prop lines — user-supplied overrides
+- The Odds API (optional, free tier) — alternative market lines
+- Manual CSV market lines — user-supplied overrides
 - Historical cache (`analysis/output/historical_cache/`) — seasons 2021-22 through 2024-25
 
 ---
@@ -82,7 +82,7 @@ Perform an exhaustive audit of the entire player props prediction pipeline (`pre
 
 - [ ] **ESPN prop parsing fragility:** The over/under pairing assumes `entries[0]` = over, `entries[1]` = under. If ESPN changes ordering or adds a third entry type, this silently produces wrong data.
 - [ ] **Athlete name resolution:** `_resolve_espn_athlete()` does network calls to resolve athlete IDs. If an athlete isn't found, the prop is silently skipped. How many props are lost this way?
-- [ ] **Prop line caching:** `fetch_player_prop_lines()` writes a `.none.json` marker when no lines are found. The 45-minute retry (`NO_LINES_RETRY_SECS_SAME_DAY`) may be too aggressive for early-morning runs where lines appear later.
+- [ ] **Market line caching:** `fetch_player_prop_lines()` writes a `.none.json` marker when no lines are found. The 45-minute retry (`NO_LINES_RETRY_SECS_SAME_DAY`) may be too aggressive for early-morning runs where lines appear later.
 - [ ] **No team on ESPN props:** `"team": ""` is set for ESPN-fetched props. Team matching then relies solely on player name normalization, which can cause mismatches for players with identical names (rare but possible).
 - [ ] **Steals lines fetched but not modeled:** `_ESPN_PROP_TYPE_MAP` includes `"Total Steals": "steals"` but `PROP_TARGETS = ["points", "rebounds", "assists", "minutes"]` excludes steals. Lines are fetched but never used for edge computation.
 
@@ -170,7 +170,7 @@ Perform an exhaustive audit of the entire player props prediction pipeline (`pre
 - [ ] **Lineup-adjusted features:** When key players are out, the remaining players' roles shift. The current `team_injury_pressure` is a rough proxy; explicit lineup encoding would be better.
 - [ ] **Time-of-game features:** Early afternoon games vs. prime time may affect player performance.
 - [ ] **Scoring environment trends:** League-wide scoring trends within a season (e.g., post-All-Star break).
-- [ ] **Prop line movement as a feature:** Open line → current line movement signals sharp money. This is partially implemented (`line_move`, `line_move_pct`) but not used as a model feature.
+- [ ] **Market line movement as a feature:** Open line → current line movement signals sharp money. This is partially implemented (`line_move`, `line_move_pct`) but not used as a model feature.
 - [ ] **Player matchup history:** How does this specific player perform against this specific opponent historically?
 - [ ] **Blocks/steals as prop targets:** Lines are fetched for steals but never modeled. Blocks lines aren't even fetched.
 - [ ] **Combos (PRA, PR, PA):** Points+Rebounds+Assists combo props are popular but not modeled.
@@ -235,11 +235,11 @@ Perform an exhaustive audit of the entire player props prediction pipeline (`pre
 
 ### 4.1 Edge and EV Computation
 
-**Examine:** `compute_prop_edges()` (line ~4746)
+**Examine:** `compute_prediction_advantages()` (line ~4746)
 
 - [ ] **t-distribution df=7 choice:** `sp_stats.t.cdf(z, df=7)` — why df=7? This should be empirically validated against the actual residual distribution. If the true tails are lighter than t(7), probabilities are too extreme; if heavier, too conservative.
-- [ ] **P(over) calibration:** After computing raw P(over) from the t-distribution, it's passed through Platt/isotonic calibration. But the calibrators are trained on a 80/20 split of `_build_market_training_frame()`, which uses only the last 180 days of cached prop lines. If market data is sparse, the calibrator may be poorly trained.
-- [ ] **EV computation:** `ev_over = p_over * over_payout - (1.0 - p_over)`. This assumes a $1 wager. The payout is computed from American odds. Verify the decimal odds conversion: for -110, payout should be $0.909 (profit per $1 risked), not $1.909.
+- [ ] **P(over) calibration:** After computing raw P(over) from the t-distribution, it's passed through Platt/isotonic calibration. But the calibrators are trained on a 80/20 split of `_build_market_training_frame()`, which uses only the last 180 days of cached market lines. If market data is sparse, the calibrator may be poorly trained.
+- [ ] **EV computation:** `ev_over = p_over * over_payout - (1.0 - p_over)`. This assumes a $1 allocation. The payout is computed from American odds. Verify the decimal odds conversion: for -110, payout should be $0.909 (profit per $1 risked), not $1.909.
 - [ ] **Side-specific thresholds:** OVER requires 20% edge and 0.30 EV; UNDER requires 15% edge and 0.20 EV. This asymmetry was introduced to counter "observed over-bias." Has this been validated? Is the bias still present?
 
 ### 4.2 Signal Gating
@@ -272,7 +272,7 @@ Perform an exhaustive audit of the entire player props prediction pipeline (`pre
 **Examine:** `_predict_market_residual_adjustment()`, `train_market_residual_models()`
 
 - [ ] **Holdout validation:** The market residual model is only retained if `holdout_mae < baseline_holdout_mae` (i.e., the model beats "predict zero residual"). This is a good gate, but the holdout is a single time-ordered split — it may be noisy.
-- [ ] **Feature availability:** Market residual model uses `pred_value`, `line`, `edge`, `edge_pct`, `over_implied_prob`, etc. At inference time, these are computed from the base model's prediction. At training time, they're from the 80% training split predictions. If the base model improves between training and inference, the residual model is calibrated to the old model.
+- [ ] **Feature availability:** Market residual model uses `pred_value`, `line`, `edge`, `advantage_pct`, `over_implied_prob`, etc. At inference time, these are computed from the base model's prediction. At training time, they're from the 80% training split predictions. If the base model improves between training and inference, the residual model is calibrated to the old model.
 
 ---
 
@@ -292,7 +292,7 @@ Perform an exhaustive audit of the entire player props prediction pipeline (`pre
 
 - [ ] **Min sample for drift detection:** `CALIB_MIN_SAMPLE = 50` — 50 graded signal bets per stat type per slice. Early in deployment, this is rarely met, making calibration monitoring inactive.
 - [ ] **Degraded stats gating:** If a stat type is flagged as degraded (Brier > 0.30 or gap > 8%), ALL signals for that stat are suppressed. This is a blunt instrument — it could suppress profitable subsegments within the degraded stat.
-- [ ] **Calibration vs. accuracy:** Brier score measures calibration, not sharpness. A model that always predicts 50% has perfect calibration but no edge. The drift detection should also check if the model has positive CLV or ROI.
+- [ ] **Calibration vs. accuracy:** Brier score measures calibration, not sharpness. A model that always predicts 50% has perfect calibration but no edge. The drift detection should also check if the model has positive market efficiency score or Accuracy.
 
 ### 5.3 Deploy Gates
 
@@ -300,7 +300,7 @@ Perform an exhaustive audit of the entire player props prediction pipeline (`pre
 
 - [ ] **Gates currently advisory:** `DEPLOY_GATES_ENFORCE = False`. All deploy gates are currently informational only. When should this be switched to enforcement?
 - [ ] **Model age gate:** `DEPLOY_GATE_MAX_MODEL_AGE_DAYS = 14`. How is model age determined? If models are retrained weekly (Sunday cron), by Friday they're 5 days old, which is fine. But if the cron fails, models could be 21+ days old before anyone notices.
-- [ ] **CLV gate:** `DEPLOY_GATE_MIN_CLV = 0.0` requires non-negative CLV. But `DEPLOY_CLV_MIN_SAMPLE = 50` means CLV isn't checked until 50 bets with line movement data. This may take weeks.
+- [ ] **Market efficiency gate:** `DEPLOY_GATE_MIN_MES = 0.0` requires non-negative market efficiency score. But `DEPLOY_MES_MIN_SAMPLE = 50` means market efficiency score isn't checked until 50 bets with line movement data. This may take weeks.
 
 ---
 
@@ -313,7 +313,7 @@ Perform an exhaustive audit of the entire player props prediction pipeline (`pre
 
 ### 6.2 Potential Mathematical Errors
 
-- [ ] **`_american_odds_to_decimal` vs. `_american_odds_to_prob`:** Three different functions convert American odds: `_american_odds_to_prob`, `_american_odds_to_decimal`, `_american_odds_to_implied_prob`. The first and third are identical. `_american_odds_to_decimal` returns *profit per $1 wagered* (not total payout). Verify this is consistently used in EV computation.
+- [ ] **`_american_odds_to_decimal` vs. `_american_odds_to_prob`:** Three different functions convert American odds: `_american_odds_to_prob`, `_american_odds_to_decimal`, `_american_odds_to_implied_prob`. The first and third are identical. `_american_odds_to_decimal` returns *performance per prediction* (not total payout). Verify this is consistently used in EV computation.
 - [ ] **EV formula verification:** `ev_over = p_over * over_payout - (1.0 - p_over)`. If `over_payout = _american_odds_to_decimal(-110) = 100/110 = 0.909`, then EV = p * 0.909 - (1-p). At p=0.55, EV = 0.55*0.909 - 0.45 = 0.50 - 0.45 = 0.05. This is correct for profit per $1 risked.
 - [ ] **`VIG_FACTOR = 0.9524`:** This is `100/105`, representing -105 juice. But many props are at -110 (`100/110 = 0.909`). If actual odds are -110 but the VIG_FACTOR is -105, the EV is overestimated by ~4 cents per dollar.
 
@@ -341,7 +341,7 @@ Perform an exhaustive audit of the entire player props prediction pipeline (`pre
 
 - [ ] **Training data leakage check:** Run the pipeline with `--walk-forward` and compare per-fold MAE to the simple `--backtest` MAE. If walk-forward MAE is significantly worse, there may be leakage in the simple backtest.
 - [ ] **Prediction consistency:** Run predictions for the same date twice. Are results identical? (They should be if caches are stable.)
-- [ ] **Edge case handling:** What happens when a game has 0 eligible players (all filtered by min_games)? When all prop lines are NaN? When a player has exactly `DEFAULT_MIN_GAMES` = 20 games?
+- [ ] **Edge case handling:** What happens when a game has 0 eligible players (all filtered by min_games)? When all market lines are NaN? When a player has exactly `DEFAULT_MIN_GAMES` = 20 games?
 
 ---
 

@@ -9,7 +9,7 @@ Run from repo root (`/Users/ryangoldstein/NBA`) so relative output paths resolve
 python3 scripts/fetch_opening_lines.py --date YYYYMMDD --days-ahead 1
 ```
 
-### Early line scanner / CLV tracking
+### Early line scanner / Market efficiency tracking
 ```bash
 python3 scripts/early_line_scanner.py --date YYYYMMDD
 python3 scripts/early_line_scanner.py --date YYYYMMDD --track
@@ -44,7 +44,7 @@ python3 scripts/predict_player_props.py --backtest
 python3 scripts/predict_player_props.py --backtest-props
 python3 scripts/predict_player_props.py --backtest-market-props
 python3 scripts/predict_player_props.py --walk-forward
-python3 scripts/predict_player_props.py --date YYYYMMDD --track-clv
+python3 scripts/predict_player_props.py --date YYYYMMDD --track-efficiency
 python3 scripts/predict_player_props.py --date YYYYMMDD --grade-results
 python3 scripts/predict_player_props.py --calibration-report
 python3 scripts/predict_player_props.py --date YYYYMMDD --daily-report

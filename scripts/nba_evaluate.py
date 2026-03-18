@@ -225,7 +225,7 @@ def profit_loss_simulation(
                     "n_wins": 0,
                     "win_rate": 0.0,
                     "profit": 0.0,
-                    "roi_pct": 0.0,
+                    "accuracy_pct": 0.0,
                 }
             )
             continue
@@ -248,7 +248,7 @@ def profit_loss_simulation(
                 "n_wins": total_wins,
                 "win_rate": round(float(total_wins / n_bets), 4) if n_bets else 0.0,
                 "profit": round(float(profit), 2),
-                "roi_pct": round(float(100 * profit / (n_bets * bet_size)), 2) if n_bets else 0.0,
+                "accuracy_pct": round(float(100 * profit / (n_bets * bet_size)), 2) if n_bets else 0.0,
                 "avg_edge": round(
                     float(
                         np.concatenate(
@@ -390,7 +390,7 @@ def print_evaluation_report(
                 if pl["n_bets"] > 0:
                     print(
                         f"    Edge>={pl['edge_threshold']:.0%}: {pl['n_bets']} bets, "
-                        f"win={pl['win_rate']:.1%}, ROI={pl['roi_pct']:+.1f}%"
+                        f"win={pl['win_rate']:.1%}, Accuracy={pl['accuracy_pct']:+.1f}%"
                     )
 
     if total_eval:
@@ -429,7 +429,7 @@ def prop_brier_score(
     p_hit: np.ndarray,
     hit: np.ndarray,
 ) -> float:
-    """Brier score for prop predictions: mean((p_hit - hit)^2).
+    """Brier score for player predictions: mean((p_hit - hit)^2).
 
     Args:
         p_hit: predicted probability of the outcome (P(over) for OVER bets, P(under) for UNDER).
@@ -446,7 +446,7 @@ def prop_calibration_by_bucket(
     group_col: str,
     min_sample: int = 50,
 ) -> list[dict[str, Any]]:
-    """Compute calibration metrics for prop predictions grouped by a column.
+    """Compute calibration metrics for player predictions grouped by a column.
 
     ``df`` must have columns: ``p_hit``, ``hit``, ``pnl``, and ``group_col``.
 
@@ -458,7 +458,7 @@ def prop_calibration_by_bucket(
       - gap: |hit_rate - mean_p_hit| (miscalibration)
       - brier: Brier score for the group
       - log_loss: log-loss for the group
-      - roi_pct: ROI%
+      - accuracy_pct: Accuracy%
     """
     results = []
     for group_val, grp in df.groupby(group_col):
@@ -478,13 +478,13 @@ def prop_calibration_by_bucket(
         p_clip = np.clip(p, 1e-6, 1 - 1e-6)
         ll = float(-np.mean(h * np.log(p_clip) + (1 - h) * np.log(1 - p_clip)))
         if "signal" in grp.columns:
-            wager_mask = grp["signal"] != "NO BET"
+            allocation_mask = grp["signal"] != "LOW CONFIDENCE"
         else:
-            wager_mask = grp["pnl"].notna()
-        n_wagers = int(wager_mask.sum())
-        total_wagered = n_wagers * 100.0
-        pnl_sum = float(grp.loc[wager_mask, "pnl"].sum()) if n_wagers > 0 else 0.0
-        roi = float(pnl_sum / total_wagered * 100) if total_wagered > 0 else 0.0
+            allocation_mask = grp["pnl"].notna()
+        n_allocations = int(allocation_mask.sum())
+        total_allocated = n_allocations * 100.0
+        pnl_sum = float(grp.loc[allocation_mask, "pnl"].sum()) if n_allocations > 0 else 0.0
+        accuracy = float(pnl_sum / total_allocated * 100) if total_allocated > 0 else 0.0
         results.append({
             "group": group_val,
             "n": int(valid.sum()),
@@ -493,6 +493,6 @@ def prop_calibration_by_bucket(
             "gap": round(abs(hr - mp), 4),
             "brier": round(brier, 4),
             "log_loss": round(ll, 4),
-            "roi_pct": round(roi, 2),
+            "accuracy_pct": round(accuracy, 2),
         })
     return results

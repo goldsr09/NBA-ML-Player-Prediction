@@ -46,7 +46,7 @@ Comprehensive audit of the codebase across data quality, feature engineering, mo
 - Fuzzy matching can false-positive (e.g., "Marcus Morris" matching "Markieff Morris")
 - No handling for load management (listed as healthy, sits out) — this is invisible to the system
 - Injury report timing: fetched once at prediction time but injuries can be updated hours before tipoff
-- The `evaluate_injury_feed_coverage()` function exists in player props but isn't used systematically for game predictions
+- The `evaluate_injury_feed_coverage()` function exists in player performance predictions but isn't used systematically for game predictions
 
 **Recommendations:**
 1. Implement injury report coverage tracking: compare predicted-out vs actual-DNP post-game
@@ -55,7 +55,7 @@ Comprehensive audit of the codebase across data quality, feature engineering, mo
 4. Track load management patterns: flag players with >20% DNP rate on B2B games
 
 ### 1D. Missing Data Sources (LOW — Future Enhancement)
-**Current sources:** NBA CDN (boxscores, schedule), ESPN (odds, injury reports, player props).
+**Current sources:** NBA CDN (boxscores, schedule), ESPN (odds, injury reports, player performance predictions).
 
 **Missing:**
 - **Play-by-play data**: clutch performance, garbage time identification, lineup-specific net ratings
@@ -125,14 +125,14 @@ Comprehensive audit of the codebase across data quality, feature engineering, mo
 - No steam move detection (rapid line changes across multiple books)
 - No market-model disagreement bucketing (model says home by 5, market says home by 1 → high-conviction signal)
 - Line movement features are NaN when open lines are unavailable (common for upcoming games captured early)
-- No historical closing line value (CLV) tracking for the game prediction pipeline (only exists for Kalshi Q4 and player props)
+- No historical market efficiency metric (market efficiency score) tracking for the game prediction pipeline (only exists for Kalshi Q4 and player performance predictions)
 - The `market_home_implied_prob_open` is derived from spread via logistic approximation (`1/(1+exp(spread/6.5))`) rather than actual opening moneyline odds
 
 **Recommendations:**
-1. Track and feature-engineer CLV for game predictions: how much did the model's pick move the line in its direction by close?
+1. Track and feature-engineer market efficiency score for game predictions: how much did the model's pick move the line in its direction by close?
 2. Add market disagreement magnitude as a feature: `abs(model_margin - market_margin)` bucketed into low/med/high
 3. Use actual opening moneyline when available instead of spread-derived approximation
-4. Add "reverse line movement" detector: line moves against public betting percentages
+4. Add "reverse line movement" detector: line moves against public prediction percentages
 
 ### 2E. Time-Decay & Recency Weighting (LOW)
 **Current state:** EWM with span=10 is used for some metrics. Season-long expanding averages are also computed.
@@ -201,7 +201,7 @@ Comprehensive audit of the codebase across data quality, feature engineering, mo
 3. Add a confidence gate: only apply residual correction when `abs(predicted_residual) > min_threshold` and the model's uncertainty (from quantile regression or std estimate) is below a maximum
 4. Track residual model edge over time and auto-disable when it degrades below breakeven
 
-### 3D. Player Props Model Architecture (MEDIUM)
+### 3D. Player Performance Predictions Model Architecture (MEDIUM)
 **Current state:** Two-stage model (XGBoost base + OOF residual correction). Market residual models. Quantile uncertainty estimation. Signal gating via calibration monitoring.
 
 **Gaps (from reading the 9235-line file):**
@@ -223,14 +223,14 @@ Comprehensive audit of the codebase across data quality, feature engineering, mo
 
 **Gaps:**
 - No integration with the main game prediction pipeline — the Q4 model could improve live total predictions
-- No half-time model (Q1+Q2 → final total) which would be useful for live betting earlier in the game
+- No half-time model (Q1+Q2 → final total) which would be useful for live prediction earlier in the game
 - The Q4 model's linear baseline (`1.0604 * thru_3q + 44.34`) is never compared against the ML model in production
 - No Q4 model for margin (only totals)
 
 **Recommendations:**
 1. Build a half-time model for total and margin predictions
 2. Integrate Q4 model outputs into the live adjustment logic in `apply_live_adjustments()`
-3. Add a Q4 margin model for live spread betting
+3. Add a Q4 margin model for live spread prediction
 
 ---
 
@@ -266,19 +266,19 @@ Comprehensive audit of the codebase across data quality, feature engineering, mo
 **Current state:** A `--backtest` mode exists that splits the last 20% of current-season games as test. `time_series_cv_folds()` exists for cross-validation.
 
 **Gaps:**
-- The 80/20 chronological split is a single point-in-time estimate — no walk-forward validation for game predictions (only exists for player props)
+- The 80/20 chronological split is a single point-in-time estimate — no walk-forward validation for game predictions (only exists for player performance predictions)
 - No purge gap between train and test to prevent information leakage from rolling features (a game on day N uses features from day N-1; if day N-1 is in train and day N is in test, there's indirect leakage)
 - No multi-season out-of-sample test: train on 2021-24, test on 2024-25 as a whole
 - CV folds use `min_train=200` games — this doesn't account for the fact that early-season games have less reliable features
 - No statistical significance testing on model comparisons (e.g., "is the enhanced model's 0.3% AUC improvement real or noise?")
-- The backtest doesn't track ATS/O-U P&L over time — it only reports aggregate metrics
+- The backtest doesn't track ATS/O-U Performance over time — it only reports aggregate metrics
 
 **Recommendations:**
-1. Implement walk-forward backtesting for game predictions: retrain monthly, predict the next month, track cumulative P&L
+1. Implement walk-forward backtesting for game predictions: retrain monthly, predict the next month, track cumulative Performance
 2. Add a 3-game purge gap between train and test in CV folds
 3. Add paired bootstrap confidence intervals for all metric comparisons
 4. Add a season-holdout test: train on all seasons except the most recent, test on the holdout
-5. Track daily/weekly P&L curves, not just aggregate metrics — to detect streaky behavior
+5. Track daily/weekly Performance curves, not just aggregate metrics — to detect streaky behavior
 
 ### 4C. Calibration Monitoring (MEDIUM)
 **Current state:** `calibration_by_decile()` and `calibration_error()` exist in `nba_evaluate.py`. The props pipeline has extensive calibration monitoring.
@@ -322,8 +322,8 @@ Comprehensive audit of the codebase across data quality, feature engineering, mo
 **Gaps:**
 - No canonical results history for game predictions (equivalent to `prop_results_history.csv`)
 - No post-game grading: predictions are generated but never compared to actual outcomes systematically
-- No CLV tracking for game prediction signals (spread, ML, total)
-- No P&L tracking over time — impossible to know if the system is profitable
+- No Market efficiency tracking for game prediction signals (spread, ML, total)
+- No Performance tracking over time — impossible to know if the system is profitable
 - No automatic signal suppression when the model degrades
 - No weekly retrain cadence — models are only retrained when manually invoking the script
 
@@ -331,13 +331,13 @@ Comprehensive audit of the codebase across data quality, feature engineering, mo
 1. Add `--grade-results` flag to `predict_upcoming_nba.py`:
    - Load yesterday's predictions CSV
    - Fetch actual results
-   - Compute: ATS result, ML result, O/U result, P&L at each signal
+   - Compute: ATS result, ML result, O/U result, Performance at each signal
    - Append to `game_results_history.csv`
 2. Add `--calibration-report` flag:
    - Compute rolling metrics by market type (spread, ML, total)
    - Alert on degraded windows (similar to props pipeline)
-3. Add CLV tracking: compare model's pick direction to closing line movement
-4. Add automated P&L dashboard output (daily and cumulative)
+3. Add Market efficiency tracking: compare model's pick direction to closing line movement
+4. Add automated Performance dashboard output (daily and cumulative)
 5. Add `--weekly-retrain` with deploy gates (similar to props pipeline)
 
 ### 5B. Model Versioning & Reproducibility (HIGH)
@@ -429,7 +429,7 @@ Comprehensive audit of the codebase across data quality, feature engineering, mo
 | Priority | Category | Key Gap |
 |----------|----------|---------|
 | CRITICAL | Testing | Zero test coverage — any code change is a blind gamble |
-| HIGH | Feedback | No game prediction grading/P&L tracking |
+| HIGH | Feedback | No game prediction grading/Performance tracking |
 | HIGH | Validation | No walk-forward backtesting for games |
 | HIGH | Model | Fixed ensemble weights, no learned stacking |
 | HIGH | Model | Win/margin/total inconsistency |

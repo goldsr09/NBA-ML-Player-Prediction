@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Autoresearch experiment runner for NBA player prop predictions.
+Autoresearch experiment runner for NBA player performance predictions.
 
 This is the SINGLE FILE the agent modifies. It contains:
   - EXPERIMENT_CONFIG: hyperparameters, feature groups, and settings
@@ -109,7 +109,7 @@ EXPERIMENT_CONFIG: dict[str, Any] = {
     # --- Features to REMOVE from the standard list ---
     "remove_features": [],
 
-    # --- Signal thresholds for betting evaluation ---
+    # --- Signal thresholds for prediction evaluation ---
     "signal_buffer": 0.03,  # added to BREAKEVEN_PROB for signal threshold
 
     # --- Targets to evaluate ---
@@ -384,7 +384,7 @@ def run_walk_forward(
                 "under_hit_rate": round(under_hit / n_under, 4) if n_under > 0 else np.nan,
                 "total_win_rate": round(total_wins / n_bets, 4) if n_bets > 0 else np.nan,
                 "profit": round(total_profit, 2),
-                "roi_pct": round(100 * total_profit / (n_bets * bet_size), 2) if n_bets > 0 else np.nan,
+                "accuracy_pct": round(100 * total_profit / (n_bets * bet_size), 2) if n_bets > 0 else np.nan,
             }
 
             wr = fold_metrics[target].get("total_win_rate", np.nan)
@@ -392,7 +392,7 @@ def run_walk_forward(
             print(
                 f"    {target:>10s}:  MAE={mae:.3f}  R2={r2:.3f}  "
                 f"Bets={n_bets}  WR={wr_s}  "
-                f"P/L=${total_profit:+.0f}  ROI={fold_metrics[target].get('roi_pct', 0):.1f}%",
+                f"P/L=${total_profit:+.0f}  Accuracy={fold_metrics[target].get('accuracy_pct', 0):.1f}%",
                 flush=True,
             )
 
@@ -429,7 +429,7 @@ def run_walk_forward(
         sum_profit = sum(vals["profit"])
         sum_bets = int(sum(vals["n_bets"]))
         avg_wr = float(np.nanmean(vals["win_rate"])) if vals["win_rate"] else np.nan
-        roi = (100 * sum_profit / (sum_bets * bet_size)) if sum_bets > 0 else np.nan
+        accuracy = (100 * sum_profit / (sum_bets * bet_size)) if sum_bets > 0 else np.nan
 
         total_profit_all += sum_profit
         total_bets_all += sum_bets
@@ -438,7 +438,7 @@ def run_walk_forward(
 
     overall_mae = float(np.nanmean(total_mae_all)) if total_mae_all else 999.0
     overall_r2 = float(np.nanmean(total_r2_all)) if total_r2_all else -999.0
-    overall_roi = (100 * total_profit_all / (total_bets_all * bet_size)) if total_bets_all > 0 else 0.0
+    overall_accuracy = (100 * total_profit_all / (total_bets_all * bet_size)) if total_bets_all > 0 else 0.0
 
     return {
         "folds": fold_results,
@@ -447,7 +447,7 @@ def run_walk_forward(
         "overall_r2": overall_r2,
         "overall_profit": total_profit_all,
         "overall_bets": total_bets_all,
-        "overall_roi": overall_roi,
+        "overall_accuracy": overall_accuracy,
         "per_target": {
             target: {
                 "avg_mae": float(np.nanmean(v["mae"])),
@@ -504,25 +504,25 @@ def main() -> None:
         total_bets = vals["total_bets"]
         avg_wr = vals.get("avg_win_rate", np.nan)
         total_profit = vals["total_profit"]
-        roi = (100 * total_profit / (total_bets * 100)) if total_bets > 0 else 0.0
+        accuracy = (100 * total_profit / (total_bets * 100)) if total_bets > 0 else 0.0
         wr_s = f"{avg_wr:.1%}" if pd.notna(avg_wr) else "N/A"
         print(
             f"  {target:>10s}:  MAE={avg_mae:.3f}  R2={avg_r2:.3f}  "
-            f"Bets={total_bets}  WR={wr_s}  P/L=${total_profit:+.0f}  ROI={roi:.1f}%",
+            f"Bets={total_bets}  WR={wr_s}  P/L=${total_profit:+.0f}  Accuracy={accuracy:.1f}%",
             flush=True,
         )
 
-    overall_roi = results["overall_roi"]
+    overall_accuracy = results["overall_accuracy"]
     overall_bets = results["overall_bets"]
     if overall_bets > 0:
-        if overall_roi > 2.0 and overall_bets >= 50:
+        if overall_accuracy > 2.0 and overall_bets >= 50:
             assessment = "GO"
-        elif overall_roi > 0:
+        elif overall_accuracy > 0:
             assessment = "CAUTIOUS GO"
         else:
             assessment = "NO GO"
     else:
-        assessment = "NO BETS"
+        assessment = "NO PREDICTIONS"
 
     # --- Standardized output block (parsed by agent) ---
     print("\n---")
@@ -530,7 +530,7 @@ def main() -> None:
     print(f"overall_r2:       {results['overall_r2']:.6f}")
     print(f"overall_profit:   {results['overall_profit']:.2f}")
     print(f"overall_bets:     {results['overall_bets']}")
-    print(f"overall_roi:      {results['overall_roi']:.2f}")
+    print(f"overall_accuracy:      {results['overall_accuracy']:.2f}")
     print(f"assessment:       {assessment}")
     print(f"elapsed_seconds:  {elapsed:.1f}")
     for target, vals in results.get("per_target", {}).items():

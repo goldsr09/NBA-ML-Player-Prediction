@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Backtest Feb 27 2026 player prop predictions against actual results.
+"""Backtest Feb 27 2026 player performance predictions against actual results.
 
 Loads:
-  - Cached prop edges (with signal thresholds already computed)
+  - Cached prediction advantages (with signal thresholds already computed)
   - Actual box scores from NBA CDN
-Grades each signal, reports win rate, P/L, ROI, breakdown by confidence tier.
+Grades each signal, reports win rate, Performance, Accuracy, breakdown by confidence tier.
 """
 from __future__ import annotations
 
@@ -29,10 +29,10 @@ from analyze_nba_2025_26_advanced import (
 )
 from predict_player_props import (
     VIG_FACTOR,
-    MIN_EDGE_PCT,
+    MIN_ADVANTAGE_PCT,
     MIN_EV,
-    BEST_BET_EV,
-    MIN_EDGE_PCT_BY_SIDE,
+    HIGH_CONF_EV,
+    MIN_ADVANTAGE_PCT_BY_SIDE,
     MIN_EV_BY_SIDE,
     SIGNAL_POINTS_ONLY,
     MIN_SIGNAL_PRED_MINUTES,
@@ -190,22 +190,22 @@ def _parse_iso_minutes(s: str) -> float:
 def grade_signals(edges: pd.DataFrame, actuals: pd.DataFrame) -> pd.DataFrame:
     """Match edge signals to actual results and grade them."""
     edges = edges.copy()
-    if "signal" in edges.columns and (edges["signal"] != "NO BET").any():
+    if "signal" in edges.columns and (edges["signal"] != "LOW CONFIDENCE").any():
         edges["rederived_signal"] = edges["signal"]
         edges["rederived_confidence"] = edges.get("confidence", "")
-        actionable = edges[edges["rederived_signal"] != "NO BET"].copy()
+        actionable = edges[edges["rederived_signal"] != "LOW CONFIDENCE"].copy()
         print(f"\nUsing saved signals from edge file: {len(actionable)}")
     else:
         # Fallback: re-derive with the same policy thresholds used by live prediction code.
         signals = []
         for _, row in edges.iterrows():
-            signal = "NO BET"
+            signal = "LOW CONFIDENCE"
             confidence = ""
             stat_type = str(row.get("stat_type", ""))
             ev_over = row.get("ev_over", np.nan)
             ev_under = row.get("ev_under", np.nan)
             edge = row.get("edge", 0)
-            edge_pct = row.get("edge_pct", 0)
+            advantage_pct = row.get("advantage_pct", 0)
             p_over = row.get("p_over", np.nan)
             p_under = row.get("p_under", np.nan)
 
@@ -231,21 +231,21 @@ def grade_signals(edges: pd.DataFrame, actuals: pd.DataFrame) -> pd.DataFrame:
                     ev_over > MIN_EV_BY_SIDE["OVER"]
                     and pd.notna(p_over)
                     and p_over > over_breakeven
-                    and abs(edge_pct) >= MIN_EDGE_PCT_BY_SIDE["OVER"]
+                    and abs(advantage_pct) >= MIN_ADVANTAGE_PCT_BY_SIDE["OVER"]
                 ):
                     signal = "OVER"
-                    confidence = "BEST BET" if ev_over >= BEST_BET_EV else "LEAN"
+                    confidence = "HIGH CONFIDENCE" if ev_over >= HIGH_CONF_EV else "MODERATE CONFIDENCE"
                 elif (
                     ev_under > MIN_EV_BY_SIDE["UNDER"]
                     and pd.notna(p_under)
                     and p_under > under_breakeven
-                    and abs(edge_pct) >= MIN_EDGE_PCT_BY_SIDE["UNDER"]
+                    and abs(advantage_pct) >= MIN_ADVANTAGE_PCT_BY_SIDE["UNDER"]
                 ):
                     signal = "UNDER"
-                    confidence = "BEST BET" if ev_under >= BEST_BET_EV else "LEAN"
+                    confidence = "HIGH CONFIDENCE" if ev_under >= HIGH_CONF_EV else "MODERATE CONFIDENCE"
 
             # Line movement upgrade
-            if signal != "NO BET" and confidence == "LEAN":
+            if signal != "LOW CONFIDENCE" and confidence == "MODERATE CONFIDENCE":
                 open_line = row.get("open_line", np.nan)
                 prop_line = row.get("prop_line", np.nan)
                 pred_value = row.get("pred_value", np.nan)
@@ -256,17 +256,17 @@ def grade_signals(edges: pd.DataFrame, actuals: pd.DataFrame) -> pd.DataFrame:
                     line_moved_up = line_move > 0
                     line_confirms = (model_says_over and line_moved_up) or (not model_says_over and not line_moved_up)
                     if line_confirms and abs(line_move_pct) >= 2.0:
-                        confidence = "BEST BET"
+                        confidence = "HIGH CONFIDENCE"
 
             signals.append({"rederived_signal": signal, "rederived_confidence": confidence})
 
         sig_df = pd.DataFrame(signals)
         edges["rederived_signal"] = sig_df["rederived_signal"].values
         edges["rederived_confidence"] = sig_df["rederived_confidence"].values
-        actionable = edges[edges["rederived_signal"] != "NO BET"].copy()
+        actionable = edges[edges["rederived_signal"] != "LOW CONFIDENCE"].copy()
         print(f"\nRe-derived signals (no saved signals available): {len(actionable)}")
 
-    print(f"  BEST BET: {(actionable['rederived_confidence'] == 'BEST BET').sum()}")
+    print(f"  HIGH CONFIDENCE: {(actionable['rederived_confidence'] == 'HIGH CONFIDENCE').sum()}")
     print(f"  LEAN:     {(actionable['rederived_confidence'] == 'LEAN').sum()}")
 
     if actionable.empty:
@@ -351,7 +351,7 @@ def grade_signals(edges: pd.DataFrame, actuals: pd.DataFrame) -> pd.DataFrame:
             "signal": signal,
             "confidence": confidence,
             "edge": row.get("edge", 0),
-            "edge_pct": row.get("edge_pct", 0),
+            "advantage_pct": row.get("advantage_pct", 0),
             "ev_at_signal": float(ev_chosen) if pd.notna(ev_chosen) else np.nan,
             "p_over": row.get("p_over", np.nan),
             "p_under": row.get("p_under", np.nan),
@@ -382,7 +382,7 @@ def _american_to_implied(odds: float) -> float:
 
 
 def _american_to_decimal(odds: float) -> float:
-    """Convert American odds to decimal profit per $1 wagered."""
+    """Convert American odds to decimal performance per prediction."""
     if pd.isna(odds):
         return VIG_FACTOR
     odds = float(odds)
@@ -407,9 +407,9 @@ def print_report(graded: pd.DataFrame) -> None:
     n_hits = int(graded["hit"].sum())
     n_pushes = int(graded["push"].sum())
     total_pnl = graded["pnl"].sum()
-    total_wagered = (n_bets - n_pushes) * 100
+    total_allocated = (n_bets - n_pushes) * 100
     hit_rate = n_hits / (n_bets - n_pushes) if (n_bets - n_pushes) > 0 else 0
-    roi = (total_pnl / (n_bets * 100)) * 100 if n_bets > 0 else 0
+    accuracy = (total_pnl / (n_bets * 100)) * 100 if n_bets > 0 else 0
 
     print("\n" + "=" * 72)
     print(f"  PROP BACKTEST RESULTS: Feb 27, 2026")
@@ -420,12 +420,12 @@ def print_report(graded: pd.DataFrame) -> None:
     print(f"  Pushes:            {n_pushes}")
     print(f"  Hit rate:          {hit_rate:.1%}")
     print(f"  Total P/L:         ${total_pnl:+.0f}")
-    print(f"  Total wagered:     ${n_bets * 100:,.0f}")
-    print(f"  ROI:               {roi:+.1f}%")
+    print(f"  Total allocated:     ${n_bets * 100:,.0f}")
+    print(f"  Accuracy:               {accuracy:+.1f}%")
 
     # --- Breakdown by confidence tier ---
     print(f"\n  --- By Confidence Tier ---")
-    for tier in ["BEST BET", "LEAN"]:
+    for tier in ["HIGH CONFIDENCE", "MODERATE CONFIDENCE"]:
         subset = graded[graded["confidence"] == tier]
         if subset.empty:
             continue
@@ -434,10 +434,10 @@ def print_report(graded: pd.DataFrame) -> None:
         t_pushes = int(subset["push"].sum())
         t_pnl = subset["pnl"].sum()
         t_hr = t_hits / (t_bets - t_pushes) if (t_bets - t_pushes) > 0 else 0
-        t_roi = (t_pnl / (t_bets * 100)) * 100 if t_bets > 0 else 0
+        t_accuracy = (t_pnl / (t_bets * 100)) * 100 if t_bets > 0 else 0
         avg_ev = subset["ev_at_signal"].dropna().mean()
         print(f"\n  {tier}:")
-        print(f"    Bets: {t_bets}  Hits: {t_hits}  Rate: {t_hr:.1%}  P/L: ${t_pnl:+.0f}  ROI: {t_roi:+.1f}%  Avg EV: {avg_ev:+.3f}")
+        print(f"    Bets: {t_bets}  Hits: {t_hits}  Rate: {t_hr:.1%}  P/L: ${t_pnl:+.0f}  Accuracy: {t_accuracy:+.1f}%  Avg EV: {avg_ev:+.3f}")
 
     # --- Breakdown by stat type ---
     print(f"\n  --- By Stat Type ---")
@@ -448,8 +448,8 @@ def print_report(graded: pd.DataFrame) -> None:
         t_pushes = int(subset["push"].sum())
         t_pnl = subset["pnl"].sum()
         t_hr = t_hits / (t_bets - t_pushes) if (t_bets - t_pushes) > 0 else 0
-        t_roi = (t_pnl / (t_bets * 100)) * 100 if t_bets > 0 else 0
-        print(f"    {st:10s}: {t_bets:>3d} bets, {t_hr:.1%} hit rate, ${t_pnl:+.0f} P/L ({t_roi:+.1f}% ROI)")
+        t_accuracy = (t_pnl / (t_bets * 100)) * 100 if t_bets > 0 else 0
+        print(f"    {st:10s}: {t_bets:>3d} bets, {t_hr:.1%} hit rate, ${t_pnl:+.0f} P/L ({t_accuracy:+.1f}% Accuracy)")
 
     # --- Breakdown by signal direction ---
     print(f"\n  --- By Direction ---")
@@ -508,10 +508,10 @@ def print_report(graded: pd.DataFrame) -> None:
 def threshold_sweep(edges: pd.DataFrame, actuals: pd.DataFrame) -> None:
     """Test different EV thresholds to find optimal cutoff."""
     print("\n  --- Threshold Sensitivity Analysis ---")
-    print(f"  {'Min EV':>8s} {'Min Edge%':>10s} {'Bets':>6s} {'Hits':>6s} {'Rate':>7s} {'P/L':>8s} {'ROI':>7s}")
+    print(f"  {'Min EV':>8s} {'Min Edge%':>10s} {'Bets':>6s} {'Hits':>6s} {'Rate':>7s} {'P/L':>8s} {'Accuracy':>7s}")
 
     for min_ev in [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50]:
-        for min_edge in [10.0, 15.0, 20.0]:
+        for min_advantage in [10.0, 15.0, 20.0]:
             # Re-derive with these thresholds
             count = 0
             hits = 0
@@ -525,7 +525,7 @@ def threshold_sweep(edges: pd.DataFrame, actuals: pd.DataFrame) -> None:
                 ev_over = row.get("ev_over", np.nan)
                 ev_under = row.get("ev_under", np.nan)
                 edge = row.get("edge", 0)
-                edge_pct = row.get("edge_pct", 0)
+                advantage_pct = row.get("advantage_pct", 0)
                 p_over = row.get("p_over", np.nan)
                 p_under = row.get("p_under", np.nan)
 
@@ -535,11 +535,11 @@ def threshold_sweep(edges: pd.DataFrame, actuals: pd.DataFrame) -> None:
                 odds_chosen = np.nan
 
                 if pd.notna(ev_over) and pd.notna(ev_under) and abs(edge) >= min_abs:
-                    if ev_over > min_ev and pd.notna(p_over) and p_over > 0.5 and abs(edge_pct) >= min_edge:
+                    if ev_over > min_ev and pd.notna(p_over) and p_over > 0.5 and abs(advantage_pct) >= min_advantage:
                         signal = "OVER"
                         ev_chosen = ev_over
                         odds_chosen = row.get("over_odds", -110)
-                    elif ev_under > min_ev and pd.notna(p_under) and p_under > 0.5 and abs(edge_pct) >= min_edge:
+                    elif ev_under > min_ev and pd.notna(p_under) and p_under > 0.5 and abs(advantage_pct) >= min_advantage:
                         signal = "UNDER"
                         ev_chosen = ev_under
                         odds_chosen = row.get("under_odds", -110)
@@ -579,8 +579,8 @@ def threshold_sweep(edges: pd.DataFrame, actuals: pd.DataFrame) -> None:
 
             if count > 0:
                 rate = hits / count
-                roi = (pnl / (count * 100)) * 100
-                print(f"  {min_ev:8.2f} {min_edge:10.1f} {count:6d} {hits:6d} {rate:7.1%} ${pnl:>+7.0f} {roi:>+6.1f}%")
+                accuracy = (pnl / (count * 100)) * 100
+                print(f"  {min_ev:8.2f} {min_advantage:10.1f} {count:6d} {hits:6d} {rate:7.1%} ${pnl:>+7.0f} {accuracy:>+6.1f}%")
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +599,7 @@ def main():
         return
 
     edges = pd.read_csv(edge_file)
-    print(f"\nLoaded {len(edges)} prop edge rows from {edge_file}")
+    print(f"\nLoaded {len(edges)} prediction advantage rows from {edge_file}")
 
     # Fetch actuals
     print(f"\nFetching actual box scores for {TARGET_DATE}...")

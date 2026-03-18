@@ -321,8 +321,8 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
-def kelly_from_ev(ev: float, cap: float = 0.10) -> float:
-    """Convert post-vig EV to a capped Kelly fraction."""
+def optimal_allocation(ev: float, cap: float = 0.10) -> float:
+    """Convert post-vig EV to a capped Allocation fraction."""
     if not np.isfinite(ev) or ev <= 0:
         return 0.0
     return clamp(float(ev) / VIG_FACTOR, 0.0, cap)
@@ -1368,7 +1368,7 @@ def recompute_market_signals(
                 spread_sig = "AWAY ATS"
                 p_bet_spread = p_away_cover
             else:
-                spread_sig = "NO BET"
+                spread_sig = "LOW CONFIDENCE"
                 p_bet_spread = np.nan
 
             spread_ev = (
@@ -1377,17 +1377,17 @@ def recompute_market_signals(
                 else 0.0
             )
             if spread_ev <= 0:
-                spread_sig = "NO BET"
+                spread_sig = "LOW CONFIDENCE"
                 spread_ev = 0.0
             spread_edge = margin_edge
         else:
             spread_edge = np.nan
-            spread_sig = "NO BET"
+            spread_sig = "LOW CONFIDENCE"
             spread_ev = 0.0
         spread_edges.append(spread_edge)
         spread_evs.append(spread_ev)
         spread_signals.append(spread_sig)
-        spread_kelly_pcts.append(kelly_from_ev(spread_ev) if spread_sig != "NO BET" else 0.0)
+        spread_kelly_pcts.append(optimal_allocation(spread_ev) if spread_sig != "LOW CONFIDENCE" else 0.0)
 
         # --- Moneyline edge from current win probability ---
         fair_home = one.get("market_home_implied_prob_close", np.nan) if has_market else np.nan
@@ -1402,19 +1402,19 @@ def recompute_market_signals(
                     ml_sig = "AWAY ML"
                 ml_ev = p_ml_bet * VIG_FACTOR - (1.0 - p_ml_bet)
                 if ml_ev <= 0:
-                    ml_sig = "NO BET"
+                    ml_sig = "LOW CONFIDENCE"
                     ml_ev = 0.0
             else:
-                ml_sig = "NO BET"
+                ml_sig = "LOW CONFIDENCE"
                 ml_ev = 0.0
         else:
             ml_home_edge = np.nan
-            ml_sig = "NO BET"
+            ml_sig = "LOW CONFIDENCE"
             ml_ev = 0.0
         ml_edges.append(ml_home_edge)
         ml_evs.append(ml_ev)
         ml_signals.append(ml_sig)
-        ml_kelly_pcts.append(kelly_from_ev(ml_ev) if ml_sig != "NO BET" else 0.0)
+        ml_kelly_pcts.append(optimal_allocation(ml_ev) if ml_sig != "LOW CONFIDENCE" else 0.0)
 
         # --- Total edge from current p_over ---
         if has_market and pd.notna(p_over):
@@ -1428,19 +1428,19 @@ def recompute_market_signals(
                     total_sig = "UNDER"
                 total_ev = p_bet_total * VIG_FACTOR - (1.0 - p_bet_total)
                 if total_ev <= 0:
-                    total_sig = "NO BET"
+                    total_sig = "LOW CONFIDENCE"
                     total_ev = 0.0
             else:
-                total_sig = "NO BET"
+                total_sig = "LOW CONFIDENCE"
                 total_ev = 0.0
         else:
             over_edge = np.nan
-            total_sig = "NO BET"
+            total_sig = "LOW CONFIDENCE"
             total_ev = 0.0
         total_edges.append(over_edge)
         total_evs.append(total_ev)
         total_signals.append(total_sig)
-        total_kelly_pcts.append(kelly_from_ev(total_ev) if total_sig != "NO BET" else 0.0)
+        total_kelly_pcts.append(optimal_allocation(total_ev) if total_sig != "LOW CONFIDENCE" else 0.0)
 
     out["p_over"] = p_overs
     out["p_under"] = p_unders
@@ -2004,21 +2004,21 @@ def main() -> None:
                 p_bet = p_away_cover
                 ev = p_bet * VIG_FACTOR - (1.0 - p_bet)
             else:
-                sig = "NO BET"
+                sig = "LOW CONFIDENCE"
                 ev = 0.0
             # Gate: only signal if EV is actually positive after vig
             if ev <= 0:
-                sig = "NO BET"
+                sig = "LOW CONFIDENCE"
                 ev = 0.0
             home_edge = margin_edge  # raw margin edge in points
         else:
             home_edge = np.nan
-            sig = "NO BET"
+            sig = "LOW CONFIDENCE"
             ev = 0.0
         win_edges.append(home_edge)
         win_evs.append(ev)
         spread_signals.append(sig)
-        spread_kelly_pcts.append(kelly_from_ev(ev) if sig != "NO BET" else 0.0)
+        spread_kelly_pcts.append(optimal_allocation(ev) if sig != "LOW CONFIDENCE" else 0.0)
 
         # --- Moneyline edge: compare win probability to market implied prob ---
         fair_home = one["market_home_implied_prob_close"].iloc[0] if has_market else np.nan
@@ -2033,19 +2033,19 @@ def main() -> None:
                     ml_sig = "AWAY ML"
                 ml_ev = p_ml_bet * VIG_FACTOR - (1.0 - p_ml_bet)
                 if ml_ev <= 0:
-                    ml_sig = "NO BET"
+                    ml_sig = "LOW CONFIDENCE"
                     ml_ev = 0.0
             else:
-                ml_sig = "NO BET"
+                ml_sig = "LOW CONFIDENCE"
                 ml_ev = 0.0
         else:
             ml_home_edge = np.nan
-            ml_sig = "NO BET"
+            ml_sig = "LOW CONFIDENCE"
             ml_ev = 0.0
         ml_edges.append(ml_home_edge)
         ml_evs.append(ml_ev)
         ml_signals.append(ml_sig)
-        ml_kelly_pcts.append(kelly_from_ev(ml_ev) if ml_sig != "NO BET" else 0.0)
+        ml_kelly_pcts.append(optimal_allocation(ml_ev) if ml_sig != "LOW CONFIDENCE" else 0.0)
 
         # --- Total edge ---
         if has_market and pd.notna(p_over):
@@ -2060,20 +2060,20 @@ def main() -> None:
                 t_ev = p_bet_total * VIG_FACTOR - (1.0 - p_bet_total)
                 # Gate: only signal if EV is actually positive after vig
                 if t_ev <= 0:
-                    t_sig = "NO BET"
+                    t_sig = "LOW CONFIDENCE"
                     t_ev = 0.0
             else:
-                t_sig = "NO BET"
+                t_sig = "LOW CONFIDENCE"
                 t_ev = 0.0
         else:
             over_edge = np.nan
-            t_sig = "NO BET"
+            t_sig = "LOW CONFIDENCE"
             t_ev = 0.0
         total_edges.append(over_edge)
         total_evs.append(t_ev)
         total_signals.append(t_sig)
-        # Kelly criterion for total bet from post-vig EV, capped at 10%.
-        total_kelly_pcts.append(kelly_from_ev(t_ev) if t_sig != "NO BET" else 0.0)
+        # Allocation criterion for total bet from post-vig EV, capped at 10%.
+        total_kelly_pcts.append(optimal_allocation(t_ev) if t_sig != "LOW CONFIDENCE" else 0.0)
 
         # --- Model agreement and confidence ---
         # Collect individual model picks (home=1, away=0)
@@ -2150,24 +2150,24 @@ def main() -> None:
             pred_df, residual_std=residual_std, total_residual_std=total_residual_std
         )
 
-    # --- Confidence-weighted Kelly sizing ---
-    # Scale Kelly percentages by model confidence to reduce sizing on uncertain bets.
+    # --- Confidence-weighted Allocation sizing ---
+    # Scale Allocation percentages by model confidence to reduce sizing on uncertain bets.
     KELLY_CONF_SCALE = {"HIGH": 1.0, "MED": 0.5, "LOW": 0.25, "VERY_LOW": 0.10}
-    DAILY_KELLY_CAP = 0.25  # 25% total bankroll cap per day
+    DAILY_ALLOCATION_CAP = 0.25  # 25% total portfolio cap per day
     for kcol in ["spread_kelly_pct", "ml_kelly_pct", "total_kelly_pct"]:
         if kcol in pred_df.columns:
             pred_df[kcol] = pred_df.apply(
                 lambda r: r[kcol] * KELLY_CONF_SCALE.get(r.get("model_confidence", "LOW"), 0.25),
                 axis=1,
             )
-    # Apply daily Kelly cap: proportionally scale down if total exceeds cap
+    # Apply daily Allocation cap: proportionally scale down if total exceeds cap
     total_kelly = (
         pred_df["spread_kelly_pct"].fillna(0).sum()
         + pred_df["ml_kelly_pct"].fillna(0).sum()
         + pred_df["total_kelly_pct"].fillna(0).sum()
     )
-    if total_kelly > DAILY_KELLY_CAP and total_kelly > 0:
-        scale_factor = DAILY_KELLY_CAP / total_kelly
+    if total_kelly > DAILY_ALLOCATION_CAP and total_kelly > 0:
+        scale_factor = DAILY_ALLOCATION_CAP / total_kelly
         for kcol in ["spread_kelly_pct", "ml_kelly_pct", "total_kelly_pct"]:
             if kcol in pred_df.columns:
                 pred_df[kcol] = pred_df[kcol] * scale_factor
@@ -2220,16 +2220,16 @@ def main() -> None:
 
         # Bet signals
         sigs = []
-        sp_sig = row.get("spread_bet_signal", "NO BET")
-        ml_sig = row.get("ml_bet_signal", "NO BET")
-        t_sig = row.get("total_bet_signal", "NO BET")
-        if sp_sig != "NO BET":
+        sp_sig = row.get("spread_bet_signal", "LOW CONFIDENCE")
+        ml_sig = row.get("ml_bet_signal", "LOW CONFIDENCE")
+        t_sig = row.get("total_bet_signal", "LOW CONFIDENCE")
+        if sp_sig != "LOW CONFIDENCE":
             sp_ev = row.get("spread_ev_pct", 0)
             sigs.append(f"{sp_sig} (EV {sp_ev:+.1f}%)")
-        if ml_sig != "NO BET":
+        if ml_sig != "LOW CONFIDENCE":
             ml_ev = row.get("ml_ev_pct", 0)
             sigs.append(f"{ml_sig} (EV {ml_ev:+.1f}%)")
-        if t_sig != "NO BET":
+        if t_sig != "LOW CONFIDENCE":
             t_ev = row.get("total_ev_pct", 0)
             sigs.append(f"{t_sig} (EV {t_ev:+.1f}%)")
         if sigs:
@@ -2248,14 +2248,14 @@ def main() -> None:
 
     # --- Summary ---
     n_games = len(pred_df)
-    spread_bets = pred_df[pred_df["spread_bet_signal"] != "NO BET"]
-    ml_bets = pred_df[pred_df["ml_bet_signal"] != "NO BET"]
-    total_bets = pred_df[pred_df["total_bet_signal"] != "NO BET"]
+    spread_bets = pred_df[pred_df["spread_bet_signal"] != "LOW CONFIDENCE"]
+    ml_bets = pred_df[pred_df["ml_bet_signal"] != "LOW CONFIDENCE"]
+    total_bets = pred_df[pred_df["total_bet_signal"] != "LOW CONFIDENCE"]
     n_spread = len(spread_bets)
     n_ml = len(ml_bets)
     n_total = len(total_bets)
 
-    print(f"\n=== BETTING SUMMARY ===")
+    print(f"\n=== PREDICTION SUMMARY ===")
     print(f"  Games analyzed:   {n_games}")
     print(f"  Spread (ATS):     {n_spread}/{n_games}")
     print(f"  Moneyline:        {n_ml}/{n_games}")
@@ -2269,7 +2269,7 @@ def main() -> None:
         best_kelly = 100 * best_spread["spread_kelly_pct"]
         spread_line = best_spread["market_home_spread_close"]
         line_str = f"{spread_line:+.1f}" if pd.notna(spread_line) else "?"
-        print(f"  Best spread:      {best_team} ({best_side}, line {line_str}) EV {best_ev_pct:+.1f}%  Kelly {best_kelly:.1f}%")
+        print(f"  Best spread:      {best_team} ({best_side}, line {line_str}) EV {best_ev_pct:+.1f}%  Allocation {best_kelly:.1f}%")
 
     if n_ml > 0:
         best_ml = ml_bets.loc[ml_bets["ml_ev_after_vig"].idxmax()]
@@ -2277,7 +2277,7 @@ def main() -> None:
         ml_team = best_ml["home_team"] if "HOME" in ml_side else best_ml["away_team"]
         ml_ev_pct = 100 * best_ml["ml_ev_after_vig"]
         ml_kelly = 100 * best_ml["ml_kelly_pct"]
-        print(f"  Best moneyline:   {ml_team} ({ml_side}) EV {ml_ev_pct:+.1f}%  Kelly {ml_kelly:.1f}%")
+        print(f"  Best moneyline:   {ml_team} ({ml_side}) EV {ml_ev_pct:+.1f}%  Allocation {ml_kelly:.1f}%")
 
     if n_total > 0:
         best_total = total_bets.loc[total_bets["total_ev_after_vig"].idxmax()]
@@ -2285,12 +2285,12 @@ def main() -> None:
         matchup = f"{best_total['away_team']}@{best_total['home_team']}"
         t_ev_pct = 100 * best_total["total_ev_after_vig"]
         t_kelly = 100 * best_total["total_kelly_pct"]
-        print(f"  Best total:       {matchup} ({t_side}) EV {t_ev_pct:+.1f}%  Kelly {t_kelly:.1f}%")
+        print(f"  Best total:       {matchup} ({t_side}) EV {t_ev_pct:+.1f}%  Allocation {t_kelly:.1f}%")
 
     if n_spread == 0 and n_ml == 0 and n_total == 0:
         print("  No actionable edges found.")
 
-    # Summary line: total signals, positive EV count, total Kelly allocation
+    # Summary line: total signals, positive EV count, total Allocation allocation
     n_total_signals = n_spread + n_ml + n_total
     n_positive_ev = (
         int((pred_df["spread_ev_after_vig"] > 0).sum())
@@ -2302,7 +2302,7 @@ def main() -> None:
         + pred_df["ml_kelly_pct"].fillna(0).sum()
         + pred_df["total_kelly_pct"].fillna(0).sum()
     )
-    print(f"\n  {n_total_signals} signals today ({n_positive_ev} positive EV), total Kelly allocation: {100*total_kelly_alloc:.1f}%")
+    print(f"\n  {n_total_signals} signals today ({n_positive_ev} positive EV), total Allocation allocation: {100*total_kelly_alloc:.1f}%")
 
     # --- Recent model performance (out-of-sample: train on all but last 100, test on last 100) ---
     holdout_n = 100

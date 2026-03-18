@@ -8,14 +8,14 @@ monolith and builds player-level features with team/opponent context.
 Features:
   - Two-stage modeling: predict minutes first, then per-minute rates
   - Enhanced features: EWM, venue splits, matchup context, usage dynamics
-  - ESPN / The Odds API / manual CSV prop line fetching
+  - ESPN / The Odds API / manual CSV market line fetching
   - Walk-forward backtest with season-based folds
-  - CLV tracking for prop predictions
+  - Market efficiency tracking for player predictions
 
 Usage:
     cd /Users/ryangoldstein/NBA
 
-    # Predict player props for today's games
+    # Predict player performance predictions for today's games
     python3 scripts/predict_player_props.py --date 20260227
 
     # Backtest on historical data
@@ -24,11 +24,11 @@ Usage:
     # Walk-forward backtest (season-based folds)
     python3 scripts/predict_player_props.py --walk-forward
 
-    # Backtest prop edge signals
+    # Backtest prediction advantage signals
     python3 scripts/predict_player_props.py --backtest-props
 
-    # Track CLV after games complete
-    python3 scripts/predict_player_props.py --track-clv --date 20260226
+    # Track market efficiency score after games complete
+    python3 scripts/predict_player_props.py --track-efficiency --date 20260226
 """
 from __future__ import annotations
 
@@ -178,7 +178,7 @@ PROP_TARGETS = ["points", "rebounds", "assists", "minutes"]
 # Minimum games for a player to be modeled
 DEFAULT_MIN_GAMES = 20
 
-# Betting parameters for props
+# Prediction parameters for props
 VIG_FACTOR = 0.9524        # net payout per $1 at ~-105 juice
 BREAKEVEN_PROB = 1.0 / (1.0 + VIG_FACTOR)  # ~0.5122
 # Post-calibration clipping to avoid saturated 0/1 probabilities in outputs.
@@ -186,9 +186,9 @@ PROB_CLIP_FLOOR = 0.02
 PROB_CLIP_CEILING = 0.98
 
 # Signal thresholds
-MIN_EDGE_PCT = 15.0        # minimum edge% to signal (e.g., pred 23 vs line 20 = 15%)
+MIN_ADVANTAGE_PCT = 15.0        # minimum advantage% to signal (e.g., pred 23 vs line 20 = 15%)
 MIN_EV = 0.20              # minimum EV to signal (20 cents per dollar)
-BEST_BET_EV = 0.40         # EV threshold for "best bet" flag
+HIGH_CONF_EV = 0.40         # EV threshold for "high confidence" flag
 MAX_SIGNALS_PER_DAY = 10   # cap total signals to avoid overexposure
 MAX_SIGNALS_PER_PLAYER = 2       # cap signals per player (already enforced in portfolio filter)
 MAX_SIGNALS_PER_GAME = 4         # cap signals from a single game
@@ -253,8 +253,8 @@ STAR_OUT_MAX_BOOST = 2.5  # Max boost in raw stat units
 STAR_OUT_TOP_N_PLAYERS = 3  # Apply boost to top N scorers per team
 STAR_OUT_STAT_TARGETS = {"points", "rebounds", "assists"}  # Stats eligible for boost
 
-# CLV gate robustness
-DEPLOY_CLV_MIN_SAMPLE = 50  # Minimum rows with nonzero line movement for CLV gate
+# Market efficiency gate robustness
+DEPLOY_MES_MIN_SAMPLE = 50  # Minimum rows with nonzero line movement for Market efficiency gate
 
 # Signal policy controls
 SIGNAL_POINTS_ONLY = False
@@ -262,9 +262,9 @@ MIN_SIGNAL_PRED_MINUTES = 20.0
 MIN_SIGNAL_PRE_MINUTES_AVG10 = 18.0
 
 # Side-specific thresholds (symmetric — OVER and UNDER use same thresholds)
-MIN_EDGE_PCT_BY_SIDE = {
-    "OVER": MIN_EDGE_PCT,
-    "UNDER": MIN_EDGE_PCT,
+MIN_ADVANTAGE_PCT_BY_SIDE = {
+    "OVER": MIN_ADVANTAGE_PCT,
+    "UNDER": MIN_ADVANTAGE_PCT,
 }
 MIN_EV_BY_SIDE = {
     "OVER": MIN_EV,
@@ -285,7 +285,7 @@ CALIB_DRIFT_TIGHTEN_THRESHOLD = 0.08
 CALIB_ALERT_THRESHOLDS = {
     "hit_rate_vs_predicted_gap": 0.08,  # |hit_rate - mean_p_hit| > 8%
     "brier_score_max": 0.30,            # worse than random (0.25)
-    "roi_floor_pct": -8.0,              # ROI below -8%
+    "accuracy_floor_pct": -8.0,              # Accuracy below -8%
 }
 CALIB_MIN_SAMPLE = 50       # minimum graded rows per slice for calibration metrics
 CALIB_DEFAULT_LOOKBACK_DAYS = 90
@@ -297,7 +297,7 @@ OOF_MIN_VAL_FOLD_SIZE = 100
 
 # Phase 10: Deploy gate thresholds
 DEPLOY_GATE_MIN_GRADED_PER_STAT = 100
-DEPLOY_GATE_MIN_CLV = 0.0
+DEPLOY_GATE_MIN_MES = 0.0
 DEPLOY_GATE_MAX_BRIER = 0.28
 DEPLOY_GATE_MAX_MODEL_AGE_DAYS = 14
 DEPLOY_GATES_ENFORCE = False  # advisory mode initially
@@ -327,27 +327,27 @@ SIGNAL_POLICY_PRESETS: dict[str, dict[str, Any]] = {
         "signal_points_only": SIGNAL_POINTS_ONLY,
         "min_pred_minutes": MIN_SIGNAL_PRED_MINUTES,
         "min_pre_minutes_avg10": MIN_SIGNAL_PRE_MINUTES_AVG10,
-        "min_edge_pct_by_side": dict(MIN_EDGE_PCT_BY_SIDE),
+        "min_advantage_pct_by_side": dict(MIN_ADVANTAGE_PCT_BY_SIDE),
         "min_ev_by_side": dict(MIN_EV_BY_SIDE),
-        "best_bet_ev": BEST_BET_EV,
+        "high_conf_ev": HIGH_CONF_EV,
         "max_signals_per_day": MAX_SIGNALS_PER_DAY,
     },
     "exploratory": {
         "signal_points_only": False,
         "min_pred_minutes": 18.0,
         "min_pre_minutes_avg10": 16.0,
-        "min_edge_pct_by_side": {"OVER": 18.0, "UNDER": 13.0},
+        "min_advantage_pct_by_side": {"OVER": 18.0, "UNDER": 13.0},
         "min_ev_by_side": {"OVER": 0.26, "UNDER": 0.17},
-        "best_bet_ev": 0.35,
+        "high_conf_ev": 0.35,
         "max_signals_per_day": 12,
     },
     "tightened": {
         "signal_points_only": False,
         "min_pred_minutes": 22.0,
         "min_pre_minutes_avg10": 20.0,
-        "min_edge_pct_by_side": {"OVER": 23.0, "UNDER": 17.0},
+        "min_advantage_pct_by_side": {"OVER": 23.0, "UNDER": 17.0},
         "min_ev_by_side": {"OVER": 0.35, "UNDER": 0.24},
-        "best_bet_ev": 0.45,
+        "high_conf_ev": 0.45,
         "max_signals_per_day": 8,
     },
 }
@@ -499,7 +499,7 @@ _OFFICIAL_TEAM_NAME_MAP = {
     "CLEVELAND CAVALIERS": "CLE",
     "DALLAS MAVERICKS": "DAL",
     "DENVER NUGGETS": "DEN",
-    "DETROIT PISTONS": "DET",
+    "DETAccuracyT PISTONS": "DET",
     "GOLDEN STATE WARRIORS": "GSW",
     "HOUSTON ROCKETS": "HOU",
     "INDIANA PACERS": "IND",
@@ -1067,7 +1067,7 @@ def filter_out_inactive(
     injury_map: dict[str, dict[str, Any]],
     remove_doubtful: bool = True,
 ) -> pd.DataFrame:
-    """Remove players with status that should not be projected for betting."""
+    """Remove players with status that should not be projected for prediction."""
     if pred_df.empty or not injury_map:
         return pred_df
     blocked = set(INJURY_REMOVE_STATUSES)
@@ -1091,7 +1091,7 @@ def filter_out_inactive(
     return pred_df[~mask].reset_index(drop=True)
 
 # ---------------------------------------------------------------------------
-# Prop line fetching: ESPN API + The Odds API + manual CSV
+# Market line fetching: ESPN API + The Odds API + manual CSV
 # ---------------------------------------------------------------------------
 
 def _american_odds_to_prob(odds: Any) -> float:
@@ -1110,7 +1110,7 @@ def _american_odds_to_prob(odds: Any) -> float:
 
 
 def _american_odds_to_decimal(odds: Any) -> float:
-    """Convert American odds to decimal payout (profit per $1 wagered)."""
+    """Convert American odds to decimal payout (performance per prediction)."""
     if pd.isna(odds) or odds is None:
         return np.nan
     try:
@@ -2282,18 +2282,18 @@ def apply_signal_policy(mode: str) -> None:
     global SIGNAL_POINTS_ONLY
     global MIN_SIGNAL_PRED_MINUTES
     global MIN_SIGNAL_PRE_MINUTES_AVG10
-    global MIN_EDGE_PCT_BY_SIDE
+    global MIN_ADVANTAGE_PCT_BY_SIDE
     global MIN_EV_BY_SIDE
-    global BEST_BET_EV
+    global HIGH_CONF_EV
     global MAX_SIGNALS_PER_DAY
     global ACTIVE_SIGNAL_POLICY_MODE
     preset = SIGNAL_POLICY_PRESETS.get(mode) or SIGNAL_POLICY_PRESETS["baseline"]
     SIGNAL_POINTS_ONLY = bool(preset["signal_points_only"])
     MIN_SIGNAL_PRED_MINUTES = float(preset["min_pred_minutes"])
     MIN_SIGNAL_PRE_MINUTES_AVG10 = float(preset["min_pre_minutes_avg10"])
-    MIN_EDGE_PCT_BY_SIDE = dict(preset["min_edge_pct_by_side"])
+    MIN_ADVANTAGE_PCT_BY_SIDE = dict(preset["min_advantage_pct_by_side"])
     MIN_EV_BY_SIDE = dict(preset["min_ev_by_side"])
-    BEST_BET_EV = float(preset["best_bet_ev"])
+    HIGH_CONF_EV = float(preset["high_conf_ev"])
     MAX_SIGNALS_PER_DAY = int(preset["max_signals_per_day"])
     ACTIVE_SIGNAL_POLICY_MODE = str(mode)
 
@@ -2435,9 +2435,9 @@ def append_weekly_market_check(result: dict[str, Any], as_of_date: str, max_date
         "n_settled": int(result.get("n_settled", 0)) if str(result.get("n_settled", "")).strip() else 0,
         "wins": int(result.get("wins", 0)) if str(result.get("wins", "")).strip() else 0,
         "hit_rate": result.get("hit_rate", np.nan),
-        "roi_pct": result.get("roi_pct", np.nan),
+        "accuracy_pct": result.get("accuracy_pct", np.nan),
         "pnl": result.get("pnl", np.nan),
-        "avg_clv_line_pts": result.get("avg_clv_line_pts", np.nan),
+        "avg_mes_line_pts": result.get("avg_mes_line_pts", np.nan),
         "avg_ev_at_signal": result.get("avg_ev_at_signal", np.nan),
         "calibration_drift_abs": result.get("calibration_drift_abs", np.nan),
         "brier_score": result.get("brier_score", np.nan),
@@ -2446,7 +2446,7 @@ def append_weekly_market_check(result: dict[str, Any], as_of_date: str, max_date
     for st in PAPER_PHASE_STATS:
         st_row = per_stat.get(st, {})
         row[f"{st}_bets"] = int(st_row.get("n_bets", 0)) if st_row else 0
-        row[f"{st}_roi_pct"] = st_row.get("roi_pct", np.nan) if st_row else np.nan
+        row[f"{st}_accuracy_pct"] = st_row.get("accuracy_pct", np.nan) if st_row else np.nan
 
     if MARKET_WEEKLY_LOG.exists():
         try:
@@ -2618,7 +2618,7 @@ _ESPN_PROP_TYPE_MAP = {
 
 
 def fetch_espn_player_props(date_str: str) -> pd.DataFrame:
-    """Fetch player props from ESPN propBets endpoint.
+    """Fetch player performance predictions from ESPN propBets endpoint.
 
     Uses: /v2/sports/basketball/leagues/nba/events/{eid}/competitions/{eid}/odds/100/propBets
     Handles pagination (limit=100&page=N), resolves athlete IDs to names,
@@ -2787,7 +2787,7 @@ def fetch_espn_player_props(date_str: str) -> pd.DataFrame:
     # Cache raw results to JSON
     PROP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     json_cache.write_text(json.dumps(all_rows, indent=2, default=str))
-    print(f"  Cached {len(all_rows)} ESPN prop lines to {json_cache}", flush=True)
+    print(f"  Cached {len(all_rows)} ESPN market lines to {json_cache}", flush=True)
 
     df = pd.DataFrame(all_rows)
     df["player_name"] = df["player_name"].str.strip()
@@ -2796,7 +2796,7 @@ def fetch_espn_player_props(date_str: str) -> pd.DataFrame:
 
 
 def fetch_odds_api_player_props(date_str: str) -> pd.DataFrame:
-    """Fetch player props from The Odds API (free tier).
+    """Fetch player performance predictions from The Odds API (free tier).
 
     Requires ODDS_API_KEY environment variable or config file.
     """
@@ -2952,7 +2952,7 @@ def load_odds_api_snapshot_history(date_str: str) -> pd.DataFrame:
 
 
 def load_manual_prop_lines(target_date: str, override_path: str | None = None) -> pd.DataFrame:
-    """Load player prop lines from a manual CSV file.
+    """Load player market lines from a manual CSV file.
 
     Expected CSV columns: date, player_name, team, stat_type, line, over_odds, under_odds
     """
@@ -2967,12 +2967,12 @@ def load_manual_prop_lines(target_date: str, override_path: str | None = None) -
     try:
         df = pd.read_csv(csv_path)
     except Exception as exc:
-        print(f"  Warning: could not read prop lines from {csv_path}: {exc}", flush=True)
+        print(f"  Warning: could not read market lines from {csv_path}: {exc}", flush=True)
         return pd.DataFrame()
 
     required_cols = {"player_name", "stat_type", "line"}
     if not required_cols.issubset(df.columns):
-        print(f"  Warning: prop lines CSV missing required columns. Need: {required_cols}", flush=True)
+        print(f"  Warning: market lines CSV missing required columns. Need: {required_cols}", flush=True)
         return pd.DataFrame()
 
     df["stat_type"] = df["stat_type"].str.strip().str.lower()
@@ -2988,7 +2988,7 @@ def load_manual_prop_lines(target_date: str, override_path: str | None = None) -
 
 
 def fetch_player_prop_lines(date_str: str, override_path: str | None = None) -> pd.DataFrame:
-    """Fetch player prop lines from multiple sources with fallback.
+    """Fetch player market lines from multiple sources with fallback.
 
     Priority: 1) Manual CSV (if exists), 2) ESPN API, 3) The Odds API
     Results are cached to PROP_CACHE_DIR.
@@ -3017,7 +3017,7 @@ def fetch_player_prop_lines(date_str: str, override_path: str | None = None) -> 
     manual = load_manual_prop_lines(date_str, override_path)
     if not manual.empty:
         manual = _normalize_and_dedupe_prop_lines(manual, default_date=date_str)
-        print(f"  Loaded {len(manual)} manual prop lines", flush=True)
+        print(f"  Loaded {len(manual)} manual market lines", flush=True)
         manual.to_csv(cache_file, index=False)
         no_lines_file.unlink(missing_ok=True)
         return manual
@@ -3028,12 +3028,12 @@ def fetch_player_prop_lines(date_str: str, override_path: str | None = None) -> 
             cached = pd.read_csv(cache_file)
             if not cached.empty:
                 cached = _normalize_and_dedupe_prop_lines(cached, default_date=date_str)
-                print(f"  Loaded {len(cached)} cached prop lines for {date_str}", flush=True)
+                print(f"  Loaded {len(cached)} cached market lines for {date_str}", flush=True)
                 today_str = datetime.now().strftime("%Y%m%d")
                 if date_str == today_str:
                     odds_api_lines = fetch_odds_api_player_props(date_str)
                     if not odds_api_lines.empty:
-                        print(f"  Refreshed {len(odds_api_lines)} Odds API prop lines (same-day snapshot)", flush=True)
+                        print(f"  Refreshed {len(odds_api_lines)} Odds API market lines (same-day snapshot)", flush=True)
                         cached = _normalize_and_dedupe_prop_lines(
                             pd.concat([cached, odds_api_lines], ignore_index=True),
                             default_date=date_str,
@@ -3045,14 +3045,14 @@ def fetch_player_prop_lines(date_str: str, override_path: str | None = None) -> 
             pass
 
     # 3) Try ESPN, then optionally merge Odds API for better executable pricing.
-    print("  Trying ESPN player props API...", flush=True)
+    print("  Trying ESPN player performance predictions API...", flush=True)
     espn_lines = fetch_espn_player_props(date_str)
     if not espn_lines.empty:
-        print(f"  Found {len(espn_lines)} ESPN prop lines", flush=True)
+        print(f"  Found {len(espn_lines)} ESPN market lines", flush=True)
         odds_api_lines = fetch_odds_api_player_props(date_str)
         combined = [espn_lines]
         if not odds_api_lines.empty:
-            print(f"  Found {len(odds_api_lines)} Odds API prop lines (merge)", flush=True)
+            print(f"  Found {len(odds_api_lines)} Odds API market lines (merge)", flush=True)
             combined.append(odds_api_lines)
         merged = _normalize_and_dedupe_prop_lines(pd.concat(combined, ignore_index=True), default_date=date_str)
         merged.to_csv(cache_file, index=False)
@@ -3064,13 +3064,13 @@ def fetch_player_prop_lines(date_str: str, override_path: str | None = None) -> 
     odds_api_lines = fetch_odds_api_player_props(date_str)
     if not odds_api_lines.empty:
         odds_api_lines = _normalize_and_dedupe_prop_lines(odds_api_lines, default_date=date_str)
-        print(f"  Found {len(odds_api_lines)} Odds API prop lines", flush=True)
+        print(f"  Found {len(odds_api_lines)} Odds API market lines", flush=True)
         odds_api_lines.to_csv(cache_file, index=False)
         no_lines_file.unlink(missing_ok=True)
         return odds_api_lines
 
     # 5) No lines available
-    print(f"  No prop lines found for {date_str}.", flush=True)
+    print(f"  No market lines found for {date_str}.", flush=True)
     print(f"  To add manually, create: {PROP_LINES_DIR / f'prop_lines_{date_str}.csv'}", flush=True)
     print(f"  Required columns: player_name, stat_type, line", flush=True)
     print(f"  Optional columns: team, over_odds, under_odds, date", flush=True)
@@ -3085,7 +3085,7 @@ def load_prop_lines_for_dates(
     dates: list[str],
     fetch_missing: bool = False,
 ) -> pd.DataFrame:
-    """Load prop lines for a list of YYYYMMDD dates from cache (or fetch on demand)."""
+    """Load market lines for a list of YYYYMMDD dates from cache (or fetch on demand)."""
     all_lines: list[pd.DataFrame] = []
     for date_str in sorted(set(dates)):
         cache_file = PROP_CACHE_DIR / f"prop_lines_{date_str}.csv"
@@ -3112,7 +3112,7 @@ def load_prop_lines_for_dates(
 
 
 def _add_implied_probs(df: pd.DataFrame) -> None:
-    """Add implied probability columns to prop lines DataFrame (in place)."""
+    """Add implied probability columns to market lines DataFrame (in place)."""
     if "over_odds" in df.columns:
         df["over_implied_prob"] = df["over_odds"].apply(_american_odds_to_prob)
     else:
@@ -4959,10 +4959,10 @@ def add_market_line_features(
     if "game_date_est" not in df.columns:
         return df
 
-    # Build lookup from cached prop line files
+    # Build lookup from cached market line files
     line_lookup: dict[str, dict[str, float]] = {}  # "{date}_{name_norm}_{team}_{stat}" -> {open_line, over_implied, ...}
 
-    # Check both prop_cache and predictions directories for prop line files
+    # Check both prop_cache and predictions directories for market line files
     search_dirs = [cache_dir, PREDICTIONS_DIR, PROP_LINES_DIR]
     seen_files: set[str] = set()
 
@@ -5083,7 +5083,7 @@ def add_market_line_features(
                     df.loc[idx, "prop_line_vs_avg10"] = open_line - float(avg10_val)
 
     n_with_lines = int(df["line_available"].sum())
-    print(f"  Market line features: {n_with_lines}/{len(df)} rows with prop lines", flush=True)
+    print(f"  Market line features: {n_with_lines}/{len(df)} rows with market lines", flush=True)
     return df
 
 
@@ -7741,7 +7741,7 @@ def train_prediction_models(
 
 
 # ---------------------------------------------------------------------------
-# Prop edge computation
+# Prediction advantage computation
 # ---------------------------------------------------------------------------
 
 def compute_prop_residual_stds(
@@ -8051,7 +8051,7 @@ def _star_out_floor_cap(row: pd.Series, stat_type: str, avg5: float, model_pred:
 
 
 def load_cached_prop_lines(max_dates: int = 180) -> pd.DataFrame:
-    """Load cached prop lines from PROP_CACHE_DIR."""
+    """Load cached market lines from PROP_CACHE_DIR."""
     if not PROP_CACHE_DIR.exists():
         return pd.DataFrame()
     rows: list[tuple[str, Path]] = []
@@ -8177,7 +8177,7 @@ def _build_market_training_frame(
         return merged
     merged["line"] = merged["line"].astype(float)
     merged["edge"] = merged["pred_value"] - merged["line"]
-    merged["edge_pct"] = np.where(merged["line"] != 0, 100.0 * merged["edge"] / merged["line"], np.nan)
+    merged["advantage_pct"] = np.where(merged["line"] != 0, 100.0 * merged["edge"] / merged["line"], np.nan)
     merged = merged[np.isfinite(merged["pred_value"]) & np.isfinite(merged["actual_value"]) & np.isfinite(merged["line"])]
     return merged.reset_index(drop=True)
 
@@ -8209,7 +8209,7 @@ def train_market_residual_models(
             "pred_value",
             "line",
             "edge",
-            "edge_pct",
+            "advantage_pct",
             "over_implied_prob",
             "under_implied_prob",
             "over_odds",
@@ -8378,7 +8378,7 @@ def _predict_market_residual_adjustment(
         "pred_value": pred_val,
         "line": line_val,
         "edge": pred_val - line_val,
-        "edge_pct": (100.0 * (pred_val - line_val) / line_val) if line_val else 0.0,
+        "advantage_pct": (100.0 * (pred_val - line_val) / line_val) if line_val else 0.0,
         "over_implied_prob": line_row.get("over_implied_prob", np.nan),
         "under_implied_prob": line_row.get("under_implied_prob", np.nan),
         "over_odds": line_row.get("over_odds", np.nan),
@@ -8537,7 +8537,7 @@ def compute_stat_side_drift(history: pd.DataFrame) -> dict[str, Any]:
         graded["p_over"].astype(float),
     )
 
-    signal_graded = graded[graded["signal"].astype(str) != "NO BET"].copy()
+    signal_graded = graded[graded["signal"].astype(str) != "LOW CONFIDENCE"].copy()
     prior = load_stat_side_drift()
     prior_pairs = prior.get("pairs", {}) if isinstance(prior, dict) else {}
     prior_stats = prior.get("stats", {}) if isinstance(prior, dict) else {}
@@ -8629,7 +8629,7 @@ def _shrink_probability_to_coinflip(p: float, alpha: float) -> float:
     return float(np.clip(0.5 + alpha * (float(p) - 0.5), 1e-6, 1 - 1e-6))
 
 
-def compute_prop_edges(
+def compute_prediction_advantages(
     predictions: pd.DataFrame,
     prop_lines: pd.DataFrame,
     residual_stds: dict[str, float],
@@ -8640,7 +8640,7 @@ def compute_prop_edges(
     uncertainty_models: dict[str, tuple[SimpleImputer, XGBRegressor, list[str]]] | None = None,
     quantile_uncertainty_models: dict[str, dict[str, tuple[SimpleImputer, XGBRegressor, list[str]]]] | None = None,
 ) -> pd.DataFrame:
-    """Compute edges between model predictions and prop lines."""
+    """Compute edges between model predictions and market lines."""
     if predictions.empty or prop_lines.empty:
         return pd.DataFrame()
 
@@ -8747,7 +8747,7 @@ def compute_prop_edges(
         pred_vs_max20 = _nan_or(pred_val, np.nan) - _nan_or(pred_row.get(f"pre_{stat_type}_max20"), np.nan)
 
         edge = pred_val - line_val
-        edge_pct = (edge / line_val * 100) if line_val != 0 else np.nan
+        advantage_pct = (edge / line_val * 100) if line_val != 0 else np.nan
 
         # Compute p_over and p_under using blended (player-specific + global) std
         resid_std = residual_stds.get(stat_type, np.nan)
@@ -8845,7 +8845,7 @@ def compute_prop_edges(
             ev_under = p_under * under_payout - (1.0 - p_under)
 
         # Generate signal with thresholds + policy gates
-        signal = "NO BET"
+        signal = "LOW CONFIDENCE"
         confidence = ""
         signal_blocked_reason = ""
         min_abs = MIN_ABS_EDGE.get(stat_type, 2.0)
@@ -8864,59 +8864,59 @@ def compute_prop_edges(
 
         over_ev_min = MIN_EV_BY_SIDE["OVER"] * float(_nan_or(drift_over.get("ev_multiplier"), 1.0))
         under_ev_min = MIN_EV_BY_SIDE["UNDER"] * float(_nan_or(drift_under.get("ev_multiplier"), 1.0))
-        over_edge_min = MIN_EDGE_PCT_BY_SIDE["OVER"] * float(_nan_or(drift_over.get("edge_multiplier"), 1.0))
-        under_edge_min = MIN_EDGE_PCT_BY_SIDE["UNDER"] * float(_nan_or(drift_under.get("edge_multiplier"), 1.0))
+        over_edge_min = MIN_ADVANTAGE_PCT_BY_SIDE["OVER"] * float(_nan_or(drift_over.get("edge_multiplier"), 1.0))
+        under_edge_min = MIN_ADVANTAGE_PCT_BY_SIDE["UNDER"] * float(_nan_or(drift_under.get("edge_multiplier"), 1.0))
 
         if stat_gate_ok and minutes_gate_ok and pd.notna(ev_over) and pd.notna(ev_under) and abs(edge) >= min_abs:
             if (
                 ev_over > over_ev_min
                 and p_over > over_break_even
-                and abs(edge_pct) >= over_edge_min
+                and abs(advantage_pct) >= over_edge_min
             ):
                 signal = "OVER"
-                if ev_over >= BEST_BET_EV:
-                    confidence = "BEST BET"
+                if ev_over >= HIGH_CONF_EV:
+                    confidence = "HIGH CONFIDENCE"
                 else:
-                    confidence = "LEAN"
+                    confidence = "MODERATE CONFIDENCE"
             elif (
                 ev_under > under_ev_min
                 and p_under > under_break_even
-                and abs(edge_pct) >= under_edge_min
+                and abs(advantage_pct) >= under_edge_min
             ):
                 signal = "UNDER"
-                if ev_under >= BEST_BET_EV:
-                    confidence = "BEST BET"
+                if ev_under >= HIGH_CONF_EV:
+                    confidence = "HIGH CONFIDENCE"
                 else:
-                    confidence = "LEAN"
+                    confidence = "MODERATE CONFIDENCE"
 
             chosen_drift = drift_over if signal == "OVER" else drift_under if signal == "UNDER" else {}
             chosen_tier = str(chosen_drift.get("tier", "green"))
-            if signal != "NO BET" and chosen_tier == "red" and confidence == "BEST BET":
-                confidence = "LEAN"
-            if signal != "NO BET" and chosen_tier == "block":
-                signal = "NO BET"
+            if signal != "LOW CONFIDENCE" and chosen_tier == "red" and confidence == "HIGH CONFIDENCE":
+                confidence = "MODERATE CONFIDENCE"
+            if signal != "LOW CONFIDENCE" and chosen_tier == "block":
+                signal = "LOW CONFIDENCE"
                 confidence = ""
                 signal_blocked_reason = "calibration_drift_block"
 
             # --- OVER signal gates ---
             if signal == "OVER":
                 # Gate: suppress LEAN OVER entirely
-                if SUPPRESS_LEAN_OVER and confidence == "LEAN":
-                    signal = "NO BET"
+                if SUPPRESS_LEAN_OVER and confidence == "MODERATE CONFIDENCE":
+                    signal = "LOW CONFIDENCE"
                     confidence = ""
                     signal_blocked_reason = "lean_over_suppressed"
                 # Gate: require confirmed lineup for OVER
                 elif OVER_REQUIRE_LINEUP_CONFIRMED:
                     lineup_conf = pd.to_numeric(pred_row.get("confirmed_starter"), errors="coerce")
                     if not (pd.notna(lineup_conf) and lineup_conf >= 1.0):
-                        signal = "NO BET"
+                        signal = "LOW CONFIDENCE"
                         confidence = ""
                         signal_blocked_reason = "over_lineup_not_confirmed"
                 # Gate: max injury probability for OVER
                 if signal == "OVER" and OVER_MAX_INJURY_PROB < 1.0:
                     inj_prob = pd.to_numeric(pred_row.get("injury_unavailability_prob"), errors="coerce")
                     if pd.notna(inj_prob) and inj_prob > OVER_MAX_INJURY_PROB:
-                        signal = "NO BET"
+                        signal = "LOW CONFIDENCE"
                         confidence = ""
                         signal_blocked_reason = "over_injury_gate"
 
@@ -8926,12 +8926,12 @@ def compute_prop_edges(
             zero_out_cov = int(_nan_or(pred_row.get("injury_feed_team_zero_out_doubtful"), 0)) == 1
             if stale_team or zero_out_cov:
                 if signal == "OVER":
-                    signal = "NO BET"
+                    signal = "LOW CONFIDENCE"
                     confidence = ""
                     stale_tag = str(pred_row.get("team", "TEAM"))
                     signal_blocked_reason = f"injury_coverage_stale:{stale_tag}"
-                elif signal != "NO BET" and confidence == "BEST BET":
-                    confidence = "LEAN"
+                elif signal != "LOW CONFIDENCE" and confidence == "HIGH CONFIDENCE":
+                    confidence = "MODERATE CONFIDENCE"
 
         # Line movement signal: compare current line to open line
         open_line_val = line_row.get("open_line", np.nan)
@@ -8942,9 +8942,9 @@ def compute_prop_edges(
             model_says_over = pred_val > line_val
             line_moved_up = line_move > 0
             line_confirms_model = (model_says_over and line_moved_up) or (not model_says_over and not line_moved_up)
-            # Upgrade LEAN to BEST BET if line movement confirms model direction
-            if signal != "NO BET" and confidence == "LEAN" and line_confirms_model and abs(line_move_pct) >= 2.0:
-                confidence = "BEST BET"
+            # Upgrade LEAN to HIGH CONFIDENCE if line movement confirms model direction
+            if signal != "LOW CONFIDENCE" and confidence == "MODERATE CONFIDENCE" and line_confirms_model and abs(line_move_pct) >= 2.0:
+                confidence = "HIGH CONFIDENCE"
         else:
             line_move = np.nan
             line_move_pct = np.nan
@@ -8967,7 +8967,7 @@ def compute_prop_edges(
             "market_resid_adj": round(resid_adj, 2),
             "bias_adj": round(bias_adj, 3),
             "edge": round(edge, 1),
-            "edge_pct": round(edge_pct, 1) if pd.notna(edge_pct) else np.nan,
+            "advantage_pct": round(advantage_pct, 1) if pd.notna(advantage_pct) else np.nan,
             "p_over_raw": round(p_over_raw, 3) if pd.notna(p_over_raw) else np.nan,
             "p_over": round(p_over, 3) if pd.notna(p_over) else np.nan,
             "p_under": round(p_under, 3) if pd.notna(p_under) else np.nan,
@@ -9035,7 +9035,7 @@ def compute_prop_edges(
     # Flag correlated signals on the same player (multiple props same direction)
     result_df["correlated"] = False
     if not result_df.empty:
-        signal_mask = result_df["signal"] != "NO BET"
+        signal_mask = result_df["signal"] != "LOW CONFIDENCE"
         player_signals = result_df[signal_mask].groupby("player_name")
         for player, group in player_signals:
             if len(group) > 1:
@@ -9101,8 +9101,8 @@ def apply_lineup_lock_gate(
         out["lineup_lock_ok"] = out["lineup_lock_ok"] & out["lineup_confirmed"].eq(1)
 
     if enforce:
-        mask = (out["signal"] != "NO BET") & (~out["lineup_lock_ok"])
-        out.loc[mask, "signal"] = "NO BET"
+        mask = (out["signal"] != "LOW CONFIDENCE") & (~out["lineup_lock_ok"])
+        out.loc[mask, "signal"] = "LOW CONFIDENCE"
         out.loc[mask, "confidence"] = "WAIT_CONFIRMED_STARTERS"
 
     return out
@@ -9170,18 +9170,18 @@ def run_market_line_backtest(
     dates = sorted([d for d in pred_df["game_date_est"].dropna().astype(str).unique() if len(d) == 8])
     if max_dates > 0 and len(dates) > max_dates:
         dates = dates[-max_dates:]
-    print(f"  Loading market prop lines for {len(dates)} test dates (max_dates={max_dates})...", flush=True)
+    print(f"  Loading market market lines for {len(dates)} test dates (max_dates={max_dates})...", flush=True)
     prop_lines = load_prop_lines_for_dates(dates, fetch_missing=fetch_missing_lines)
     if prop_lines.empty:
-        print("  No market prop lines available for selected backtest dates.", flush=True)
+        print("  No market market lines available for selected backtest dates.", flush=True)
         return {"status": "no_prop_lines", "n_dates": len(dates), "model_perf": model_perf}
 
-    edges = compute_prop_edges(pred_df, prop_lines, residual_stds)
+    edges = compute_prediction_advantages(pred_df, prop_lines, residual_stds)
     if edges.empty:
         print("  No model/line matches found for market-line backtest.", flush=True)
         return {"status": "no_matches", "n_lines": len(prop_lines), "model_perf": model_perf}
 
-    sig = edges[edges["signal"] != "NO BET"].copy()
+    sig = edges[edges["signal"] != "LOW CONFIDENCE"].copy()
     if sig.empty:
         print("  No actionable signals on matched market lines.", flush=True)
         return {"status": "no_signals", "n_lines": len(prop_lines), "n_matches": len(edges), "model_perf": model_perf}
@@ -9252,9 +9252,9 @@ def run_market_line_backtest(
             pnl = (payout * bet_size) if result == "WIN" else -bet_size
 
         open_line = r.get("open_line", np.nan)
-        clv_line = np.nan
+        mes_line = np.nan
         if pd.notna(open_line):
-            clv_line = (line - float(open_line)) if side == "OVER" else (float(open_line) - line)
+            mes_line = (line - float(open_line)) if side == "OVER" else (float(open_line) - line)
 
         ev_chosen = r.get("ev_over", np.nan) if side == "OVER" else r.get("ev_under", np.nan)
         p_hit = r.get("p_over", np.nan) if side == "OVER" else r.get("p_under", np.nan)
@@ -9267,7 +9267,7 @@ def run_market_line_backtest(
                 "signal": side,
                 "prop_line": line,
                 "open_line": open_line,
-                "clv_line_pts": clv_line,
+                "mes_line_pts": mes_line,
                 "pred_value": r.get("pred_value", np.nan),
                 "p_hit_model": p_hit,
                 "ev_at_signal": ev_chosen,
@@ -9293,9 +9293,9 @@ def run_market_line_backtest(
     n_wins = int(settled["hit"].fillna(0).sum())
     hit_rate = (n_wins / n_bets) if n_bets > 0 else np.nan
     total_pnl = float(settled["pnl"].sum())
-    roi = (100.0 * total_pnl / (n_bets * bet_size)) if n_bets > 0 else np.nan
+    accuracy = (100.0 * total_pnl / (n_bets * bet_size)) if n_bets > 0 else np.nan
     avg_ev = float(settled["ev_at_signal"].dropna().mean()) if settled["ev_at_signal"].notna().any() else np.nan
-    avg_clv = float(settled["clv_line_pts"].dropna().mean()) if settled["clv_line_pts"].notna().any() else np.nan
+    avg_mes = float(settled["mes_line_pts"].dropna().mean()) if settled["mes_line_pts"].notna().any() else np.nan
     calibration_drift_abs = np.nan
     brier_score = np.nan
     if "p_hit_model" in settled.columns and settled["p_hit_model"].notna().any():
@@ -9309,13 +9309,13 @@ def run_market_line_backtest(
     print("\n  --- Market-Line Backtest Summary ---", flush=True)
     print(
         f"  Signals={len(sig)}  Settled={n_bets}  Wins={n_wins}  "
-        f"HitRate={hit_rate:.1%}  P/L=${total_pnl:+.0f}  ROI={roi:.1f}%",
+        f"HitRate={hit_rate:.1%}  P/L=${total_pnl:+.0f}  Accuracy={accuracy:.1f}%",
         flush=True,
     )
     if pd.notna(avg_ev):
         print(f"  Avg EV at signal: {avg_ev:+.3f}", flush=True)
-    if pd.notna(avg_clv):
-        print(f"  Avg line CLV (pts): {avg_clv:+.3f}", flush=True)
+    if pd.notna(avg_mes):
+        print(f"  Avg line market efficiency score (pts): {avg_mes:+.3f}", flush=True)
     if pd.notna(calibration_drift_abs):
         print(f"  Calibration drift |hit - p(hit)|: {calibration_drift_abs:.3f}", flush=True)
     if pd.notna(brier_score):
@@ -9327,15 +9327,15 @@ def run_market_line_backtest(
         st_wins = int(g["hit"].fillna(0).sum())
         st_pnl = float(g["pnl"].sum())
         st_hr = (st_wins / st_bets) if st_bets > 0 else np.nan
-        st_roi = (100.0 * st_pnl / (st_bets * bet_size)) if st_bets > 0 else np.nan
+        st_accuracy = (100.0 * st_pnl / (st_bets * bet_size)) if st_bets > 0 else np.nan
         per_stat[st] = {
             "n_bets": st_bets,
             "wins": st_wins,
             "hit_rate": round(float(st_hr), 4) if pd.notna(st_hr) else np.nan,
             "pnl": round(st_pnl, 2),
-            "roi_pct": round(float(st_roi), 2) if pd.notna(st_roi) else np.nan,
+            "accuracy_pct": round(float(st_accuracy), 2) if pd.notna(st_accuracy) else np.nan,
         }
-        print(f"    {st:10s}: bets={st_bets:3d} hit={st_hr:.1%} pnl=${st_pnl:+.0f} roi={st_roi:.1f}%", flush=True)
+        print(f"    {st:10s}: bets={st_bets:3d} hit={st_hr:.1%} pnl=${st_pnl:+.0f} accuracy={st_accuracy:.1f}%", flush=True)
 
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
     eval_csv = PREDICTIONS_DIR / "market_line_prop_backtest_signals.csv"
@@ -9347,9 +9347,9 @@ def run_market_line_backtest(
         "wins": int(n_wins),
         "hit_rate": round(float(hit_rate), 4) if pd.notna(hit_rate) else np.nan,
         "pnl": round(total_pnl, 2),
-        "roi_pct": round(float(roi), 2) if pd.notna(roi) else np.nan,
+        "accuracy_pct": round(float(accuracy), 2) if pd.notna(accuracy) else np.nan,
         "avg_ev_at_signal": round(float(avg_ev), 4) if pd.notna(avg_ev) else np.nan,
-        "avg_clv_line_pts": round(float(avg_clv), 4) if pd.notna(avg_clv) else np.nan,
+        "avg_mes_line_pts": round(float(avg_mes), 4) if pd.notna(avg_mes) else np.nan,
         "calibration_drift_abs": round(float(calibration_drift_abs), 4) if pd.notna(calibration_drift_abs) else np.nan,
         "brier_score": round(float(brier_score), 6) if pd.notna(brier_score) else np.nan,
         "n_unmatched_signals": int(unmatched),
@@ -9399,9 +9399,9 @@ def run_box_advanced_ablation(
             "n_settled": int(res.get("n_settled", 0)) if str(res.get("n_settled", "")).strip() else 0,
             "wins": int(res.get("wins", 0)) if str(res.get("wins", "")).strip() else 0,
             "hit_rate": res.get("hit_rate", np.nan),
-            "roi_pct": res.get("roi_pct", np.nan),
+            "accuracy_pct": res.get("accuracy_pct", np.nan),
             "pnl": res.get("pnl", np.nan),
-            "avg_clv_line_pts": res.get("avg_clv_line_pts", np.nan),
+            "avg_mes_line_pts": res.get("avg_mes_line_pts", np.nan),
             "avg_ev_at_signal": res.get("avg_ev_at_signal", np.nan),
             "calibration_drift_abs": res.get("calibration_drift_abs", np.nan),
             "brier_score": res.get("brier_score", np.nan),
@@ -9418,7 +9418,7 @@ def run_box_advanced_ablation(
         print(
             f"    {r['mode']:12s} status={r['status']:<12s} "
             f"signals={int(r['n_signals'])} settled={int(r['n_settled'])} "
-            f"roi={r['roi_pct']} clv={r['avg_clv_line_pts']}",
+            f"accuracy={r['accuracy_pct']} mes={r['avg_mes_line_pts']}",
             flush=True,
         )
 
@@ -9426,14 +9426,14 @@ def run_box_advanced_ablation(
     try:
         base = out_df[out_df["mode"] == "baseline"].iloc[0]
         adv = out_df[out_df["mode"] == "box_advanced"].iloc[0]
-        delta_row["delta_roi_pct"] = (
-            float(adv["roi_pct"]) - float(base["roi_pct"])
-            if pd.notna(adv["roi_pct"]) and pd.notna(base["roi_pct"])
+        delta_row["delta_accuracy_pct"] = (
+            float(adv["accuracy_pct"]) - float(base["accuracy_pct"])
+            if pd.notna(adv["accuracy_pct"]) and pd.notna(base["accuracy_pct"])
             else np.nan
         )
-        delta_row["delta_clv_pts"] = (
-            float(adv["avg_clv_line_pts"]) - float(base["avg_clv_line_pts"])
-            if pd.notna(adv["avg_clv_line_pts"]) and pd.notna(base["avg_clv_line_pts"])
+        delta_row["delta_mes_pts"] = (
+            float(adv["avg_mes_line_pts"]) - float(base["avg_mes_line_pts"])
+            if pd.notna(adv["avg_mes_line_pts"]) and pd.notna(base["avg_mes_line_pts"])
             else np.nan
         )
         delta_row["delta_drift_abs"] = (
@@ -9473,7 +9473,7 @@ def backtest_prop_edges(
     test_frac: float = 0.2,
     bet_size: float = 100.0,
 ) -> dict[str, dict[str, Any]]:
-    """Backtest prop edge signals against actual outcomes."""
+    """Backtest prediction advantage signals against actual outcomes."""
     player_df = player_df.sort_values("game_time_utc").reset_index(drop=True)
     all_targets = list(PROP_TARGETS) + (
         ["fg3m"] if "fg3m" in player_df.columns and player_df["fg3m"].notna().sum() > 100 else []
@@ -9483,7 +9483,7 @@ def backtest_prop_edges(
     train = player_df.iloc[:cut].copy()
     test = player_df.iloc[cut:].copy()
 
-    print(f"\n  Prop edge backtest: {len(train)} train, {len(test)} test", flush=True)
+    print(f"\n  Prediction advantage backtest: {len(train)} train, {len(test)} test", flush=True)
 
     results: dict[str, dict[str, Any]] = {}
     for target in all_targets:
@@ -9552,7 +9552,7 @@ def backtest_prop_edges(
             "total_wins": over_wins + under_wins,
             "total_win_rate": round((over_wins + under_wins) / n_bets, 3) if n_bets > 0 else np.nan,
             "profit_flat_100": round(total_profit, 2),
-            "roi_pct": round(100 * total_profit / (n_bets * bet_size), 2) if n_bets > 0 else np.nan,
+            "accuracy_pct": round(100 * total_profit / (n_bets * bet_size), 2) if n_bets > 0 else np.nan,
         }
 
         print(
@@ -9560,7 +9560,7 @@ def backtest_prop_edges(
             f"{results[target]['over_hit_rate']})  "
             f"Unders={n_under} ({under_hit}/{n_under} hit="
             f"{results[target]['under_hit_rate']})  "
-            f"P/L=${total_profit:+.0f}  ROI={results[target]['roi_pct']}%",
+            f"P/L=${total_profit:+.0f}  Accuracy={results[target]['accuracy_pct']}%",
             flush=True,
         )
 
@@ -9568,7 +9568,7 @@ def backtest_prop_edges(
 
 
 def run_backtest(player_df: pd.DataFrame, test_frac: float = 0.2) -> dict[str, dict[str, float]]:
-    """Run a chronological backtest on player props models."""
+    """Run a chronological backtest on player performance predictions models."""
     player_df = player_df.sort_values("game_time_utc").reset_index(drop=True)
     backtest_targets = list(PROP_TARGETS) + (
         ["fg3m"] if "fg3m" in player_df.columns and player_df["fg3m"].notna().sum() > 100 else []
@@ -9802,7 +9802,7 @@ def run_walk_forward_backtest(
                 "total_win_rate_ci_low": round(wr_low, 3) if pd.notna(wr_low) else np.nan,
                 "total_win_rate_ci_high": round(wr_high, 3) if pd.notna(wr_high) else np.nan,
                 "profit": round(total_profit, 2),
-                "roi_pct": round(100 * total_profit / (n_bets * bet_size), 2) if n_bets > 0 else np.nan,
+                "accuracy_pct": round(100 * total_profit / (n_bets * bet_size), 2) if n_bets > 0 else np.nan,
             }
 
             wr = fold_metrics[target].get("total_win_rate", np.nan)
@@ -9813,7 +9813,7 @@ def run_walk_forward_backtest(
             print(
                 f"    {target:>10s}:  MAE={mae:.2f}  R2={r2:.3f}  "
                 f"Bets={n_bets}  WR={wr_s} {ci_s}  "
-                f"P/L=${total_profit:+.0f}  ROI={fold_metrics[target].get('roi_pct', 0):.1f}%",
+                f"P/L=${total_profit:+.0f}  Accuracy={fold_metrics[target].get('accuracy_pct', 0):.1f}%",
                 flush=True,
             )
 
@@ -9851,35 +9851,35 @@ def run_walk_forward_backtest(
         sum_profit = sum(vals["profit"])
         sum_bets = sum(vals["n_bets"])
         avg_wr = np.nanmean(vals["win_rate"]) if vals["win_rate"] else np.nan
-        roi = (100 * sum_profit / (sum_bets * bet_size)) if sum_bets > 0 else np.nan
+        accuracy = (100 * sum_profit / (sum_bets * bet_size)) if sum_bets > 0 else np.nan
         total_profit_all += sum_profit
         total_bets_all += int(sum_bets)
 
         wr_s = f"{avg_wr:.1%}" if pd.notna(avg_wr) else "N/A"
-        roi_s = f"{roi:.1f}%" if pd.notna(roi) else "N/A"
+        accuracy_s = f"{accuracy:.1f}%" if pd.notna(accuracy) else "N/A"
         print(
             f"  {target:>10s}:  Avg MAE={avg_mae:.2f}  Avg R2={avg_r2:.3f}  "
             f"Total Bets={int(sum_bets)}  Avg WR={wr_s}  "
-            f"P/L=${sum_profit:+.0f}  ROI={roi_s}",
+            f"P/L=${sum_profit:+.0f}  Accuracy={accuracy_s}",
             flush=True,
         )
 
     if total_bets_all > 0:
-        overall_roi = 100 * total_profit_all / (total_bets_all * bet_size)
+        overall_accuracy = 100 * total_profit_all / (total_bets_all * bet_size)
         print(
             f"\n  OVERALL: {total_bets_all} bets, ${total_profit_all:+.0f} P/L, "
-            f"{overall_roi:.1f}% ROI",
+            f"{overall_accuracy:.1f}% Accuracy",
             flush=True,
         )
 
         # GO / NO GO assessment
         print(f"\n  {'=' * 40}", flush=True)
-        if overall_roi > 2.0 and total_bets_all >= 50:
-            print("  ASSESSMENT: GO -- Positive ROI across walk-forward folds", flush=True)
-        elif overall_roi > 0:
+        if overall_accuracy > 2.0 and total_bets_all >= 50:
+            print("  ASSESSMENT: GO -- Positive Accuracy across walk-forward folds", flush=True)
+        elif overall_accuracy > 0:
             print("  ASSESSMENT: CAUTIOUS GO -- Marginally positive, monitor closely", flush=True)
         else:
-            print("  ASSESSMENT: NO GO -- Negative ROI in walk-forward validation", flush=True)
+            print("  ASSESSMENT: NO GO -- Negative Accuracy in walk-forward validation", flush=True)
         print(f"  {'=' * 40}", flush=True)
 
     # --- Step 5: Gate Checks ---
@@ -9933,7 +9933,7 @@ def _run_walk_forward_gate_checks(
     Gate checks (all must pass before proceeding to market blending):
     1. MAE per stat: test fold MAE below stat-specific threshold
     2. Win rate: avg win rate on synthetic lines >= 48% per stat
-    3. Overall ROI: >= -5% across all folds (within vig tolerance)
+    3. Overall Accuracy: >= -5% across all folds (within vig tolerance)
     4. R² positive: model adds value over naive baseline for each stat
     """
     print(f"\n  {'=' * 72}", flush=True)
@@ -9974,15 +9974,15 @@ def _run_walk_forward_gate_checks(
             if not passed:
                 all_pass = False
 
-    # Gate 3: Overall ROI non-negative
+    # Gate 3: Overall Accuracy non-negative
     total_profit = sum(sum(v["profit"]) for v in agg.values())
     total_bets = sum(int(sum(v["n_bets"])) for v in agg.values())
     if total_bets > 0:
-        overall_roi = 100 * total_profit / (total_bets * bet_size)
-        passed = overall_roi >= -5.0  # Allow slight negative (within vig)
-        gates["overall_roi"] = {"value": round(overall_roi, 2), "threshold": -5.0, "pass": passed}
+        overall_accuracy = 100 * total_profit / (total_bets * bet_size)
+        passed = overall_accuracy >= -5.0  # Allow slight negative (within vig)
+        gates["overall_accuracy"] = {"value": round(overall_accuracy, 2), "threshold": -5.0, "pass": passed}
         status = "PASS" if passed else "FAIL"
-        print(f"    ROI gate: {overall_roi:.1f}% vs -5.0% -> {status}", flush=True)
+        print(f"    Accuracy gate: {overall_accuracy:.1f}% vs -5.0% -> {status}", flush=True)
         if not passed:
             all_pass = False
 
@@ -11218,14 +11218,14 @@ def format_predictions(pred_df: pd.DataFrame) -> pd.DataFrame:
 def apply_portfolio_caps(prop_edges: pd.DataFrame) -> pd.DataFrame:
     """Apply portfolio de-correlation caps directly to signal rows.
 
-    Non-selected signals are converted to NO BET and annotated via
+    Non-selected signals are converted to LOW CONFIDENCE and annotated via
     `signal_blocked_reason` so persisted outputs match what is actionable.
     """
     if prop_edges.empty or "signal" not in prop_edges.columns:
         return prop_edges
 
     out = prop_edges.copy()
-    signal_mask = out["signal"] != "NO BET"
+    signal_mask = out["signal"] != "LOW CONFIDENCE"
     signals = out[signal_mask].copy()
     if signals.empty:
         return out
@@ -11290,7 +11290,7 @@ def apply_portfolio_caps(prop_edges: pd.DataFrame) -> pd.DataFrame:
     original_signal_idx = set(out[signal_mask].index.tolist())
     blocked_idx = sorted(original_signal_idx - keep_idx)
     if blocked_idx:
-        out.loc[blocked_idx, "signal"] = "NO BET"
+        out.loc[blocked_idx, "signal"] = "LOW CONFIDENCE"
         if "confidence" in out.columns:
             out.loc[blocked_idx, "confidence"] = ""
         if "signal_blocked_reason" in out.columns:
@@ -11302,16 +11302,16 @@ def apply_portfolio_caps(prop_edges: pd.DataFrame) -> pd.DataFrame:
 
 
 def print_prop_edge_summary(prop_edges: pd.DataFrame) -> None:
-    """Print a formatted summary of prop edge signals."""
+    """Print a formatted summary of prediction advantage signals."""
     if prop_edges.empty:
-        print("\n  No prop edge data available.", flush=True)
+        print("\n  No prediction advantage data available.", flush=True)
         return
 
     # Keep display output aligned with persisted actionable signals.
     prop_edges = apply_portfolio_caps(prop_edges)
 
-    n_signals = int((prop_edges["signal"] != "NO BET").sum())
-    n_best_bets = int((prop_edges["confidence"] == "BEST BET").sum())
+    n_signals = int((prop_edges["signal"] != "LOW CONFIDENCE").sum())
+    n_high_confs = int((prop_edges["confidence"] == "HIGH CONFIDENCE").sum())
     n_positive_ev = int(
         ((prop_edges["ev_over"] > 0) | (prop_edges["ev_under"] > 0)).sum()
     )
@@ -11327,7 +11327,7 @@ def print_prop_edge_summary(prop_edges: pd.DataFrame) -> None:
     )
     print(f"  Total props analyzed: {len(prop_edges)}", flush=True)
     print(f"  Signals generated: {n_signals}", flush=True)
-    print(f"  Best bets: {n_best_bets}", flush=True)
+    print(f"  High confidence predictions: {n_high_confs}", flush=True)
     print(f"  Positive EV props: {n_positive_ev}", flush=True)
     if "signal_blocked_reason" in prop_edges.columns:
         blocked_minutes = int((prop_edges["signal_blocked_reason"] == "minutes_gate").sum())
@@ -11339,7 +11339,7 @@ def print_prop_edge_summary(prop_edges: pd.DataFrame) -> None:
             )
 
     # Sort all signals by EV and cap at MAX_SIGNALS_PER_DAY
-    all_signals = prop_edges[prop_edges["signal"] != "NO BET"].copy()
+    all_signals = prop_edges[prop_edges["signal"] != "LOW CONFIDENCE"].copy()
     all_signals["_best_ev"] = all_signals.apply(
         lambda r: r["ev_over"] if r["signal"] == "OVER" else r["ev_under"], axis=1
     )
@@ -11349,14 +11349,14 @@ def print_prop_edge_summary(prop_edges: pd.DataFrame) -> None:
     if n_correlated > 0:
         print(f"  Correlated signals (same player, same direction): {n_correlated}", flush=True)
 
-    if n_best_bets > 0:
-        best = all_signals[all_signals["confidence"] == "BEST BET"].head(MAX_SIGNALS_PER_DAY)
-        print(f"\n  --- BEST BETS (top {len(best)}) ---", flush=True)
+    if n_high_confs > 0:
+        best = all_signals[all_signals["confidence"] == "HIGH CONFIDENCE"].head(MAX_SIGNALS_PER_DAY)
+        print(f"\n  --- HIGH CONFIDENCES (top {len(best)}) ---", flush=True)
         _print_prop_table(best)
 
-    remaining = MAX_SIGNALS_PER_DAY - min(n_best_bets, MAX_SIGNALS_PER_DAY)
-    if remaining > 0 and n_signals > n_best_bets:
-        lean = all_signals[all_signals["confidence"] != "BEST BET"].head(remaining)
+    remaining = MAX_SIGNALS_PER_DAY - min(n_high_confs, MAX_SIGNALS_PER_DAY)
+    if remaining > 0 and n_signals > n_high_confs:
+        lean = all_signals[all_signals["confidence"] != "HIGH CONFIDENCE"].head(remaining)
         if not lean.empty:
             print(f"\n  --- LEAN ({len(lean)}) ---", flush=True)
             _print_prop_table(lean)
@@ -11475,12 +11475,12 @@ def generate_daily_report(
     # 3. Signal summary
     signal_summary: dict[str, dict[str, int]] = {}
     if not prop_edges.empty:
-        signals = prop_edges[prop_edges["signal"] != "NO BET"]
+        signals = prop_edges[prop_edges["signal"] != "LOW CONFIDENCE"]
         for stat_type, grp in signals.groupby("stat_type"):
             signal_summary[str(stat_type)] = {
                 "n_signals": int(len(grp)),
-                "n_best_bets": int((grp["confidence"] == "BEST BET").sum()),
-                "n_leans": int((grp["confidence"] == "LEAN").sum()),
+                "n_high_confs": int((grp["confidence"] == "HIGH CONFIDENCE").sum()),
+                "n_leans": int((grp["confidence"] == "MODERATE CONFIDENCE").sum()),
                 "n_over": int((grp["signal"] == "OVER").sum()),
                 "n_under": int((grp["signal"] == "UNDER").sum()),
             }
@@ -11513,12 +11513,12 @@ def generate_daily_report(
               f"[{stats['min']:.1f}, {stats['max']:.1f}] n={stats['count']}", flush=True)
 
     n_total_signals = sum(s["n_signals"] for s in signal_summary.values())
-    n_total_best = sum(s["n_best_bets"] for s in signal_summary.values())
-    print(f"\n  Signals: {n_total_signals} total ({n_total_best} best bets)", flush=True)
+    n_total_best = sum(s["n_high_confs"] for s in signal_summary.values())
+    print(f"\n  Signals: {n_total_signals} total ({n_total_best} high confidence predictions)", flush=True)
     for stat, counts in signal_summary.items():
         print(f"    {stat}: {counts['n_signals']} signals "
               f"({counts['n_over']}O/{counts['n_under']}U, "
-              f"{counts['n_best_bets']} best)", flush=True)
+              f"{counts['n_high_confs']} best)", flush=True)
 
     if pd.notna(model_age_days):
         freshness = "OK" if model_age_days < 14 else "STALE"
@@ -11538,7 +11538,7 @@ def generate_daily_report(
         ss = signal_summary.get(stat, {})
         stat_signals = (
             prop_edges[
-                (prop_edges["stat_type"] == stat) & (prop_edges["signal"] != "NO BET")
+                (prop_edges["stat_type"] == stat) & (prop_edges["signal"] != "LOW CONFIDENCE")
             ].copy()
             if not prop_edges.empty
             else pd.DataFrame()
@@ -11557,7 +11557,7 @@ def generate_daily_report(
             "stat_type": stat,
             "n_predictions": int(len(prop_edges[prop_edges["stat_type"] == stat])) if not prop_edges.empty else 0,
             "n_signals": ss.get("n_signals", 0),
-            "n_best_bets": ss.get("n_best_bets", 0),
+            "n_high_confs": ss.get("n_high_confs", 0),
             "n_leans": ss.get("n_leans", 0),
             "mean_pred": pred_stats.get(f"pred_{stat}", {}).get("mean", np.nan),
             "mean_edge": float(prop_edges.loc[prop_edges["stat_type"] == stat, "edge"].mean())
@@ -11617,61 +11617,61 @@ def check_deploy_gates(target_date: str) -> dict[str, Any]:
             gate1["affected_stats"].add(stat)
     results["gates"]["min_graded_per_stat"] = gate1
 
-    # Gate 2: Positive trailing CLV (last 30 days) with minimum sample
+    # Gate 2: Positive trailing market efficiency score (last 30 days) with minimum sample
     gate2: dict[str, Any] = {"passed": True, "details": {}, "status": "PASS"}
     if not graded.empty and "game_date_est" in graded.columns:
         cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
         recent = graded[
             (graded["game_date_est"].astype(str) >= cutoff)
-            & (graded["signal"] != "NO BET")
+            & (graded["signal"] != "LOW CONFIDENCE")
         ]
         if not recent.empty and "line_move" in recent.columns:
             with_line_snapshot = recent.copy()
             with_line_snapshot["line_move"] = pd.to_numeric(with_line_snapshot["line_move"], errors="coerce")
             with_line_snapshot = with_line_snapshot[with_line_snapshot["line_move"].notna()].copy()
 
-            # CLV sample should only include rows with actual movement.
+            # Market efficiency sample should only include rows with actual movement.
             with_move = with_line_snapshot[with_line_snapshot["line_move"].abs() > 1e-9].copy()
             n_with_move = len(with_move)
             gate2["details"]["n_signals_30d"] = int(len(recent))
             gate2["details"]["n_with_line_snapshot_30d"] = int(len(with_line_snapshot))
             gate2["details"]["n_with_line_move_30d"] = n_with_move
-            gate2["details"]["min_sample_required"] = DEPLOY_CLV_MIN_SAMPLE
+            gate2["details"]["min_sample_required"] = DEPLOY_MES_MIN_SAMPLE
 
-            if n_with_move >= DEPLOY_CLV_MIN_SAMPLE:
-                clv_dir = np.where(
+            if n_with_move >= DEPLOY_MES_MIN_SAMPLE:
+                mes_dir = np.where(
                     with_move["signal"] == "OVER",
                     with_move["line_move"].to_numpy(dtype=float),
                     -with_move["line_move"].to_numpy(dtype=float),
                 )
-                mean_clv = float(np.nanmean(clv_dir))
-                gate2["details"]["avg_clv_line_pts_30d"] = round(mean_clv, 3)
+                mean_mes = float(np.nanmean(mes_dir))
+                gate2["details"]["avg_mes_line_pts_30d"] = round(mean_mes, 3)
 
-                # Separate odds-based CLV if closing odds available
+                # Separate odds-based market efficiency score if closing odds available
                 if "closing_odds_over" in with_move.columns and "closing_odds_under" in with_move.columns:
-                    odds_clv_vals = []
+                    odds_mes_vals = []
                     for _, r in with_move.iterrows():
                         open_over = pd.to_numeric(r.get("over_odds"), errors="coerce")
                         close_over = pd.to_numeric(r.get("closing_odds_over"), errors="coerce")
                         if pd.notna(open_over) and pd.notna(close_over):
-                            # CLV = implied prob improvement in signal direction
+                            # market efficiency score = implied prob improvement in signal direction
                             open_ip = _american_odds_to_implied_prob(open_over)
                             close_ip = _american_odds_to_implied_prob(close_over)
                             if pd.notna(open_ip) and pd.notna(close_ip):
-                                clv_odds = (close_ip - open_ip) if r.get("signal") == "OVER" else (open_ip - close_ip)
-                                odds_clv_vals.append(clv_odds)
-                    if odds_clv_vals:
-                        gate2["details"]["avg_clv_odds_30d"] = round(float(np.mean(odds_clv_vals)), 4)
-                        gate2["details"]["n_with_odds_clv_30d"] = len(odds_clv_vals)
+                                mes_odds = (close_ip - open_ip) if r.get("signal") == "OVER" else (open_ip - close_ip)
+                                odds_mes_vals.append(mes_odds)
+                    if odds_mes_vals:
+                        gate2["details"]["avg_mes_odds_30d"] = round(float(np.mean(odds_mes_vals)), 4)
+                        gate2["details"]["n_with_odds_mes_30d"] = len(odds_mes_vals)
 
-                if mean_clv < DEPLOY_GATE_MIN_CLV:
+                if mean_mes < DEPLOY_GATE_MIN_MES:
                     gate2["passed"] = False
                     gate2["status"] = "FAIL"
             else:
                 # Insufficient sample — treat as not deployment-ready.
                 gate2["passed"] = False
                 gate2["status"] = "INSUFFICIENT_DATA"
-                gate2["details"]["reason"] = f"insufficient_sample ({n_with_move} < {DEPLOY_CLV_MIN_SAMPLE})"
+                gate2["details"]["reason"] = f"insufficient_sample ({n_with_move} < {DEPLOY_MES_MIN_SAMPLE})"
         else:
             gate2["passed"] = False
             gate2["status"] = "INSUFFICIENT_DATA"
@@ -11682,7 +11682,7 @@ def check_deploy_gates(target_date: str) -> dict[str, Any]:
         gate2["passed"] = False
         gate2["status"] = "INSUFFICIENT_DATA"
         gate2["details"]["reason"] = "no graded history"
-    results["gates"]["positive_trailing_clv"] = gate2
+    results["gates"]["positive_trailing_mes"] = gate2
 
     # Gate 3: Calibration tolerance
     gate3: dict[str, Any] = {"passed": True, "details": {}, "affected_stats": set()}
@@ -11690,7 +11690,7 @@ def check_deploy_gates(target_date: str) -> dict[str, Any]:
         cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
         recent_signal = graded[
             (graded["game_date_est"].astype(str) >= cutoff)
-            & (graded["signal"] != "NO BET")
+            & (graded["signal"] != "LOW CONFIDENCE")
         ]
         if not recent_signal.empty:
             recent_signal = recent_signal.copy()
@@ -11764,20 +11764,20 @@ def _print_deploy_gate_status(gate_results: dict[str, Any]) -> None:
                 print(f"\n  Recent weekly retrains ({len(recent)}):", flush=True)
                 for _, row in recent.iterrows():
                     ts = str(row.get("timestamp", ""))[:10]
-                    roi = row.get("roi", "N/A")
+                    accuracy = row.get("accuracy", "N/A")
                     alerts = row.get("n_alerts", "N/A")
-                    print(f"    {ts}: ROI={roi}  alerts={alerts}", flush=True)
+                    print(f"    {ts}: Accuracy={accuracy}  alerts={alerts}", flush=True)
         except Exception:
             pass
     print(f"{'=' * 60}\n", flush=True)
 
 
 # ---------------------------------------------------------------------------
-# CLV tracking for props
+# Market efficiency tracking for props
 # ---------------------------------------------------------------------------
 
-def track_prop_clv(target_date: str) -> None:
-    """Track CLV for prop predictions by comparing to actual results.
+def track_prop_efficiency(target_date: str) -> None:
+    """Track market efficiency score for player predictions by comparing to actual results.
 
     Loads predictions from the morning, compares to actual game results,
     and appends to a cumulative tracking CSV.
@@ -11792,7 +11792,7 @@ def track_prop_clv(target_date: str) -> None:
 
     if not edge_file.exists():
         print(f"  No edge predictions found for {target_date}: {edge_file}", flush=True)
-        print("  CLV tracking requires prop edge signals.", flush=True)
+        print("  Market efficiency tracking requires prediction advantage signals.", flush=True)
         return
 
     print(f"  Loading predictions from {pred_file}", flush=True)
@@ -11828,7 +11828,7 @@ def track_prop_clv(target_date: str) -> None:
         prop_line = edge_row["prop_line"]
         pred_value = edge_row["pred_value"]
 
-        if signal == "NO BET":
+        if signal == "LOW CONFIDENCE":
             continue
 
         # Find actual result
@@ -11896,7 +11896,7 @@ def track_prop_clv(target_date: str) -> None:
     total_pnl = new_tracking["pnl"].sum()
     hit_rate = n_hits / n_bets if n_bets > 0 else 0
 
-    print(f"\n  --- CLV Tracking for {target_date} ---", flush=True)
+    print(f"\n  --- market efficiency score Tracking for {target_date} ---", flush=True)
     print(f"  Bets: {n_bets}  Hits: {n_hits}  Hit Rate: {hit_rate:.1%}  P/L: ${total_pnl:+.0f}", flush=True)
 
     for _, row in new_tracking.iterrows():
@@ -11915,11 +11915,11 @@ def track_prop_clv(target_date: str) -> None:
         cum_hits = int(combined["hit"].sum())
         cum_pnl = combined["pnl"].sum()
         cum_hr = cum_hits / cum_bets if cum_bets > 0 else 0
-        cum_roi = 100 * cum_pnl / (cum_bets * 100) if cum_bets > 0 else 0
+        cum_accuracy = 100 * cum_pnl / (cum_bets * 100) if cum_bets > 0 else 0
         print(f"\n  --- Cumulative Stats ---", flush=True)
         print(
             f"  Total Bets: {cum_bets}  Hits: {cum_hits}  "
-            f"Hit Rate: {cum_hr:.1%}  P/L: ${cum_pnl:+.0f}  ROI: {cum_roi:.1f}%",
+            f"Hit Rate: {cum_hr:.1%}  P/L: ${cum_pnl:+.0f}  Accuracy: {cum_accuracy:.1f}%",
             flush=True,
         )
 
@@ -11979,7 +11979,7 @@ def compute_calibration_report(
     if graded.empty:
         return {"error": "no graded rows in lookback window"}
 
-    # Compute p_hit: P(over) for OVER signals, P(under) for UNDER, P(over) for NO BET
+    # Compute p_hit: P(over) for OVER signals, P(under) for UNDER, P(over) for LOW CONFIDENCE
     graded["p_hit"] = np.where(
         graded["signal"] == "UNDER",
         graded["p_under"].astype(float),
@@ -11988,14 +11988,14 @@ def compute_calibration_report(
 
     # Edge buckets
     graded["edge_bucket"] = pd.cut(
-        graded["edge_pct"].abs(),
+        graded["advantage_pct"].abs(),
         bins=[0, 5, 10, 15, 20, 100],
         labels=["0-5%", "5-10%", "10-15%", "15-20%", "20%+"],
         include_lowest=True,
     )
 
     # Signal-only for confidence/pnl metrics
-    signal_graded = graded[graded["signal"] != "NO BET"].copy()
+    signal_graded = graded[graded["signal"] != "LOW CONFIDENCE"].copy()
 
     report: dict[str, Any] = {
         "lookback_days": lookback_days,
@@ -12031,12 +12031,12 @@ def compute_calibration_report(
                 "brier": entry["brier"],
                 "threshold": CALIB_ALERT_THRESHOLDS["brier_score_max"],
             })
-        if entry["roi_pct"] < CALIB_ALERT_THRESHOLDS["roi_floor_pct"]:
+        if entry["accuracy_pct"] < CALIB_ALERT_THRESHOLDS["accuracy_floor_pct"]:
             alerts.append({
-                "type": "roi_floor",
+                "type": "accuracy_floor",
                 "stat_type": stat,
-                "roi_pct": entry["roi_pct"],
-                "threshold": CALIB_ALERT_THRESHOLDS["roi_floor_pct"],
+                "accuracy_pct": entry["accuracy_pct"],
+                "threshold": CALIB_ALERT_THRESHOLDS["accuracy_floor_pct"],
             })
 
     # --- By confidence ---
@@ -12053,17 +12053,17 @@ def compute_calibration_report(
         min_sample=min_sample,
     )
 
-    # --- CLV summary (mean line movement in signal direction) ---
+    # --- Market efficiency summary (mean line movement in signal direction) ---
     if "line_move" in signal_graded.columns and not signal_graded.empty:
         with_move = signal_graded[signal_graded["line_move"].notna()].copy()
         if not with_move.empty:
-            clv_dir = np.where(
+            mes_dir = np.where(
                 with_move["signal"] == "OVER",
                 with_move["line_move"].astype(float),
                 -with_move["line_move"].astype(float),
             )
-            report["clv_mean"] = round(float(np.mean(clv_dir)), 3)
-            report["clv_n"] = len(with_move)
+            report["mes_mean"] = round(float(np.mean(mes_dir)), 3)
+            report["mes_n"] = len(with_move)
 
     # --- Star-out nights subset (forward pressure > p90 threshold) ---
     star_out_threshold = 30.0  # ~p90 of training team_injury_pressure
@@ -12089,7 +12089,7 @@ def compute_calibration_report(
                 "hit_rate": round(float(hit.mean()), 4),
                 "mean_p_hit": round(float(p_hit.mean()), 4),
                 "gap": round(float(abs(hit.mean() - p_hit.mean())), 4),
-                "roi_pct": round(float(pnl.mean()) * 100, 2),
+                "accuracy_pct": round(float(pnl.mean()) * 100, 2),
             })
         if star_out_metrics:
             report["by_star_out"] = star_out_metrics
@@ -12114,7 +12114,7 @@ def print_calibration_report(report: dict[str, Any]) -> None:
                 f"    {str(e['group']):10s}: n={e['n']:>4d}  "
                 f"HitRate={e['hit_rate']:.1%}  Pred={e['mean_p_hit']:.1%}  "
                 f"Gap={e['gap']:.3f}  Brier={e['brier']:.3f}  "
-                f"ROI={e['roi_pct']:+.1f}%",
+                f"Accuracy={e['accuracy_pct']:+.1f}%",
                 flush=True,
             )
 
@@ -12124,7 +12124,7 @@ def print_calibration_report(report: dict[str, Any]) -> None:
             print(
                 f"    {str(e['group']):10s}: n={e['n']:>4d}  "
                 f"HitRate={e['hit_rate']:.1%}  Brier={e['brier']:.3f}  "
-                f"ROI={e['roi_pct']:+.1f}%",
+                f"Accuracy={e['accuracy_pct']:+.1f}%",
                 flush=True,
             )
 
@@ -12134,7 +12134,7 @@ def print_calibration_report(report: dict[str, Any]) -> None:
             print(
                 f"    {str(e['group']):10s}: n={e['n']:>4d}  "
                 f"HitRate={e['hit_rate']:.1%}  Brier={e['brier']:.3f}  "
-                f"ROI={e['roi_pct']:+.1f}%",
+                f"Accuracy={e['accuracy_pct']:+.1f}%",
                 flush=True,
             )
 
@@ -12144,12 +12144,12 @@ def print_calibration_report(report: dict[str, Any]) -> None:
             print(
                 f"    {str(e['group']):10s}: n={e['n']:>4d}  "
                 f"HitRate={e['hit_rate']:.1%}  Pred={e['mean_p_hit']:.1%}  "
-                f"Gap={e['gap']:.3f}  ROI={e['roi_pct']:+.1f}%",
+                f"Gap={e['gap']:.3f}  Accuracy={e['accuracy_pct']:+.1f}%",
                 flush=True,
             )
 
-    if "clv_mean" in report:
-        print(f"\n  CLV (signal direction): mean={report['clv_mean']:+.3f} pts  (n={report['clv_n']})", flush=True)
+    if "mes_mean" in report:
+        print(f"\n  market efficiency score (signal direction): mean={report['mes_mean']:+.3f} pts  (n={report['mes_n']})", flush=True)
 
     if report.get("alerts"):
         print(f"\n  !!! ALERTS ({len(report['alerts'])}) !!!", flush=True)
@@ -12158,8 +12158,8 @@ def print_calibration_report(report: dict[str, Any]) -> None:
                 print(f"    MISCALIBRATION: {a['stat_type']} gap={a['gap']:.3f} > {a['threshold']:.3f}", flush=True)
             elif a["type"] == "brier_degraded":
                 print(f"    BRIER DEGRADED: {a['stat_type']} brier={a['brier']:.3f} > {a['threshold']:.3f}", flush=True)
-            elif a["type"] == "roi_floor":
-                print(f"    ROI FLOOR: {a['stat_type']} roi={a['roi_pct']:.1f}% < {a['threshold']:.1f}%", flush=True)
+            elif a["type"] == "accuracy_floor":
+                print(f"    Accuracy FLOOR: {a['stat_type']} accuracy={a['accuracy_pct']:.1f}% < {a['threshold']:.1f}%", flush=True)
     else:
         print(f"\n  No alerts triggered.", flush=True)
 
@@ -12192,7 +12192,7 @@ def get_calibration_degraded_stats(
         graded = graded[graded["game_date_est"] >= cutoff]
 
     # Only check signal rows
-    signal = graded[graded["signal"] != "NO BET"].copy()
+    signal = graded[graded["signal"] != "LOW CONFIDENCE"].copy()
     if signal.empty:
         return set()
 
@@ -12225,7 +12225,7 @@ def save_canonical_results(
     run_id: str = "",
     asof_utc: pd.Timestamp | None = None,
 ) -> Path:
-    """Save ALL prop edge rows (signals + NO BET) to canonical results history.
+    """Save ALL prediction advantage rows (signals + LOW CONFIDENCE) to canonical results history.
 
     Predictions are stored with actual_value=NaN. Actuals are filled later by
     ``grade_canonical_results()``.
@@ -12311,8 +12311,8 @@ def save_canonical_results(
             "ev_over": r.get("ev_over", np.nan),
             "ev_under": r.get("ev_under", np.nan),
             "edge": r.get("edge", np.nan),
-            "edge_pct": r.get("edge_pct", np.nan),
-            "signal": r.get("signal", "NO BET"),
+            "advantage_pct": r.get("advantage_pct", np.nan),
+            "signal": r.get("signal", "LOW CONFIDENCE"),
             "confidence": r.get("confidence", ""),
             "signal_blocked_reason": r.get("signal_blocked_reason", ""),
             "signal_policy_mode": policy_mode,
@@ -12444,7 +12444,7 @@ def grade_canonical_results(target_date: str) -> pd.DataFrame:
 
         actual_val = float(actual_val)
         prop_line = float(row.get("prop_line", np.nan))
-        signal = str(row.get("signal", "NO BET"))
+        signal = str(row.get("signal", "LOW CONFIDENCE"))
 
         # Determine hit/push/pnl
         push = 0
@@ -12459,7 +12459,7 @@ def grade_canonical_results(target_date: str) -> pd.DataFrame:
             hit = 1 if actual_val < prop_line else 0
             pnl = VIG_FACTOR * 100 if hit else -100.0
         else:
-            # NO BET: still record actual_value but pnl=0
+            # LOW CONFIDENCE: still record actual_value but pnl=0
             hit = int(actual_val > prop_line) if pd.notna(prop_line) else np.nan
             pnl = 0.0
 
@@ -12475,9 +12475,9 @@ def grade_canonical_results(target_date: str) -> pd.DataFrame:
     graded_rows = history[date_mask].copy()
     n_total = len(graded_rows)
     n_graded = graded_rows["actual_value"].notna().sum()
-    n_signals = (graded_rows["signal"] != "NO BET").sum()
-    n_hits = graded_rows.loc[graded_rows["signal"] != "NO BET", "hit"].sum()
-    signal_total = graded_rows.loc[graded_rows["signal"] != "NO BET", "pnl"].sum()
+    n_signals = (graded_rows["signal"] != "LOW CONFIDENCE").sum()
+    n_hits = graded_rows.loc[graded_rows["signal"] != "LOW CONFIDENCE", "hit"].sum()
+    signal_total = graded_rows.loc[graded_rows["signal"] != "LOW CONFIDENCE", "pnl"].sum()
 
     print(f"\n  --- Grading Results for {target_date} ---", flush=True)
     print(f"  Total predictions: {n_total}  Graded: {n_graded}  New: {graded_count}", flush=True)
@@ -12486,7 +12486,7 @@ def grade_canonical_results(target_date: str) -> pd.DataFrame:
         print(f"  Signal bets: {int(n_signals)}  Hits: {int(n_hits)}  Hit Rate: {sig_hr:.1%}  P/L: ${signal_total:+.0f}", flush=True)
 
     # Per-stat breakdown for signal bets
-    sig_rows = graded_rows[(graded_rows["signal"] != "NO BET") & graded_rows["actual_value"].notna()]
+    sig_rows = graded_rows[(graded_rows["signal"] != "LOW CONFIDENCE") & graded_rows["actual_value"].notna()]
     if not sig_rows.empty:
         print(f"\n  --- Per-Stat Breakdown ---", flush=True)
         for st in sorted(sig_rows["stat_type"].unique()):
@@ -12582,7 +12582,7 @@ def migrate_tracking_to_canonical() -> None:
             "ev_over": r.get("ev_at_signal", np.nan),
             "ev_under": np.nan,
             "edge": np.nan,
-            "edge_pct": np.nan,
+            "advantage_pct": np.nan,
             "signal": r.get("signal", ""),
             "confidence": r.get("confidence", ""),
             "signal_blocked_reason": "",
@@ -12715,8 +12715,8 @@ def run_weekly_retrain(
     print(f"  Single models: {len(single_models)}", flush=True)
 
     # Step 3: Market-line backtest
-    roi_val = None
-    clv_val = None
+    accuracy_val = None
+    mes_val = None
     print("\n  Running market-line backtest...", flush=True)
     try:
         result = run_market_line_backtest(
@@ -12727,9 +12727,9 @@ def run_weekly_retrain(
             fetch_missing_lines=False,
         )
         if isinstance(result, dict):
-            roi_val = result.get("roi_pct", "N/A")
-            clv_val = result.get("avg_clv_line_pts", "N/A")
-            print(f"  Market backtest ROI: {roi_val}  CLV: {clv_val}", flush=True)
+            accuracy_val = result.get("accuracy_pct", "N/A")
+            mes_val = result.get("avg_mes_line_pts", "N/A")
+            print(f"  Market backtest Accuracy: {accuracy_val}  market efficiency score: {mes_val}", flush=True)
 
             # Record snapshot
             append_weekly_market_check(result, as_of_date=target_date, max_dates=args.market_backtest_max_dates)
@@ -12767,8 +12767,8 @@ def run_weekly_retrain(
             "n_residual": n_residual,
             "n_single": len(single_models),
             "n_alerts": len(report.get("alerts", [])),
-            "roi": roi_val,
-            "clv": clv_val,
+            "accuracy": accuracy_val,
+            "mes": mes_val,
         },
     )
 
@@ -12778,7 +12778,7 @@ def run_weekly_retrain(
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Predict NBA player props")
+    p = argparse.ArgumentParser(description="Predict NBA player performance predictions")
     p.add_argument("--date", type=str, default=None,
                    help="Target date YYYYMMDD (default: today)")
     p.add_argument("--asof-utc", type=str, default=None,
@@ -12788,27 +12788,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--backtest", action="store_true",
                    help="Run backtest evaluation")
     p.add_argument("--backtest-props", action="store_true",
-                   help="Run backtest on prop edges (signal hit rates and P/L)")
+                   help="Run backtest on prediction advantages (signal hit rates and P/L)")
     p.add_argument("--backtest-market-props", action="store_true",
-                   help="Run backtest against actual market prop lines (cached/fetched)")
+                   help="Run backtest against actual market market lines (cached/fetched)")
     p.add_argument("--walk-forward", action="store_true",
                    help="Run walk-forward backtest with season-based folds")
-    p.add_argument("--track-clv", action="store_true",
-                   help="Track CLV for a completed date's predictions")
+    p.add_argument("--track-efficiency", action="store_true",
+                   help="Track market efficiency score for a completed date's predictions")
     p.add_argument("--min-games", type=int, default=DEFAULT_MIN_GAMES,
                    help=f"Minimum games for a player (default: {DEFAULT_MIN_GAMES})")
     p.add_argument("--prop-lines", type=str, default=None,
-                   help="Path to prop lines CSV (overrides default)")
+                   help="Path to market lines CSV (overrides default)")
     p.add_argument("--market-backtest-max-dates", type=int, default=30,
                    help="Max recent test dates to evaluate in market-line backtest (default: 30)")
     p.add_argument("--market-backtest-fetch-missing", action="store_true",
-                   help="Fetch missing historical prop lines during market-line backtest")
+                   help="Fetch missing historical market lines during market-line backtest")
     p.add_argument("--ablation-box-adv", action="store_true",
                    help="Run actionable market-line ablation: baseline vs BoxScoreAdvancedV3 features")
     p.add_argument("--ablation-max-dates", type=int, default=60,
                    help="Max recent dates for BoxScoreAdvancedV3 ablation market-line backtest (default: 60)")
     p.add_argument("--record-weekly-market-check", action="store_true",
-                   help="Append actionable market-backtest ROI/CLV snapshot to weekly log")
+                   help="Append actionable market-backtest Accuracy/MES snapshot to weekly log")
     p.add_argument("--enforce-lineup-lock", action="store_true",
                    help="Suppress signals until game is within lineup lock window")
     p.add_argument("--lineup-lock-minutes", type=int, default=30,
@@ -12891,15 +12891,15 @@ def main() -> None:
         migrate_tracking_to_canonical()
         return
 
-    # --- CLV tracking mode (legacy, delegates to grade_canonical_results when possible) ---
-    if args.track_clv:
+    # --- Market efficiency tracking mode (legacy, delegates to grade_canonical_results when possible) ---
+    if args.track_efficiency:
         target_date = args.date or (run_asof_utc - timedelta(days=1)).strftime("%Y%m%d")
         if PROP_RESULTS_HISTORY_FILE.exists():
-            print(f"Grading canonical results for {target_date} (via --track-clv)...", flush=True)
+            print(f"Grading canonical results for {target_date} (via --track-efficiency)...", flush=True)
             grade_canonical_results(target_date)
         else:
-            print(f"Tracking CLV for {target_date}...", flush=True)
-            track_prop_clv(target_date)
+            print(f"Tracking market efficiency score for {target_date}...", flush=True)
+            track_prop_efficiency(target_date)
         return
 
     # --- Calibration report mode (history-only) ---
@@ -12965,7 +12965,7 @@ def main() -> None:
 
     # --- Backtest mode ---
     if args.backtest:
-        print("\nRunning player props backtest...", flush=True)
+        print("\nRunning player performance predictions backtest...", flush=True)
         results = run_backtest(player_df)
 
         if results:
@@ -12992,9 +12992,9 @@ def main() -> None:
         )
         return
 
-    # --- Prop edge backtest mode ---
+    # --- Prediction advantage backtest mode ---
     if args.backtest_props:
-        print("\nRunning prop edge backtest (signal hit rates + P/L)...", flush=True)
+        print("\nRunning prediction advantage backtest (signal hit rates + P/L)...", flush=True)
         edge_results = backtest_prop_edges(player_df)
 
         if edge_results:
@@ -13008,7 +13008,7 @@ def main() -> None:
                     f"  {target:>10s}: Bets={metrics['total_bets']:>4d}  "
                     f"WinRate={wr_s}  "
                     f"P/L=${metrics['profit_flat_100']:+.0f}  "
-                    f"ROI={metrics.get('roi_pct', 0):.1f}%",
+                    f"Accuracy={metrics.get('accuracy_pct', 0):.1f}%",
                     flush=True,
                 )
                 total_profit += metrics.get("profit_flat_100", 0)
@@ -13016,7 +13016,7 @@ def main() -> None:
             if total_bets > 0:
                 print(
                     f"\n  TOTAL: {total_bets} bets, ${total_profit:+.0f} P/L, "
-                    f"{100 * total_profit / (total_bets * 100):.1f}% ROI",
+                    f"{100 * total_profit / (total_bets * 100):.1f}% Accuracy",
                     flush=True,
                 )
         return
@@ -13042,7 +13042,7 @@ def main() -> None:
 
     # --- Walk-forward backtest mode ---
     if args.walk_forward:
-        print("\nRunning walk-forward backtest for player props...", flush=True)
+        print("\nRunning walk-forward backtest for player performance predictions...", flush=True)
         run_walk_forward_backtest(player_df)
         return
 
@@ -13111,7 +13111,7 @@ def main() -> None:
         player_df, tune=args.tune, n_tune_trials=args.tune_trials,
     )
 
-    print("Generating player prop predictions...", flush=True)
+    print("Generating player performance predictions...", flush=True)
     pred_df = build_player_predictions(
         player_df,
         team_games,
@@ -13135,7 +13135,7 @@ def main() -> None:
 
     market_residual_models: dict[str, dict[str, Any]] = {}
     prob_calibrators: dict[str, dict[str, Any]] = {}
-    print("\nTraining market residual/calibration models from cached prop lines...", flush=True)
+    print("\nTraining market residual/calibration models from cached market lines...", flush=True)
     try:
         residual_models, market_calibs, diag = train_market_residual_models(
             player_df,
@@ -13162,11 +13162,11 @@ def main() -> None:
     )
     if latest_weekly:
         lw_date = str(latest_weekly.get("as_of_date", ""))
-        lw_roi = latest_weekly.get("roi_pct", np.nan)
-        lw_clv = latest_weekly.get("avg_clv_line_pts", np.nan)
+        lw_accuracy = latest_weekly.get("accuracy_pct", np.nan)
+        lw_mes = latest_weekly.get("avg_mes_line_pts", np.nan)
         lw_drift = latest_weekly.get("calibration_drift_abs", np.nan)
         print(
-            f"  Latest weekly check [{lw_date}]: ROI={lw_roi}, CLV={lw_clv}, drift={lw_drift}",
+            f"  Latest weekly check [{lw_date}]: Accuracy={lw_accuracy}, MES={lw_mes}, drift={lw_drift}",
             flush=True,
         )
     if progress_snapshot.get("ready_total", 0):
@@ -13196,13 +13196,13 @@ def main() -> None:
             flush=True,
         )
 
-    # --- Load prop lines and compute edges ---
-    print(f"\nFetching prop lines for {target_date}...", flush=True)
+    # --- Load market lines and compute edges ---
+    print(f"\nFetching market lines for {target_date}...", flush=True)
     prop_lines = fetch_player_prop_lines(target_date, override_path=args.prop_lines)
 
     prop_edges = pd.DataFrame()
     if not prop_lines.empty:
-        print(f"Loaded {len(prop_lines)} prop lines", flush=True)
+        print(f"Loaded {len(prop_lines)} market lines", flush=True)
         print("Computing residual standard deviations...", flush=True)
         residual_stds = compute_prop_residual_stds(
             player_df,
@@ -13233,8 +13233,8 @@ def main() -> None:
         unc_models = two_stage_models.get("_uncertainty", None) if two_stage_models else None
         q_unc_models = two_stage_models.get("_uncertainty_quantile", None) if two_stage_models else None
 
-        print("Computing prop edges...", flush=True)
-        prop_edges = compute_prop_edges(
+        print("Computing prediction advantages...", flush=True)
+        prop_edges = compute_prediction_advantages(
             pred_df,
             prop_lines,
             residual_stds,
@@ -13246,14 +13246,14 @@ def main() -> None:
             quantile_uncertainty_models=q_unc_models,
         )
         if not prop_edges.empty:
-            pre_signals = int((prop_edges["signal"] != "NO BET").sum())
+            pre_signals = int((prop_edges["signal"] != "LOW CONFIDENCE").sum())
             prop_edges = apply_lineup_lock_gate(
                 prop_edges,
                 upcoming,
                 lock_minutes=args.lineup_lock_minutes,
                 enforce=args.enforce_lineup_lock,
             )
-            post_signals = int((prop_edges["signal"] != "NO BET").sum())
+            post_signals = int((prop_edges["signal"] != "LOW CONFIDENCE").sum())
             if args.enforce_lineup_lock:
                 print(
                     f"  Lineup lock gate: {pre_signals} -> {post_signals} signals "
@@ -13262,9 +13262,9 @@ def main() -> None:
                 )
 
             # Phase 2: enforce portfolio caps in persisted outputs.
-            cap_pre = int((prop_edges["signal"] != "NO BET").sum())
+            cap_pre = int((prop_edges["signal"] != "LOW CONFIDENCE").sum())
             prop_edges = apply_portfolio_caps(prop_edges)
-            cap_post = int((prop_edges["signal"] != "NO BET").sum())
+            cap_post = int((prop_edges["signal"] != "LOW CONFIDENCE").sum())
             if cap_post != cap_pre:
                 print(f"  Portfolio caps: {cap_pre} -> {cap_post} signals", flush=True)
 
@@ -13281,16 +13281,16 @@ def main() -> None:
                         affected = gate_info.get("affected_stats", set())
                         if affected:
                             for stat in affected:
-                                mask = (prop_edges["stat_type"] == stat) & (prop_edges["signal"] != "NO BET")
+                                mask = (prop_edges["stat_type"] == stat) & (prop_edges["signal"] != "LOW CONFIDENCE")
                                 gate_blocked += int(mask.sum())
-                                prop_edges.loc[mask, "signal"] = "NO BET"
+                                prop_edges.loc[mask, "signal"] = "LOW CONFIDENCE"
                                 prop_edges.loc[mask, "confidence"] = ""
                                 if "signal_blocked_reason" in prop_edges.columns:
                                     prop_edges.loc[mask, "signal_blocked_reason"] = f"deploy_gate:{gate_name}"
                         else:
-                            mask = prop_edges["signal"] != "NO BET"
+                            mask = prop_edges["signal"] != "LOW CONFIDENCE"
                             gate_blocked += int(mask.sum())
-                            prop_edges.loc[mask, "signal"] = "NO BET"
+                            prop_edges.loc[mask, "signal"] = "LOW CONFIDENCE"
                             prop_edges.loc[mask, "confidence"] = ""
                             if "signal_blocked_reason" in prop_edges.columns:
                                 prop_edges.loc[mask, "signal_blocked_reason"] = f"deploy_gate:{gate_name}"
@@ -13299,9 +13299,9 @@ def main() -> None:
 
             edge_out_path = PREDICTIONS_DIR / f"player_prop_edges_{target_date}.csv"
             prop_edges.to_csv(edge_out_path, index=False)
-            print(f"  Prop edges saved to {edge_out_path}", flush=True)
+            print(f"  Prediction advantages saved to {edge_out_path}", flush=True)
 
-            # Save canonical results (Phase 1): all predictions (signals + NO BET)
+            # Save canonical results (Phase 1): all predictions (signals + LOW CONFIDENCE)
             save_canonical_results(
                 prop_edges,
                 target_date,
@@ -13318,7 +13318,7 @@ def main() -> None:
     print(f"  {len(output)} player predictions across {upcoming['home_team'].nunique()} games", flush=True)
 
     # Print predictions summary
-    print(f"\n--- Player Props Predictions for {target_date} ---", flush=True)
+    print(f"\n--- Player Performance Predictions Predictions for {target_date} ---", flush=True)
     for _, game in upcoming.iterrows():
         home = game["home_team"]
         away = game["away_team"]
@@ -13350,7 +13350,7 @@ def main() -> None:
                 fg3_str = f"  3PM={fg3:.1f}" if fg3 is not None and pd.notna(fg3) else ""
                 print(f"      {name:25s}  PTS={pts_s:>5s}  REB={reb_s:>5s}  AST={ast_s:>5s}  MIN={min_s:>5s}{fg3_str}", flush=True)
 
-    # Print prop edge signals
+    # Print prediction advantage signals
     if not prop_edges.empty:
         print_prop_edge_summary(prop_edges)
 
@@ -13370,7 +13370,7 @@ def main() -> None:
                     print(
                         f"    {str(entry['group']):10s}: n={entry['n']:>3d}  "
                         f"HR={entry['hit_rate']:.0%}  Brier={entry['brier']:.3f}  "
-                        f"ROI={entry['roi_pct']:+.1f}%",
+                        f"Accuracy={entry['accuracy_pct']:+.1f}%",
                         flush=True,
                     )
                 if report.get("alerts"):

@@ -1,5 +1,5 @@
 """
-Quarter-by-Quarter Scoring Analysis for Live Total Betting Edge
+Quarter-by-Quarter Scoring Analysis for Live Total Prediction Edge
 
 Goal: Understand if knowing the score through 3 quarters gives a predictive
 advantage on the final total (4th quarter scoring).
@@ -125,7 +125,7 @@ def load_quarter_data():
 def main():
     print("=" * 70)
     print("NBA QUARTER-BY-QUARTER SCORING ANALYSIS")
-    print("Goal: Find betting edge on totals entering Q4")
+    print("Goal: Find prediction advantage on totals entering Q4")
     print("=" * 70)
 
     df = load_quarter_data()
@@ -209,7 +209,7 @@ def main():
     print(f"\n  * Naive Q4 = what Q4 would be if it matched per-quarter pace from Q1-Q3")
     print(f"  * Overall Q4 mean = {overall_q4_mean:.1f}")
     print(f"\n  KEY INSIGHT: Compare 'Avg Q4' across buckets.")
-    print(f"  If Q4 is similar across all buckets → strong regression to mean → betting edge exists.")
+    print(f"  If Q4 is similar across all buckets → strong regression to mean → prediction advantage exists.")
     print(f"  If Q4 tracks pace → less regression → harder to exploit.")
 
     # ── 5. Implied vs actual final total ──────────────────────────────────
@@ -243,9 +243,9 @@ def main():
     print(f"  (1.333 = no regression, 1.0 = full regression to mean)")
     print(f"  Amount of regression: {(4/3 - shrinkage) / (4/3 - 1) * 100:.1f}%")
 
-    # ── 6. Betting simulation: over/under on projected 4Q total ───────────
+    # ── 6. Prediction simulation: over/under on projected 4Q total ───────────
     print("\n" + "=" * 70)
-    print("6. BETTING SIMULATION: OVER/UNDER ON Q4 TOTAL")
+    print("6. PREDICTION SIMULATION: OVER/UNDER ON Q4 TOTAL")
     print("=" * 70)
 
     # Simulate: if the live total line at end of Q3 is set at (pregame_total - thru_3q),
@@ -358,7 +358,7 @@ def main():
 
     # ── 10. Summary and recommendations ──────────────────────────────────
     print("\n" + "=" * 70)
-    print("10. SUMMARY & BETTING IMPLICATIONS")
+    print("10. SUMMARY & PREDICTION IMPLICATIONS")
     print("=" * 70)
 
     regression_pct = (4/3 - shrinkage) / (4/3 - 1) * 100
@@ -380,7 +380,7 @@ def main():
   4. Blowout effect: Games with large 3Q margins see depressed Q4 scoring
      (starters pulled, pace slows).
 
-  BETTING IMPLICATIONS:
+  PREDICTION IMPLICATIONS:
 
   - If live lines at end of Q3 simply extrapolate pace, there IS an edge:
     • High-scoring 3Q games → bet UNDER on Q4/final total
@@ -390,7 +390,7 @@ def main():
 
   - Blowouts compound the effect — large margins + high totals = strongest UNDER signal.
 
-  - CAVEAT: Sportsbooks know about regression to the mean. The real edge depends
+  - CAVEAT: Market sources know about regression to the mean. The real edge depends
     on whether live lines fully price in this regression. Track actual live lines
     vs. these projections to quantify the exploitable edge.
 """)
