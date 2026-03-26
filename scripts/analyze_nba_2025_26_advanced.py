@@ -332,7 +332,51 @@ def load_historical_espn_odds(season: str) -> pd.DataFrame:
     return pd.DataFrame(odds_rows)
 
 
-SCHEDULE_CACHE_TTL_HOURS = 6
+SCHEDULE_CACHE_TTL_HOURS = 3
+
+
+def _count_completed_schedule_games(payload: dict[str, Any]) -> tuple[int, str]:
+    """Return (completed_game_count, latest_completed_est_date) for cached schedule payload."""
+    count = 0
+    latest_est = ""
+    for day in ((payload or {}).get("leagueSchedule", {}) or {}).get("gameDates", []) or []:
+        for g in day.get("games", []) or []:
+            gid = str(g.get("gameId", ""))
+            if not gid.startswith("002"):
+                continue
+            if int(g.get("gameStatus", 0)) != 3:
+                continue
+            count += 1
+            game_date_est = str(g.get("gameDateEst") or "")
+            if game_date_est > latest_est:
+                latest_est = game_date_est
+    return count, latest_est
+
+
+def _schedule_cache_is_obviously_stale(payload: dict[str, Any], *, now_est: datetime | None = None) -> bool:
+    """Guard against fresh-but-bad schedule cache files.
+
+    We have seen same-day cache files that only include finals through a much older
+    date, which poisons downstream feature builds. Use two cheap consistency checks:
+    1) local current-season boxscore cache materially exceeds completed schedule rows
+    2) latest completed game date lags the current EST date by too many days
+    """
+    completed_count, latest_est = _count_completed_schedule_games(payload)
+    boxscore_count = len(list(BOXSCORE_CACHE.glob("*.json"))) if BOXSCORE_CACHE.exists() else 0
+    if boxscore_count and completed_count + 20 < boxscore_count:
+        return True
+
+    if latest_est:
+        try:
+            latest_dt = pd.to_datetime(latest_est, utc=True, errors="coerce")
+            now_est = now_est or datetime.now(ZoneInfo("America/New_York"))
+            if pd.notna(latest_dt):
+                latest_date_est = latest_dt.tz_convert(ZoneInfo("America/New_York")).date()
+                if latest_date_est < (now_est.date() - timedelta(days=5)):
+                    return True
+        except Exception:
+            pass
+    return False
 
 
 def fetch_schedule_df() -> pd.DataFrame:
@@ -343,6 +387,15 @@ def fetch_schedule_df() -> pd.DataFrame:
         if age_hours > SCHEDULE_CACHE_TTL_HOURS:
             sched_cache.unlink()
     payload = fetch_json(SCHEDULE_URL, cache_path=sched_cache)
+    if _schedule_cache_is_obviously_stale(payload):
+        completed_count, latest_est = _count_completed_schedule_games(payload)
+        print(
+            f"  Invalidating stale schedule cache: completed={completed_count}, latest_est={latest_est or 'n/a'}",
+            flush=True,
+        )
+        if sched_cache.exists():
+            sched_cache.unlink()
+        payload = fetch_json(SCHEDULE_URL, cache_path=sched_cache)
     rows: list[dict[str, Any]] = []
     for day in payload["leagueSchedule"]["gameDates"]:
         for g in day["games"]:
@@ -1108,7 +1161,11 @@ def fetch_all_espn_odds(events_df: pd.DataFrame, max_workers: int = 16) -> pd.Da
 def join_espn_odds(schedule_df: pd.DataFrame) -> pd.DataFrame:
     events = extract_espn_events(schedule_df)
     merged = schedule_df.merge(events, on=["game_date_est", "home_team", "away_team"], how="left")
-    odds = fetch_all_espn_odds(merged[["espn_event_id"]].dropna().drop_duplicates())
+    espn_ids = merged[["espn_event_id"]].dropna().drop_duplicates()
+    odds = fetch_all_espn_odds(espn_ids)
+    if odds.empty and not espn_ids.empty:
+        # ESPN returned events but no odds yet — add espn_event_id so merge succeeds with NaN odds
+        odds = pd.DataFrame(columns=["espn_event_id"])
     merged = merged.merge(odds, on="espn_event_id", how="left")
     return merged
 
@@ -1542,6 +1599,12 @@ def build_team_games_and_players(include_historical: bool = True) -> tuple[pd.Da
         on=["game_id", "game_time_utc"],
         how="left",
     )
+    # Propagate game_date_est into player_games so BRef merge can join on date
+    player_games = player_games.merge(
+        schedule_df[["game_id", "game_date_est"]].drop_duplicates(subset=["game_id"]),
+        on="game_id",
+        how="left",
+    )
 
     # Load historical seasons
     if include_historical:
@@ -1561,6 +1624,12 @@ def build_team_games_and_players(include_historical: bool = True) -> tuple[pd.Da
                 hist_sched[["game_id", "game_time_utc", "game_date_est", "home_team", "away_team",
                             "arena_city", "arena_state", "arena_name"]],
                 on=["game_id", "game_time_utc"],
+                how="left",
+            )
+            # Propagate game_date_est into historical player_games for BRef merge
+            hist_pg = hist_pg.merge(
+                hist_sched[["game_id", "game_date_est"]].drop_duplicates(subset=["game_id"]),
+                on="game_id",
                 how="left",
             )
             schedule_df = pd.concat([hist_sched, schedule_df], ignore_index=True)

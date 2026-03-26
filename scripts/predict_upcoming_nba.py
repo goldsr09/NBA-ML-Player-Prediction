@@ -917,7 +917,13 @@ def build_upcoming_game_features(upcoming_games: pd.DataFrame, team_states: pd.D
         "market_total_open",
         "market_home_implied_prob_close",
     ]
-    games = games.merge(odds_joined[odds_cols].drop_duplicates("game_id"), on="game_id", how="left")
+    available_odds_cols = [c for c in odds_cols if c in odds_joined.columns]
+    if len(available_odds_cols) > 1:  # more than just game_id
+        games = games.merge(odds_joined[available_odds_cols].drop_duplicates("game_id"), on="game_id", how="left")
+    # Ensure all expected odds columns exist (NaN if no odds available)
+    for c in odds_cols:
+        if c not in games.columns:
+            games[c] = np.nan
     # For upcoming games, close lines aren't available yet -- fall back to open lines
     games["market_home_spread_close"] = games["market_home_spread_close"].fillna(games["market_home_spread_open"])
     games["market_total_close"] = games["market_total_close"].fillna(games["market_total_open"])

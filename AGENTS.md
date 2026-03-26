@@ -43,6 +43,7 @@ python3 scripts/predict_player_props.py --date YYYYMMDD --days 1
 python3 scripts/predict_player_props.py --backtest
 python3 scripts/predict_player_props.py --backtest-props
 python3 scripts/predict_player_props.py --backtest-market-props
+python3 scripts/predict_player_props.py --backtest-market-props --market-backtest-max-dates 60
 python3 scripts/predict_player_props.py --walk-forward
 python3 scripts/predict_player_props.py --date YYYYMMDD --track-efficiency
 python3 scripts/predict_player_props.py --date YYYYMMDD --grade-results
@@ -53,12 +54,14 @@ python3 scripts/predict_player_props.py --date YYYYMMDD --weekly-retrain
 python3 scripts/predict_player_props.py --date YYYYMMDD --enforce-lineup-lock --lineup-lock-minutes 30
 python3 scripts/predict_player_props.py --date YYYYMMDD --asof-utc YYYY-MM-DDTHH:MM:SSZ
 python3 scripts/predict_player_props.py --date YYYYMMDD --force-starter-refresh
+python3 scripts/predict_player_props.py --date YYYYMMDD --refresh-injuries-only
+python3 scripts/predict_player_props.py --date YYYYMMDD --force-starter-refresh --refresh-injuries-only
 python3 scripts/predict_player_props.py --backtest-market-props --market-backtest-max-dates 60 --record-weekly-market-check --date YYYYMMDD
 python3 scripts/predict_player_props.py --backtest-market-props --market-backtest-fetch-missing --market-backtest-max-dates 60
 python3 scripts/predict_player_props.py --ablation-box-adv --ablation-max-dates 45
 python3 scripts/predict_player_props.py --ablation-market-lines
 python3 scripts/predict_player_props.py --ablation-features
-python3 scripts/predict_player_props.py --date YYYYMMDD --enable-experimental-market-models --market-model-max-dates 120
+python3 scripts/predict_player_props.py --date YYYYMMDD --enable-experimental-market-models --market-model-max-dates 180
 python3 scripts/predict_player_props.py --date YYYYMMDD --box-adv-fetch-missing --box-adv-max-fetch 100
 python3 scripts/predict_player_props.py --date YYYYMMDD --keep-doubtful
 python3 scripts/predict_player_props.py --date YYYYMMDD --enable-player-encoding
@@ -89,11 +92,22 @@ python3 scripts/fetch_historical_seasons.py --seasons 2023-24 2024-25 --workers 
 python3 scripts/fetch_historical_seasons.py --seasons 2024-25 --skip-odds
 ```
 
+### Basketball Reference data fetch
+```bash
+python3 scripts/fetch_bref_data.py --date YYYYMMDD
+python3 scripts/fetch_bref_data.py --seasons 2024-25 --only boxscores
+python3 scripts/fetch_bref_data.py --seasons 2024-25 --only opponent-stats
+python3 scripts/fetch_bref_data.py --seasons 2024-25 --only shooting
+python3 scripts/fetch_bref_data.py --seasons 2024-25 --delay 4.0
+python3 scripts/fetch_bref_data.py --all-seasons --export-csv
+```
+
 ### Supplemental data fetch
 ```bash
 python3 scripts/fetch_bdl_tracking.py --seasons 2024 2025
 python3 scripts/fetch_bdl_tracking.py --max-dates 30
 python3 scripts/fetch_bdl_tracking.py --max-dates 30 --dry-run
+python3 scripts/fetch_nba_rotation_matchups.py
 python3 scripts/fetch_nba_rotation_matchups.py --max-games 200
 python3 scripts/fetch_nba_defensive_scoring.py
 python3 scripts/fetch_nba_defensive_scoring.py --endpoint defensive --max-games 200
@@ -105,6 +119,13 @@ python3 scripts/fetch_nba_defensive_scoring.py --endpoint scoring --max-games 20
 python3 scripts/ab_compare_prop_models.py
 python3 scripts/ab_compare_prop_models.py --max-dates 45 --bootstrap 2000 --seed 7
 python3 scripts/ab_compare_prop_models.py --max-dates 60 --test-frac 0.3 --bet-size 100
+python3 scripts/ab_compare_prop_models.py --baseline-feature-version v15 --candidate-feature-version v16 --bootstrap 2000 --seed 7
+python3 scripts/ab_compare_prop_models.py --baseline-use-tuned --candidate-use-tuned --baseline-use-selected-groups --candidate-use-selected-groups
+```
+
+### Experiment harness
+```bash
+python3 scripts/run_experiment.py
 ```
 
 ### Daily props cron pipeline
@@ -113,7 +134,15 @@ bash scripts/daily_props_cron.sh
 bash scripts/daily_props_cron.sh YYYYMMDD
 ```
 
+### Starter refresh polling
+```bash
+bash scripts/starter_refresh_poll.sh
+bash scripts/starter_refresh_poll.sh YYYYMMDD
+bash scripts/install_starter_refresh_launchd.sh
+```
+
 ## TODO
 - Confirm whether cron-based snapshot scheduling should be documented here or kept only in script output text.
 - Reconfirm Kalshi Q4 workflow docs if `scripts/kalshi_q4_edge.py` and `scripts/grade_kalshi_snapshots.py` are reintroduced.
 - Decide whether `scripts/backtest_feb27_props.py` should be documented as a standard workflow or kept as a one-date archival utility.
+- Confirm whether `scripts/fetch_nba_defensive_scoring.py` should support `--workers`; current parser exposes only `--max-games` and `--endpoint`.
